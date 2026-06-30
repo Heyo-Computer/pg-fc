@@ -42,4 +42,23 @@ Key settings:
 - override the data device with the kernel arg `pgdata_dev=/dev/vdc` if needed
 
 Postgres listens on `0.0.0.0:5432`. Reach it over the VM's tap interface.
-# pg-fc
+
+## pg-vm-pool (per-schema pooler)
+
+This repo also contains `pg-vm-pool` (`src/`), a connection pooler that fronts
+many of these microVMs behind a single Postgres endpoint — **one VM per
+schema**. The database name in the client's connection string selects the
+schema; the pooler lazily creates/restarts the `pg-<schema>` VM, opens a raw-TCP
+iroh tunnel to its Postgres, and splices the connection through.
+
+```sh
+cargo run                       # listens on 127.0.0.1:6432 (PG_VM_POOL_LISTEN)
+psql "host=127.0.0.1 port=6432 user=postgres dbname=tenant1"   # -> VM pg-tenant1
+```
+
+Config via env: `PG_VM_POOL_LISTEN`, `PG_VM_POOL_IMAGE` (default `pg`),
+`PG_VM_POOL_USER`, `PG_VM_POOL_TTL_SECONDS`, `PG_VM_POOL_READY_TIMEOUT_SECS`.
+
+Requires a local heyvmd with the `POST /sandboxes/:id/tcp-tunnel` endpoint and
+`heyo-sdk` ≥ 0.1.3 (`Sandbox::expose_tcp`). Connect as `user=postgres`; the VM's
+`trust` host auth needs no password (see the auth note in `init.sh`).

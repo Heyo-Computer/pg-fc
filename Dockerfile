@@ -17,11 +17,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PGDATA=/workspace/pgdata \
     PG_MAJOR=${PG_MAJOR}
 
+# Debian bookworm's stock repos only carry PostgreSQL 15, so for any other
+# major (PG_MAJOR=16 by default) we pull from the PostgreSQL project's own apt
+# repo (PGDG, apt.postgresql.org). curl + gnupg fetch the signing key; the repo
+# is then pinned by that key via signed-by.
+#
 # Postgres + the handful of userland tools init.sh relies on.
 # - e2fsprogs: mkfs.ext4 to format the /workspace volume on first boot
 # - util-linux/mount: mount the volume and pseudo-filesystems
 # - gosu: drop privileges to the postgres user without a login shell
 RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl gnupg ca-certificates \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+        https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         postgresql-${PG_MAJOR} \
         postgresql-client-${PG_MAJOR} \
@@ -29,7 +41,6 @@ RUN apt-get update \
         util-linux \
         mount \
         gosu \
-        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Put the versioned Postgres binaries on PATH so init.sh stays version-agnostic.

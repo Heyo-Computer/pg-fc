@@ -57,12 +57,16 @@ chmod 700 "$PGDATA"
 # Initialize the cluster the first time this volume is used.
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
     echo "[init] initializing new Postgres cluster in $PGDATA"
-    gosu postgres initdb --pgdata="$PGDATA" --encoding=UTF8 --auth-host=scram-sha-256
+    # `trust` host auth: initdb never sets a superuser password, so scram over
+    # TCP would lock every client out. The microVM isn't directly reachable —
+    # the only path in is the per-schema iroh tunnel the pooler opens, which is
+    # the real security boundary here. Set a password and switch this back to
+    # scram-sha-256 for any deployment where the VM's 5432 is broadly reachable.
+    gosu postgres initdb --pgdata="$PGDATA" --encoding=UTF8 --auth-host=trust
 
-    # Listen on all interfaces so the host/other VMs can reach it; tighten via
-    # pg_hba in a real deployment.
+    # Listen on all interfaces so the host/tunnel can reach it.
     echo "listen_addresses = '*'" >> "$PGDATA/postgresql.conf"
-    echo "host all all 0.0.0.0/0 scram-sha-256" >> "$PGDATA/pg_hba.conf"
+    echo "host all all 0.0.0.0/0 trust" >> "$PGDATA/pg_hba.conf"
 fi
 
 echo "[init] starting postgres (PID 1)"
