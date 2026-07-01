@@ -47,6 +47,9 @@ pub async fn ensure_vm(cfg: &Config, schema: &str) -> Result<Arc<SchemaEntry>> {
                     driver: Some(SandboxDriver::Firecracker),
                     open_ports: vec![VM_PG_PORT],
                     size_class: Some(SandboxSize::Micro),
+                    // Persistent data disk → /dev/vdb → /workspace → PGDATA, so
+                    // the schema's data survives VM stop/start/restart.
+                    disk_size_gb: Some(cfg.data_disk_gb),
                     ttl_seconds: cfg.ttl_seconds,
                     wait_for_ready: Some(cfg.ready_timeout),
                     ..Default::default()

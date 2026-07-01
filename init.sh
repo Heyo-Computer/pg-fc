@@ -14,6 +14,17 @@
 
 set -e
 
+# The kernel hands PID 1 a minimal PATH, and Docker's `ENV PATH` does NOT apply
+# on the Firecracker boot path (no container runtime sets it up). The versioned
+# Postgres binaries live in /usr/lib/postgresql/<major>/bin, so without this
+# `gosu postgres initdb` fails with "initdb: executable file not found in $PATH"
+# and PID 1 exits → kernel panic. Establish a sane base PATH and prepend every
+# installed major's bin dir (glob stays literal and is skipped if none match).
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+for pgbin in /usr/lib/postgresql/*/bin; do
+    [ -d "$pgbin" ] && PATH="$pgbin:$PATH"
+done
+
 # The block device Firecracker exposes for the data volume. Override via the
 # kernel cmdline (e.g. `pgdata_dev=/dev/vdc`) when the drive ordering differs.
 DATA_DEV="${pgdata_dev:-/dev/vdb}"
@@ -69,6 +80,35 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
     echo "host all all 0.0.0.0/0 trust" >> "$PGDATA/pg_hba.conf"
 fi
 
-echo "[init] starting postgres (PID 1)"
-# exec so postgres becomes PID 1 and handles SIGTERM/SIGINT shutdown directly.
-exec gosu postgres postgres -D "$PGDATA"
+# Postgres opens its unix socket (and lock file) in /var/run/postgresql, which
+# is a symlink to the /run tmpfs we mounted above — so the directory the package
+# ships is gone and must be recreated each boot, owned by postgres.
+mkdir -p /var/run/postgresql
+chown postgres:postgres /var/run/postgresql
+
+echo "[init] starting postgres"
+# Run Postgres as a background child rather than `exec`-ing it as PID 1. The
+# heyvm daemon drives an exec channel over the serial console (ttyS0): it writes
+# `echo START; (cmd); echo END $?` to the console and waits for a *shell* to run
+# it. It uses this for lifecycle ops like /etc/hosts injection. If Postgres owns
+# the console (exec postgres), nothing services that channel, so every daemon
+# exec blocks ~30s then fails over to SSH (also absent) — adding tens of seconds
+# to each VM create, and worse as sibling VMs multiply. Keeping a shell on the
+# console (below) makes creates fast.
+#
+# Trade-off: Postgres no longer receives the VM's SIGTERM directly. That's fine
+# here — Postgres is crash-safe (WAL replay on next boot) and the data dir is
+# currently ephemeral. If clean shutdown matters later, trap TERM in this shell
+# and forward it to $PG_PID.
+gosu postgres postgres -D "$PGDATA" &
+
+# heyvm's `wait_for_ready` scans the serial console for this exact marker and
+# times out (panicking the create) if it never appears. Postgres binds 5432
+# within ~1s and the pooler retries `SELECT 1` (wait_pg_ready), so emitting it
+# now (rather than after Postgres is fully up) is safe.
+echo "HEYVM_READY"
+
+# Hand PID 1 to a shell on the serial console so the daemon's exec channel works
+# (see above) and PID 1 stays alive for the VM's lifetime. Firecracker keeps the
+# console open, so this never sees EOF while the VM runs.
+exec /bin/sh

@@ -51,8 +51,12 @@ ENV PATH="/usr/lib/postgresql/${PG_MAJOR}/bin:${PATH}"
 RUN mkdir -p /workspace \
     && chown postgres:postgres /workspace
 
-COPY init.sh /sbin/init.sh
-RUN chmod +x /sbin/init.sh
+# The heyvm/Firecracker builder boots with a fixed kernel arg `init=/init.sh`,
+# so the script must live at the rootfs *root* (not /sbin). A mismatch panics
+# the kernel with "Requested init /init.sh failed (error -2)" (ENOENT).
+COPY init.sh /init.sh
+RUN chmod +x /init.sh
 
-# Firecracker is pointed at this via the kernel boot arg `init=/sbin/init.sh`.
-ENTRYPOINT ["/sbin/init.sh"]
+# ENTRYPOINT is ignored on the Firecracker boot path (the kernel `init=` arg
+# wins), but keep it so the image is still runnable as a normal container.
+ENTRYPOINT ["/init.sh"]
