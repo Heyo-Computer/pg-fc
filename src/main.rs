@@ -33,6 +33,7 @@ async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
     let listen_addr = cfg.listen_addr;
     let registry = Arc::new(SchemaRegistry::new(cfg));
+    registry.spawn_reaper();
 
     let listener = TcpListener::bind(listen_addr).await?;
     info!("pg-vm-pool listening on {listen_addr}");
@@ -56,8 +57,10 @@ async fn handle_conn(mut client: TcpStream, registry: Arc<SchemaRegistry>) -> Re
     }
     info!("client requested schema {schema}");
 
-    let entry = registry.get_or_init(&schema).await?;
-    proxy::splice(client, &entry, &info.raw).await
+    // Hold the guard for the whole connection: it keeps the VM off the idle
+    // reaper's radar until the client disconnects.
+    let guard = registry.checkout(&schema).await?;
+    proxy::splice(client, guard.entry(), &info.raw).await
 }
 
 /// Conservative guard on the client-supplied schema name: it becomes both a

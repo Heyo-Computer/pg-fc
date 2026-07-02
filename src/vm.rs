@@ -11,7 +11,7 @@ use heyo_sdk::{
     SandboxStatus, DEFAULT_LOCAL_BASE_URL,
 };
 use tokio::time::sleep;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::registry::SchemaEntry;
@@ -30,6 +30,7 @@ fn local_opts() -> HeyoClientOptions {
 /// Bring up (or reattach to) the VM for `schema` and return a ready entry.
 pub async fn ensure_vm(cfg: &Config, schema: &str) -> Result<Arc<SchemaEntry>> {
     let name = format!("pg-{schema}");
+    let keepalive = cfg.is_keepalive(schema);
 
     let existing = Sandbox::list(local_opts())
         .await
@@ -39,7 +40,7 @@ pub async fn ensure_vm(cfg: &Config, schema: &str) -> Result<Arc<SchemaEntry>> {
 
     let sandbox = match existing {
         None => {
-            info!("creating VM {name}");
+            info!("creating VM {name}{}", if keepalive { " (keep-alive)" } else { "" });
             Sandbox::create(
                 SandboxCreateOptions {
                     name: Some(name.clone()),
@@ -50,7 +51,11 @@ pub async fn ensure_vm(cfg: &Config, schema: &str) -> Result<Arc<SchemaEntry>> {
                     // Persistent data disk → /dev/vdb → /workspace → PGDATA, so
                     // the schema's data survives VM stop/start/restart.
                     disk_size_gb: Some(cfg.data_disk_gb),
-                    ttl_seconds: cfg.ttl_seconds,
+                    // Always 0: the pooler owns VM lifecycle. Keep-alive schemas
+                    // stay up; others are stopped by the pooler's idle reaper,
+                    // which tracks connections — something the daemon's absolute
+                    // TTL can't do. A non-zero daemon TTL would just fight it.
+                    ttl_seconds: Some(0),
                     wait_for_ready: Some(cfg.ready_timeout),
                     ..Default::default()
                 },
@@ -85,6 +90,17 @@ pub async fn ensure_vm(cfg: &Config, schema: &str) -> Result<Arc<SchemaEntry>> {
         }
     };
 
+    // Pin keep-alive schemas idempotently: TTL 0 = never auto-stopped. This
+    // covers a VM created before its schema was pinned (or created with a
+    // non-zero TTL) — a freshly-created keep-alive VM is already TTL 0, so this
+    // is a harmless no-op there. Best-effort: a failure here shouldn't block
+    // serving the connection, so we warn rather than bail.
+    if keepalive {
+        if let Err(e) = sandbox.set_ttl(0).await {
+            warn!("failed to pin keep-alive VM {name} (set_ttl 0): {e:#}");
+        }
+    }
+
     // Expose the VM's Postgres over an iroh tunnel and dial it locally. The
     // tunnel task is aborted when the returned P2pTunnel drops, so SchemaEntry
     // owns it for the process lifetime.
@@ -105,7 +121,9 @@ pub async fn ensure_vm(cfg: &Config, schema: &str) -> Result<Arc<SchemaEntry>> {
     wait_pg_ready(&pool, cfg.ready_timeout).await?;
     ensure_database(&pool, schema).await?;
 
-    Ok(Arc::new(SchemaEntry { sandbox, tunnel, local_port, pool }))
+    Ok(Arc::new(SchemaEntry::new(
+        sandbox, tunnel, local_port, pool, keepalive,
+    )))
 }
 
 fn build_pool(port: u16, dbname: &str, user: &str) -> Result<Pool> {

@@ -1,12 +1,16 @@
 //! Schema -> VM registry. One entry per schema, created once and reused.
+//! A background reaper stops VMs that go idle (no connections) for too long.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use deadpool_postgres::Pool;
 use heyo_sdk::{P2pTunnel, Sandbox};
 use tokio::sync::{Mutex, OnceCell};
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::vm;
@@ -14,7 +18,6 @@ use crate::vm;
 /// A ready, warm VM for one schema. Holding `tunnel` keeps the iroh forward
 /// alive; holding `pool` keeps a bootstrap/health connection warm.
 pub struct SchemaEntry {
-    #[allow(dead_code)]
     pub sandbox: Sandbox,
     #[allow(dead_code)]
     pub tunnel: P2pTunnel,
@@ -22,6 +25,69 @@ pub struct SchemaEntry {
     pub local_port: u16,
     #[allow(dead_code)]
     pub pool: Pool,
+    /// Exempt from idle reaping (a permanent keep-alive schema).
+    pub keepalive: bool,
+    /// Number of client connections currently spliced through this entry.
+    active: AtomicUsize,
+    /// Last time a connection started or ended. `active == 0` plus a stale
+    /// `last_active` is what marks the VM idle. Refreshed at checkout so an
+    /// entry handed out but not yet counted in `active` isn't reaped mid-race.
+    last_active: StdMutex<Instant>,
+}
+
+impl SchemaEntry {
+    pub fn new(
+        sandbox: Sandbox,
+        tunnel: P2pTunnel,
+        local_port: u16,
+        pool: Pool,
+        keepalive: bool,
+    ) -> Self {
+        Self {
+            sandbox,
+            tunnel,
+            local_port,
+            pool,
+            keepalive,
+            active: AtomicUsize::new(0),
+            last_active: StdMutex::new(Instant::now()),
+        }
+    }
+
+    fn touch(&self) {
+        *self.last_active.lock().unwrap() = Instant::now();
+    }
+
+    /// Idle = not keep-alive, no live connections, and quiet for `>= timeout`.
+    fn is_idle(&self, timeout: Duration) -> bool {
+        !self.keepalive
+            && self.active.load(Ordering::SeqCst) == 0
+            && self.last_active.lock().unwrap().elapsed() >= timeout
+    }
+}
+
+/// RAII marker for one in-flight client connection. Bumps the entry's active
+/// count for its lifetime and refreshes activity on both ends, so the reaper
+/// never stops a VM with (or that just had) a live connection.
+pub struct ConnGuard(Arc<SchemaEntry>);
+
+impl ConnGuard {
+    fn new(entry: Arc<SchemaEntry>) -> Self {
+        entry.active.fetch_add(1, Ordering::SeqCst);
+        entry.touch();
+        Self(entry)
+    }
+
+    pub fn entry(&self) -> &SchemaEntry {
+        &self.0
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+        self.0.touch();
+    }
 }
 
 pub struct SchemaRegistry {
@@ -40,18 +106,116 @@ impl SchemaRegistry {
         }
     }
 
-    /// Get the entry for `schema`, bringing the VM up on first request.
+    /// Check out the entry for `schema`, bringing the VM up on first request.
+    /// The returned guard keeps the VM off the reaper's radar until dropped.
     /// Concurrent callers for the same schema share one bring-up.
-    pub async fn get_or_init(&self, schema: &str) -> Result<Arc<SchemaEntry>> {
-        let cell = {
-            let mut map = self.entries.lock().await;
-            map.entry(schema.to_string())
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+    pub async fn checkout(&self, schema: &str) -> Result<ConnGuard> {
+        loop {
+            // Warm path: take a guard while still holding the map lock, which the
+            // reaper also takes — so it can't evict this entry between its
+            // idle-check and our increment. The guard also keeps `active > 0`
+            // during the liveness probe below, so the reaper leaves it alone.
+            let (cell, warm) = {
+                let mut map = self.entries.lock().await;
+                let cell = map
+                    .entry(schema.to_string())
+                    .or_insert_with(|| Arc::new(OnceCell::new()))
+                    .clone();
+                let warm = cell.get().map(|e| ConnGuard::new(e.clone()));
+                (cell, warm)
+            };
+
+            if let Some(guard) = warm {
+                // A VM stopped out-of-band (manual stop) or a tunnel dropped by a
+                // network change leaves a cached entry whose local tunnel still
+                // accepts but never reaches Postgres — splicing to it would hang.
+                // Probe first; reuse only if it actually answers, else evict and
+                // fall through to re-init (which restarts the VM).
+                if self.entry_alive(guard.entry()).await {
+                    return Ok(guard);
+                }
+                warn!("schema {schema}: cached VM unreachable, restarting it");
+                drop(guard);
+                self.evict(schema, &cell).await;
+                continue;
+            }
+
+            // Cold path: bring the VM up without holding the map lock. Concurrent
+            // first-connects share one bring-up via the OnceCell.
+            let entry = cell
+                .get_or_try_init(|| vm::ensure_vm(&self.cfg, schema))
+                .await?;
+            return Ok(ConnGuard::new(entry.clone()));
+        }
+    }
+
+    /// Remove `cell` from the map iff it's still the current cell for `schema`,
+    /// so a concurrent re-init that already installed a fresh cell isn't lost.
+    async fn evict(&self, schema: &str, cell: &Arc<OnceCell<Arc<SchemaEntry>>>) {
+        let mut map = self.entries.lock().await;
+        if matches!(map.get(schema), Some(cur) if Arc::ptr_eq(cur, cell)) {
+            map.remove(schema);
+        }
+    }
+
+    /// Timeout-bounded liveness probe: can we run `SELECT 1` on the VM's Postgres
+    /// through the tunnel? Catches both a stopped VM and a dead tunnel (either
+    /// makes `pool.get()`/the query hang, which the timeout bounds). Cheap on a
+    /// healthy warm VM (a local round-trip), so it's safe per checkout.
+    async fn entry_alive(&self, entry: &SchemaEntry) -> bool {
+        let probe = async {
+            let client = entry.pool.get().await?;
+            client.simple_query("SELECT 1").await?;
+            Ok::<(), anyhow::Error>(())
         };
-        let entry = cell
-            .get_or_try_init(|| vm::ensure_vm(&self.cfg, schema))
-            .await?;
-        Ok(entry.clone())
+        matches!(
+            tokio::time::timeout(Duration::from_secs(3), probe).await,
+            Ok(Ok(()))
+        )
+    }
+
+    /// Spawn the background idle-reaper if an idle timeout is configured.
+    pub fn spawn_reaper(self: &Arc<Self>) {
+        let Some(timeout) = self.cfg.idle_timeout else {
+            info!("idle reaping disabled (PG_VM_POOL_IDLE_TIMEOUT_SECS=0)");
+            return;
+        };
+        info!("idle reaper: stopping VMs after {timeout:?} without connections");
+        let registry = self.clone();
+        // Check a few times per timeout window so shutdown lands close to the
+        // deadline, but not so often it busies the daemon.
+        let tick = (timeout / 4).max(Duration::from_secs(5));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tick).await;
+                registry.reap_idle(timeout).await;
+            }
+        });
+    }
+
+    /// Evict and stop every idle VM. Eviction (removing the map cell) happens
+    /// under the lock so a concurrent `checkout` either sees the entry before
+    /// eviction (and bumps `active`, sparing it) or misses it and brings up a
+    /// fresh VM. The actual stop happens after the lock is released.
+    async fn reap_idle(&self, timeout: Duration) {
+        let mut victims: Vec<(String, Arc<SchemaEntry>)> = Vec::new();
+        {
+            let mut map = self.entries.lock().await;
+            map.retain(|schema, cell| match cell.get() {
+                Some(entry) if entry.is_idle(timeout) => {
+                    victims.push((schema.clone(), entry.clone()));
+                    false
+                }
+                _ => true,
+            });
+        }
+        for (schema, entry) in victims {
+            info!("idle-stopping VM for schema {schema} (no connections for >= {timeout:?})");
+            if let Err(e) = entry.sandbox.stop().await {
+                warn!("failed to stop idle VM for schema {schema}: {e:#}");
+            }
+            // Dropping the last Arc here tears down the tunnel + pool. Data on
+            // the VM's /dev/vdb persists; a later connect restarts the VM.
+        }
     }
 }
