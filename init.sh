@@ -74,11 +74,36 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
     # the real security boundary here. Set a password and switch this back to
     # scram-sha-256 for any deployment where the VM's 5432 is broadly reachable.
     gosu postgres initdb --pgdata="$PGDATA" --encoding=UTF8 --auth-host=trust
-
-    # Listen on all interfaces so the host/tunnel can reach it.
-    echo "listen_addresses = '*'" >> "$PGDATA/postgresql.conf"
-    echo "host all all 0.0.0.0/0 trust" >> "$PGDATA/pg_hba.conf"
 fi
+
+# Reconcile the network-facing config on EVERY boot, not just first init. Two
+# reasons this must be idempotent and self-healing:
+#   1. The pooler stops VMs with an unclean kill (no clean Postgres shutdown).
+#      ext4 delayed allocation means a first-boot append to postgresql.conf that
+#      was never fsync'd can be left as NUL bytes on disk after that kill, and
+#      Postgres then refuses to start ("syntax error ... near token"). Stripping
+#      NULs here repairs a config the previous boot corrupted.
+#   2. A config lost to corruption (or an image whose base conf lacks these)
+#      is restored rather than leaving the VM unreachable.
+# Postgres data itself is WAL/fsync-protected; only these plain config appends
+# are at risk, so healing them is enough. `sync` at the end makes the repaired
+# files durable before we hand control to Postgres.
+heal_line() {
+    # heal_line <file> <match-prefix> <full-line>
+    # Drop any NUL bytes, then ensure exactly the desired directive is present.
+    file="$1"; prefix="$2"; line="$3"
+    if [ -f "$file" ]; then
+        tr -d '\000' < "$file" > "$file.heal" && mv "$file.heal" "$file"
+    fi
+    if ! grep -q "^$prefix" "$file" 2>/dev/null; then
+        echo "$line" >> "$file"
+    fi
+}
+# Listen on all interfaces so the host/tunnel can reach it.
+heal_line "$PGDATA/postgresql.conf" "listen_addresses" "listen_addresses = '*'"
+heal_line "$PGDATA/pg_hba.conf" "host all all 0.0.0.0/0 trust" "host all all 0.0.0.0/0 trust"
+chown postgres:postgres "$PGDATA/postgresql.conf" "$PGDATA/pg_hba.conf" 2>/dev/null || true
+sync
 
 # Postgres opens its unix socket (and lock file) in /var/run/postgresql, which
 # is a symlink to the /run tmpfs we mounted above — so the directory the package

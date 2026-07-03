@@ -9,6 +9,7 @@ mod config;
 mod proxy;
 mod registry;
 mod startup;
+mod store;
 mod vm;
 
 use std::sync::Arc;

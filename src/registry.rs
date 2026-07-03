@@ -2,6 +2,7 @@
 //! A background reaper stops VMs that go idle (no connections) for too long.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -13,16 +14,21 @@ use tokio::sync::{Mutex, OnceCell};
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::store::Store;
 use crate::vm;
 
-/// A ready, warm VM for one schema. Holding `tunnel` keeps the iroh forward
-/// alive; holding `pool` keeps a bootstrap/health connection warm.
+/// A ready, warm VM for one schema. `target` is where client bytes are spliced
+/// — either the VM's guest IP directly (same-host, no tunnel) or the local end
+/// of an iroh tunnel. Holding `tunnel` (when present) keeps that forward alive;
+/// holding `pool` keeps a bootstrap/health connection warm.
 pub struct SchemaEntry {
     pub sandbox: Sandbox,
+    /// Splice destination for this schema's Postgres.
+    pub target: SocketAddr,
+    /// Some in tunnel mode (kept alive for the entry's lifetime); None when
+    /// dialing the guest IP directly.
     #[allow(dead_code)]
-    pub tunnel: P2pTunnel,
-    /// Local 127.0.0.1 port the tunnel listens on — the splice target.
-    pub local_port: u16,
+    pub tunnel: Option<P2pTunnel>,
     #[allow(dead_code)]
     pub pool: Pool,
     /// Exempt from idle reaping (a permanent keep-alive schema).
@@ -38,15 +44,15 @@ pub struct SchemaEntry {
 impl SchemaEntry {
     pub fn new(
         sandbox: Sandbox,
-        tunnel: P2pTunnel,
-        local_port: u16,
+        target: SocketAddr,
+        tunnel: Option<P2pTunnel>,
         pool: Pool,
         keepalive: bool,
     ) -> Self {
         Self {
             sandbox,
+            target,
             tunnel,
-            local_port,
             pool,
             keepalive,
             active: AtomicUsize::new(0),
@@ -96,13 +102,19 @@ pub struct SchemaRegistry {
     // (slow) first VM bring-up without blocking other schemas. A failed init
     // leaves the cell empty so the next client retries.
     entries: Mutex<HashMap<String, Arc<OnceCell<Arc<SchemaEntry>>>>>,
+    // Persistent schema → sandbox-id map. Outlives entry eviction and process
+    // restarts, so a reconnect after a stop/reap/restart reattaches to the same
+    // VM (by id) rather than creating a duplicate with a fresh, empty data disk.
+    store: Store,
 }
 
 impl SchemaRegistry {
     pub fn new(cfg: Config) -> Self {
+        let store = Store::load(cfg.state_file.clone());
         Self {
             cfg,
             entries: Mutex::new(HashMap::new()),
+            store,
         }
     }
 
@@ -141,11 +153,34 @@ impl SchemaRegistry {
             }
 
             // Cold path: bring the VM up without holding the map lock. Concurrent
-            // first-connects share one bring-up via the OnceCell.
-            let entry = cell
-                .get_or_try_init(|| vm::ensure_vm(&self.cfg, schema))
-                .await?;
-            return Ok(ConnGuard::new(entry.clone()));
+            // first-connects share one bring-up via the OnceCell (one runs
+            // ensure_vm, the rest await it here). Log entry/exit with timing so a
+            // slow or stuck bring-up is visible — otherwise a client just parks
+            // here silently until ready_timeout, which reads as a hang in the log.
+            let started = Instant::now();
+            info!("schema {schema}: cold start, bringing up VM (or awaiting in-progress bring-up)");
+            // Reattach to the VM we last used for this schema (survives eviction
+            // and process restarts), else find-or-create by name.
+            let known_id = self.store.get(schema);
+            match cell
+                .get_or_try_init(|| vm::ensure_vm(&self.cfg, schema, known_id.as_deref()))
+                .await
+            {
+                Ok(entry) => {
+                    // Remember which VM now backs this schema so a later restart
+                    // reattaches to it instead of creating a duplicate.
+                    self.store.put(schema, entry.sandbox.sandbox_id());
+                    info!("schema {schema}: VM ready in {:?}", started.elapsed());
+                    return Ok(ConnGuard::new(entry.clone()));
+                }
+                Err(e) => {
+                    warn!(
+                        "schema {schema}: bring-up failed after {:?}: {e:#}",
+                        started.elapsed()
+                    );
+                    return Err(e);
+                }
+            }
         }
     }
 

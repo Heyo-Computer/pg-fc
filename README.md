@@ -57,8 +57,20 @@ psql "host=127.0.0.1 port=6432 user=postgres dbname=tenant1"   # -> VM pg-tenant
 ```
 
 Config via env: `PG_VM_POOL_LISTEN`, `PG_VM_POOL_IMAGE` (default `pg`),
-`PG_VM_POOL_USER`, `PG_VM_POOL_TTL_SECONDS`, `PG_VM_POOL_READY_TIMEOUT_SECS`.
+`PG_VM_POOL_USER`, `PG_VM_POOL_PASSWORD` (optional), `PG_VM_POOL_READY_TIMEOUT_SECS`,
+`PG_VM_POOL_CONNECT_TIMEOUT_SECS` (tunnel-handshake cap, default 30),
+`PG_VM_POOL_DIRECT_CONNECT` (default on).
 
 Requires a local heyvmd with the `POST /sandboxes/:id/tcp-tunnel` endpoint and
-`heyo-sdk` ≥ 0.1.3 (`Sandbox::expose_tcp`). Connect as `user=postgres`; the VM's
-`trust` host auth needs no password (see the auth note in `init.sh`).
+`heyo-sdk` ≥ 0.1.5 (`Sandbox::expose_tcp` + `SandboxInfo.guest_ip`). Connect as
+`user=postgres`; the VM's `trust` host auth needs no password (see the auth note
+in `init.sh`). Set `PG_VM_POOL_USER`/`PG_VM_POOL_PASSWORD` if a VM's Postgres
+instead requires password auth (scram/md5) — the pooler uses them for its
+readiness probe and per-schema bootstrap connection.
+
+**Direct connect (default):** when the pooler shares the host with the VMs (the
+local-daemon deployment), it dials each VM's Postgres directly at its `guest_ip`
+over the host tap and skips the iroh tunnel entirely — no relay dependency,
+lower latency, faster bring-up. It falls back to a tunnel automatically if the
+daemon reports no `guest_ip`. Set `PG_VM_POOL_DIRECT_CONNECT=0` to force the
+tunnel path (e.g. if the pooler ever runs on a different machine than the VMs).

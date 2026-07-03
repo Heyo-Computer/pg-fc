@@ -1155,9 +1155,9 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "heyo-sdk"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "859ae18c63c5fdb62d1fe452bc0c45686a8f397313af7a83c0406c2c69c28b36"
+checksum = "8f81920102647d4ea487184cb01f3c2bba9ce2095de72a862978b5ab709ffd24"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2466,6 +2466,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "deadpool-postgres",
+ "futures",
  "heyo-sdk",
  "tokio",
  "tokio-postgres",

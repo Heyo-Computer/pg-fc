@@ -6,8 +6,9 @@ edition = "2024"
 [dependencies]
 deadpool-postgres = "0.14.1"
 tokio-postgres = "0.7"
-heyo-sdk = "0.1.4"
+heyo-sdk = "0.1.5"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+futures = "0.3.32"

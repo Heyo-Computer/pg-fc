@@ -6,12 +6,13 @@ use tokio::net::TcpStream;
 
 use crate::registry::SchemaEntry;
 
-/// Dial the schema's tunnel, replay the buffered StartupMessage, then pipe both
-/// directions until either side closes.
+/// Dial the schema's VM Postgres (guest IP directly, or the tunnel's local end),
+/// replay the buffered StartupMessage, then pipe both directions until either
+/// side closes.
 pub async fn splice(mut client: TcpStream, entry: &SchemaEntry, startup_raw: &[u8]) -> Result<()> {
-    let mut upstream = TcpStream::connect(("127.0.0.1", entry.local_port))
+    let mut upstream = TcpStream::connect(entry.target)
         .await
-        .with_context(|| format!("connecting to tunnel 127.0.0.1:{}", entry.local_port))?;
+        .with_context(|| format!("connecting to VM Postgres at {}", entry.target))?;
 
     upstream
         .write_all(startup_raw)
