@@ -10,6 +10,7 @@ mod proxy;
 mod registry;
 mod startup;
 mod store;
+mod tls;
 mod vm;
 
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use tracing_subscriber::EnvFilter;
 
 use config::Config;
 use registry::SchemaRegistry;
+use tls::TlsReloader;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -33,6 +35,19 @@ async fn main() -> Result<()> {
 
     let cfg = Config::from_env()?;
     let listen_addr = cfg.listen_addr;
+    // Client-facing TLS: certbot (or any external renewer) owns the PEM files;
+    // the reloader picks up rotations without a restart. Built before the
+    // registry so a bad cert fails startup fast.
+    let tls = match (cfg.tls_cert.clone(), cfg.tls_key.clone()) {
+        (Some(cert), Some(key)) => {
+            info!("TLS enabled (cert={}, hot-reload on change)", cert.display());
+            Some(Arc::new(TlsReloader::new(cert, key)?))
+        }
+        _ => {
+            info!("TLS disabled (set PG_VM_POOL_TLS_CERT/KEY to enable)");
+            None
+        }
+    };
     let registry = Arc::new(SchemaRegistry::new(cfg));
     registry.spawn_reaper();
 
@@ -42,16 +57,21 @@ async fn main() -> Result<()> {
     loop {
         let (sock, peer) = listener.accept().await?;
         let registry = registry.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(sock, registry).await {
+            if let Err(e) = handle_conn(sock, registry, tls).await {
                 warn!("connection {peer} closed: {e:#}");
             }
         });
     }
 }
 
-async fn handle_conn(mut client: TcpStream, registry: Arc<SchemaRegistry>) -> Result<()> {
-    let info = startup::read_startup(&mut client).await?;
+async fn handle_conn(
+    client: TcpStream,
+    registry: Arc<SchemaRegistry>,
+    tls: Option<Arc<TlsReloader>>,
+) -> Result<()> {
+    let (client, info) = startup::read_startup(client, tls.as_deref()).await?;
     let schema = info.database.clone();
     if !is_valid_schema(&schema) {
         anyhow::bail!("rejecting invalid schema name {schema:?}");

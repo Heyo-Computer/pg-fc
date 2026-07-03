@@ -53,6 +53,13 @@ pub struct Config {
     /// to the right VM (by id) after a restart instead of creating a duplicate
     /// with a fresh data disk. Env `PG_VM_POOL_STATE_FILE`.
     pub state_file: PathBuf,
+    /// TLS certificate chain + private key (PEM) for client-facing TLS. Both
+    /// set → the pooler answers the Postgres `SSLRequest` with `S` and speaks
+    /// TLS; unset → it declines (`N`) as before. Files are re-read on change,
+    /// so an external renewer (certbot) rotating them needs no restart.
+    /// Envs `PG_VM_POOL_TLS_CERT` / `PG_VM_POOL_TLS_KEY`.
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
 }
 
 impl Config {
@@ -111,6 +118,22 @@ impl Config {
                 let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
                 PathBuf::from(home).join(".heyo/pg-vm-pool/registry.tsv")
             });
+        // TLS cert/key PEM paths; empty treated as unset (like PASSWORD above).
+        // Setting only one of the pair is a configuration mistake — fail fast
+        // rather than silently serving plaintext.
+        let tls_cert = std::env::var("PG_VM_POOL_TLS_CERT")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from);
+        let tls_key = std::env::var("PG_VM_POOL_TLS_KEY")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from);
+        if tls_cert.is_some() != tls_key.is_some() {
+            anyhow::bail!(
+                "PG_VM_POOL_TLS_CERT and PG_VM_POOL_TLS_KEY must be set together (or neither)"
+            );
+        }
         // Comma-separated schema names; blanks/whitespace ignored.
         let keepalive_schemas = std::env::var("PG_VM_POOL_KEEPALIVE_SCHEMAS")
             .unwrap_or_default()
@@ -132,6 +155,8 @@ impl Config {
             keepalive_schemas,
             direct_connect,
             state_file,
+            tls_cert,
+            tls_key,
         })
     }
 }

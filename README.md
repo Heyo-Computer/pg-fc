@@ -7,7 +7,7 @@ on a separate volume mounted at `/workspace`.
 
 | file | purpose |
 |------|---------|
-| `Dockerfile` | Debian + Postgres image; ships `init.sh` as `/sbin/init.sh` |
+| `Dockerfile` | Debian + Postgres image; ships `init.sh` as `/init.sh` |
 | `init.sh` | PID 1 inside the microVM: mounts pseudo-fs + data volume, init's the cluster, exec's postgres |
 | `build-rootfs.sh` | Builds the image and flattens it into a bootable ext4 rootfs |
 
@@ -51,22 +51,47 @@ schema**. The database name in the client's connection string selects the
 schema; the pooler lazily creates/restarts the `pg-<schema>` VM, opens a raw-TCP
 iroh tunnel to its Postgres, and splices the connection through.
 
+### Using the pooler
+
+Prereqs: a running local heyvmd (`heyvm --api --port 34099`) with the
+`POST /sandboxes/:id/tcp-tunnel` endpoint, `heyo-sdk` ≥ 0.1.5, and the `pg`
+image built (`heyvm mvm build --local-only -f Dockerfile --name pg`).
+
 ```sh
-cargo run                       # listens on 127.0.0.1:6432 (PG_VM_POOL_LISTEN)
+cargo build --release
+target/release/pg-vm-pool       # listens on 127.0.0.1:6432 (PG_VM_POOL_LISTEN)
+
+# The dbname selects (and lazily creates) the VM — one per schema:
 psql "host=127.0.0.1 port=6432 user=postgres dbname=tenant1"   # -> VM pg-tenant1
+psql "host=127.0.0.1 port=6432 user=postgres dbname=tenant2"   # -> VM pg-tenant2
 ```
 
-Config via env: `PG_VM_POOL_LISTEN`, `PG_VM_POOL_IMAGE` (default `pg`),
-`PG_VM_POOL_USER`, `PG_VM_POOL_PASSWORD` (optional), `PG_VM_POOL_READY_TIMEOUT_SECS`,
-`PG_VM_POOL_CONNECT_TIMEOUT_SECS` (tunnel-handshake cap, default 30),
-`PG_VM_POOL_DIRECT_CONNECT` (default on).
+First connect to a new schema boots a VM (~2s); reconnects reuse or restart it.
+Each schema's data lives on its VM's persistent disk and survives stops,
+restarts, and idle reaping. The schema→VM binding is persisted in
+`PG_VM_POOL_STATE_FILE` (default `~/.heyo/pg-vm-pool/registry.tsv`) so it also
+survives pooler restarts.
 
-Requires a local heyvmd with the `POST /sandboxes/:id/tcp-tunnel` endpoint and
-`heyo-sdk` ≥ 0.1.5 (`Sandbox::expose_tcp` + `SandboxInfo.guest_ip`). Connect as
-`user=postgres`; the VM's `trust` host auth needs no password (see the auth note
-in `init.sh`). Set `PG_VM_POOL_USER`/`PG_VM_POOL_PASSWORD` if a VM's Postgres
-instead requires password auth (scram/md5) — the pooler uses them for its
-readiness probe and per-schema bootstrap connection.
+Connect as `user=postgres`; the VM image's `trust` host auth needs no password
+(see the auth note in `init.sh`). Set `PG_VM_POOL_USER`/`PG_VM_POOL_PASSWORD`
+if a VM's Postgres instead requires password auth (scram/md5) — the pooler uses
+them for its readiness probe and per-schema bootstrap connection.
+
+Config via env (all optional):
+
+| var | default | meaning |
+|-----|---------|---------|
+| `PG_VM_POOL_LISTEN` | `127.0.0.1:6432` | client listen address |
+| `PG_VM_POOL_IMAGE` | `pg` | Firecracker image per schema |
+| `PG_VM_POOL_USER` / `PG_VM_POOL_PASSWORD` | `postgres` / unset | probe+bootstrap credentials |
+| `PG_VM_POOL_IDLE_TIMEOUT_SECS` | `900` | stop a VM after this long with no connections; `0` disables |
+| `PG_VM_POOL_KEEPALIVE_SCHEMAS` | none | comma-separated schemas exempt from idle reaping |
+| `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size |
+| `PG_VM_POOL_READY_TIMEOUT_SECS` | `300` | max wait for VM+Postgres readiness |
+| `PG_VM_POOL_CONNECT_TIMEOUT_SECS` | `30` | iroh tunnel handshake cap |
+| `PG_VM_POOL_DIRECT_CONNECT` | on | dial guest IP directly; `0` forces the tunnel |
+| `PG_VM_POOL_STATE_FILE` | `~/.heyo/pg-vm-pool/registry.tsv` | persisted schema→VM map |
+| `PG_VM_POOL_TLS_CERT` / `PG_VM_POOL_TLS_KEY` | unset (TLS off) | PEM cert chain + key; see TLS below |
 
 **Direct connect (default):** when the pooler shares the host with the VMs (the
 local-daemon deployment), it dials each VM's Postgres directly at its `guest_ip`
@@ -74,3 +99,68 @@ over the host tap and skips the iroh tunnel entirely — no relay dependency,
 lower latency, faster bring-up. It falls back to a tunnel automatically if the
 daemon reports no `guest_ip`. Set `PG_VM_POOL_DIRECT_CONNECT=0` to force the
 tunnel path (e.g. if the pooler ever runs on a different machine than the VMs).
+
+### Managing with supervisord
+
+`deploy/supervisor/pg-vm-pool.conf` runs the release binary under supervisord
+and is the single place to manage the pooler's environment:
+
+```sh
+cargo build --release
+sudo ln -s /home/sam/Projects/pg-fc/deploy/supervisor/pg-vm-pool.conf \
+           /etc/supervisor/conf.d/pg-vm-pool.conf
+sudo mkdir -p /var/log/pg-vm-pool
+sudo supervisorctl reread && sudo supervisorctl update
+sudo supervisorctl status pg-vm-pool          # start/stop/restart/tail work too
+```
+
+Edit the `environment=` block in the conf to change any `PG_VM_POOL_*` var,
+then `supervisorctl reread && supervisorctl update pg-vm-pool` — note a plain
+`restart` does **not** reload `environment=`; `update` does. Comma-containing
+values (like `KEEPALIVE_SCHEMAS`) must be double-quoted. Logs land in
+`/var/log/pg-vm-pool/pg-vm-pool.log`.
+
+### TLS
+
+TLS is **off by default** and fully optional: without it the pooler answers the
+Postgres `SSLRequest` with `N` and clients proceed in plaintext exactly as
+before (`sslmode=prefer` falls back silently; `sslmode=disable` is unaffected).
+
+To enable, point the pooler at a PEM cert chain + private key:
+
+```sh
+PG_VM_POOL_TLS_CERT=/path/fullchain.pem \
+PG_VM_POOL_TLS_KEY=/path/privkey.pem \
+target/release/pg-vm-pool
+```
+
+Both must be set together (setting only one is a startup error). With TLS on,
+clients that ask get an encrypted session (`sslmode=require` works) and
+plaintext clients are **still accepted** — nothing breaks for existing local
+consumers. TLS terminates at the pooler; the pooler→VM hop stays plaintext over
+the host-local tap.
+
+The cert files are **hot-reloaded**: the pooler stats them before each
+handshake and rebuilds its acceptor when they change, so an external renewer
+can rotate certs with no pooler restart. With Let's Encrypt/certbot:
+
+```sh
+# one-time issuance (needs public DNS -> this host, port 80 free for the challenge)
+sudo certbot certonly --standalone -d pg.example.com
+
+# deploy hook: copy renewed certs somewhere the pooler user can read
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/pg-vm-pool.sh >/dev/null <<'EOF'
+#!/bin/sh
+d=/home/sam/.heyo/pg-vm-pool/tls
+mkdir -p "$d"
+install -o sam -g sam -m 600 "$RENEWED_LINEAGE/fullchain.pem" "$d/fullchain.pem"
+install -o sam -g sam -m 600 "$RENEWED_LINEAGE/privkey.pem"  "$d/privkey.pem"
+EOF
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/pg-vm-pool.sh
+# run the copy once by hand after the first issuance, then renewals are automatic
+```
+
+Then set `PG_VM_POOL_TLS_CERT`/`KEY` to those copies (see the commented lines
+in the supervisor conf). For clients beyond localhost also set
+`PG_VM_POOL_LISTEN=0.0.0.0:6432`, open the firewall, and have clients dial the
+certificate's hostname (`sslmode=verify-full host=pg.example.com`).

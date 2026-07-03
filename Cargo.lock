@@ -2468,8 +2468,10 @@ dependencies = [
  "deadpool-postgres",
  "futures",
  "heyo-sdk",
+ "rustls-pki-types",
  "tokio",
  "tokio-postgres",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]
