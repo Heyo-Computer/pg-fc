@@ -1,9 +1,18 @@
 # pg-fc
 
+This repo has two parts that fit together: a **Firecracker build** that
+produces a rootfs image booting straight into Postgres, and **pg-vm-pool**, a
+connection pooler that runs many of those microVMs behind a single Postgres
+endpoint — one VM per schema, created and stopped/restarted on demand. The
+Firecracker image is the unit the pooler manages; the pooler is what a real
+client actually connects to.
+
+## Postgres VM
+
 A Firecracker rootfs that boots straight into Postgres, with the data directory
 on a separate volume mounted at `/workspace`.
 
-## Files
+### Files
 
 | file | purpose |
 |------|---------|
@@ -11,7 +20,7 @@ on a separate volume mounted at `/workspace`.
 | `init.sh` | PID 1 inside the microVM: mounts pseudo-fs + data volume, init's the cluster, exec's postgres |
 | `build-rootfs.sh` | Builds the image and flattens it into a bootable ext4 rootfs |
 
-## Design
+### Design
 
 Firecracker boots a kernel + a flat rootfs and runs `init=` as PID 1 — there's
 no systemd. `init.sh` does the minimal init work and then `exec`s `postgres` so
@@ -22,7 +31,7 @@ which is a second Firecracker drive (`/dev/vdb` by default). On first boot the
 volume is formatted ext4 and the cluster is `initdb`'d into
 `/workspace/pgdata`; subsequent boots just mount and start.
 
-## Build
+### Build
 
 `build-rootfs.sh` needs Linux (mkfs.ext4 + loopback mount):
 
@@ -30,7 +39,7 @@ volume is formatted ext4 and the cluster is `initdb`'d into
 ./build-rootfs.sh pg-rootfs.ext4 2G
 ```
 
-## Boot
+### Boot
 
 ```sh
 firecracker --api-sock /tmp/fc.sock   # then configure via the API, or use a config:
@@ -164,3 +173,33 @@ Then set `PG_VM_POOL_TLS_CERT`/`KEY` to those copies (see the commented lines
 in the supervisor conf). For clients beyond localhost also set
 `PG_VM_POOL_LISTEN=0.0.0.0:6432`, open the firewall, and have clients dial the
 certificate's hostname (`sslmode=verify-full host=pg.example.com`).
+
+### Testing
+
+`examples/e2e.rs` and `examples/e2e_concurrent.rs` are end-to-end tests that
+exercise the full stack through a real client connection — not mocks: pooler
+routing, daemon VM create/stop/restart, and per-VM persistent disks.
+
+- `e2e.rs` drives one schema through several stop/restart cycles and
+  hard-asserts each restart actually comes back healthy (the `/dev/vdb` data
+  drive is still attached, and the guest's Postgres port is reachable) before
+  checking the rows written earlier survived.
+- `e2e_concurrent.rs` runs that same create/write/stop/restart/verify cycle for
+  several schemas (default 5) **at the same time**, each with distinct data,
+  to prove concurrent VMs don't cross-wire and the pooler restarts them all in
+  parallel.
+
+Prereqs: a running pooler (`target/release/pg-vm-pool`, default
+`127.0.0.1:6432`) and a running local heyvmd daemon. Then:
+
+```sh
+cargo run --release --example e2e
+cargo run --release --example e2e_concurrent
+```
+
+Useful env vars: `E2E_ROWS`, `E2E_CYCLES` (e2e.rs), `E2E_VMS` (e2e_concurrent.rs),
+`E2E_STOP_MODE=cli|sdk` (`cli` reproduces a manual/out-of-band stop via
+`heyvm stop`, the default and the path that catches the restart-silently-no-ops
+bug; `sdk` is the cooperative stop path), and `E2E_KEEP=1` to keep the test
+VM(s) around instead of deleting them at the end. See the doc comments at the
+top of each file for the full list.
