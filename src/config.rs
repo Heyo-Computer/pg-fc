@@ -5,12 +5,19 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use heyo_sdk::SandboxSize;
+
 #[derive(Clone)]
 pub struct Config {
     /// Where the pooler listens for Postgres clients.
     pub listen_addr: SocketAddr,
     /// Firecracker image name to boot per schema (`heyvm mvm build --name pg`).
     pub image: String,
+    /// VM resource tier for every schema's VM (same tier for all of them —
+    /// there's no per-schema override). `Micro` (the default) is 1 vCPU
+    /// throttled to 0.25 core and 512MB memory; see heyo's `SizeClass` for
+    /// the full tier table. Env `PG_VM_POOL_SIZE_CLASS`.
+    pub size_class: SandboxSize,
     /// Postgres role the pooler uses for the readiness probe + bootstrap. With
     /// the pg-fc image's `trust` host auth this needs no password.
     pub pg_user: String,
@@ -84,6 +91,10 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("invalid PG_VM_POOL_LISTEN {listen:?}: {e}"))?;
 
         let image = std::env::var("PG_VM_POOL_IMAGE").unwrap_or_else(|_| "pg".to_string());
+        let size_class = match std::env::var("PG_VM_POOL_SIZE_CLASS") {
+            Ok(v) => parse_size_class(&v)?,
+            Err(_) => SandboxSize::Micro,
+        };
         let pg_user = std::env::var("PG_VM_POOL_USER").unwrap_or_else(|_| "postgres".to_string());
         // Optional; unset means no password (trust auth). An empty value is
         // treated as unset so `PG_VM_POOL_PASSWORD=` doesn't force an empty
@@ -152,6 +163,7 @@ impl Config {
         Ok(Self {
             listen_addr,
             image,
+            size_class,
             pg_user,
             pg_password,
             idle_timeout,
@@ -164,5 +176,19 @@ impl Config {
             tls_cert,
             tls_key,
         })
+    }
+}
+
+/// Case-insensitive, matching heyo's own CLI parsing convention.
+fn parse_size_class(v: &str) -> anyhow::Result<SandboxSize> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "micro" => Ok(SandboxSize::Micro),
+        "mini" => Ok(SandboxSize::Mini),
+        "small" => Ok(SandboxSize::Small),
+        "medium" => Ok(SandboxSize::Medium),
+        "large" => Ok(SandboxSize::Large),
+        other => anyhow::bail!(
+            "invalid PG_VM_POOL_SIZE_CLASS {other:?}: expected one of micro, mini, small, medium, large"
+        ),
     }
 }

@@ -97,6 +97,12 @@ psql "host=127.0.0.1 port=6432 user=postgres dbname=tenant2"   # -> VM pg-tenant
 ```
 
 First connect to a new schema boots a VM (~2s); reconnects reuse or restart it.
+If Postgres dies while its VM stays up (OOM kill, segfault — the VM's PID 1 is
+a shell, so the sandbox still reports running), the pooler notices on the next
+connect: a short probe distinguishes a dead postmaster (silent port) from one
+that's alive but recovering (answers `57P03` during WAL replay), and only the
+former triggers an automatic stop/start of the VM — a fresh boot re-runs
+`init.sh`, which relaunches Postgres.
 Each schema's data lives on its VM's persistent disk and survives stops,
 restarts, and idle reaping. The schema→VM binding is persisted in
 `PG_VM_POOL_STATE_FILE` (default `~/.heyo/pg-vm-pool/registry.tsv`) so it also
@@ -120,6 +126,18 @@ Config via env (all optional):
 |-----|---------|---------|
 | `PG_VM_POOL_LISTEN` | `127.0.0.1:6432` | client listen address |
 | `PG_VM_POOL_IMAGE` | `pg` | Firecracker image per schema |
+| `PG_VM_POOL_SIZE_CLASS` | `micro` | VM resource tier for every schema's VM: `micro` (0.25 CPU, 512MB), `mini` (0.5 CPU, 1GB), `small` (1 CPU, 2GB), `medium` (2 CPU, 4GB), `large` (4 CPU, 8GB) |
+
+Postgres inside each VM **tunes itself to the VM's resources at every boot**:
+`init.sh` reads live RAM/vCPUs/disk and regenerates
+`$PGDATA/heyvm-tuning.conf` (`shared_buffers` = ¼ RAM, `work_mem`,
+`maintenance_work_mem`, WAL sizing from the data disk, parallel workers from
+vCPUs), so one image serves every size class and a VM that changes size class
+picks up correct values on its next start. The profile is single-tenant and
+ingest-friendly: `wal_level=minimal` + `wal_compression=lz4` (no per-VM
+replicas), `synchronous_commit=off` (commits already ride WAL crash recovery
+— the pooler stop-kills VMs), SSD plan costs, JIT off. Manual overrides go in
+`postgresql.conf`, which is read after the include and therefore wins.
 | `PG_VM_POOL_USER` / `PG_VM_POOL_PASSWORD` | `postgres` / unset | probe+bootstrap credentials, and (if set) the required client password |
 | `PG_VM_POOL_IDLE_TIMEOUT_SECS` | `900` | stop a VM after this long with no connections; `0` disables |
 | `PG_VM_POOL_KEEPALIVE_SCHEMAS` | none | comma-separated schemas exempt from idle reaping |
