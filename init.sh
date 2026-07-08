@@ -61,6 +61,52 @@ else
     echo "[init] WARNING: $DATA_DEV not found, using rootfs for $WORKSPACE (non-persistent)"
 fi
 
+# --- swap + overcommit: survive ingest memory spikes -------------------------
+# Bulk loads (~1GB COPY + sorted INSERT) can transiently outgrow a small VM's
+# RAM. Without swap the kernel OOM killer SIGKILLs a backend and takes the
+# whole cluster through crash-restart — the "postgres died inside a live VM"
+# case. Two-part fix, applied only when the persistent disk is present:
+#   1. A swapfile on the data disk as an emergency spillway (sized to RAM,
+#      capped by disk headroom): spikes page out and slow down instead of
+#      killing the server.
+#   2. vm.overcommit_memory=2 (the setting the Postgres docs recommend for
+#      dedicated hosts): allocations beyond swap + 90% RAM *fail*, so the one
+#      offending query gets a clean "out of memory" error instead of the OOM
+#      killer choosing a victim.
+if [ -b "$DATA_DEV" ]; then
+    SWAPFILE="$WORKSPACE/swapfile"
+    if [ ! -f "$SWAPFILE" ]; then
+        mem_mb=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo)
+        avail_mb=$(df -Pm "$WORKSPACE" | awk 'NR==2 {print $4}')
+        swap_mb=$mem_mb
+        [ "$swap_mb" -gt 2048 ] && swap_mb=2048
+        # Never let swap eat more than an eighth of the disk, and only create
+        # it with 2x headroom so it can't crowd out the data it exists to save.
+        disk_eighth=$(($(blockdev --getsize64 "$DATA_DEV") / 1024 / 1024 / 8))
+        [ "$swap_mb" -gt "$disk_eighth" ] && swap_mb="$disk_eighth"
+        if [ "$avail_mb" -gt $((swap_mb * 2)) ]; then
+            echo "[init] creating ${swap_mb}MB swapfile at $SWAPFILE"
+            if ! fallocate -l "${swap_mb}M" "$SWAPFILE" 2>/dev/null; then
+                dd if=/dev/zero of="$SWAPFILE" bs=1M count="$swap_mb" 2>/dev/null
+            fi
+            chmod 600 "$SWAPFILE"
+            mkswap "$SWAPFILE" >/dev/null
+        else
+            echo "[init] WARNING: not enough free disk for a ${swap_mb}MB swapfile, skipping"
+        fi
+    fi
+    if [ -f "$SWAPFILE" ]; then
+        swapon "$SWAPFILE" 2>/dev/null || echo "[init] WARNING: swapon $SWAPFILE failed"
+    fi
+    # Strict overcommit only alongside swap: ratio first, then the mode switch.
+    # Swappiness 10 keeps the swapfile as a pressure valve, not a working set.
+    if swapon --show 2>/dev/null | grep -q .; then
+        echo 90 > /proc/sys/vm/overcommit_ratio   2>/dev/null || true
+        echo 2  > /proc/sys/vm/overcommit_memory  2>/dev/null || true
+        echo 10 > /proc/sys/vm/swappiness         2>/dev/null || true
+    fi
+fi
+
 mkdir -p "$PGDATA"
 chown -R postgres:postgres "$WORKSPACE"
 chmod 700 "$PGDATA"
@@ -136,11 +182,15 @@ gather_workers=$((cpus / 2))
 # Let WAL grow with the data disk so a ~1GB COPY doesn't checkpoint-storm,
 # while never letting recycled WAL crowd the data on small disks.
 max_wal_mb=1024
+temp_limit_mb=1024
 if [ -b "$DATA_DEV" ]; then
     disk_mb=$(($(blockdev --getsize64 "$DATA_DEV") / 1024 / 1024))
     max_wal_mb=$((disk_mb / 4))
     [ "$max_wal_mb" -lt 1024 ] && max_wal_mb=1024
     [ "$max_wal_mb" -gt 4096 ] && max_wal_mb=4096
+    # Cap per-process spill files: a runaway sort filling the disk is a PANIC
+    # (whole-cluster crash), while hitting this limit only errors that query.
+    temp_limit_mb=$((disk_mb / 4))
 fi
 
 cat > "$PGDATA/heyvm-tuning.conf" <<EOF
@@ -153,6 +203,7 @@ work_mem = ${work_mem_mb}MB
 maintenance_work_mem = ${maint_mem_mb}MB
 temp_buffers = ${temp_buffers_mb}MB
 max_wal_size = ${max_wal_mb}MB
+temp_file_limit = ${temp_limit_mb}MB
 max_parallel_workers = ${cpus}
 max_parallel_workers_per_gather = ${gather_workers}
 
@@ -203,7 +254,17 @@ echo "[init] starting postgres"
 # here — Postgres is crash-safe (WAL replay on next boot) and the data dir is
 # currently ephemeral. If clean shutdown matters later, trap TERM in this shell
 # and forward it to $PG_PID.
-gosu postgres postgres -D "$PGDATA" &
+# OOM-killer insurance (matters if the strict-overcommit setup above was
+# skipped or still trips): shield the postmaster at -900 so the killer never
+# takes out the whole cluster. The score must be lowered *before* dropping
+# root (unprivileged processes can only raise it), and children inherit it —
+# PG_OOM_ADJUST_FILE is Postgres' built-in reset: the postmaster writes 0 into
+# each backend's oom_score_adj at fork, so a runaway backend dies before the
+# postmaster (a backend kill is a recoverable restart; losing PID-postmaster
+# means our pooler-side power-cycle).
+export PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj
+export PG_OOM_ADJUST_VALUE=0
+sh -c "echo -900 > /proc/self/oom_score_adj 2>/dev/null || true; exec gosu postgres postgres -D '$PGDATA'" &
 
 # heyvm's `wait_for_ready` scans the serial console for this exact marker and
 # times out (panicking the create) if it never appears. Postgres binds 5432

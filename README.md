@@ -138,6 +138,18 @@ ingest-friendly: `wal_level=minimal` + `wal_compression=lz4` (no per-VM
 replicas), `synchronous_commit=off` (commits already ride WAL crash recovery
 — the pooler stop-kills VMs), SSD plan costs, JIT off. Manual overrides go in
 `postgresql.conf`, which is read after the include and therefore wins.
+
+The image also hardens against ingest memory spikes (the classic "big upload
+OOM-kills Postgres inside a live VM" failure): `init.sh` creates a swapfile on
+the data disk (sized to RAM, capped at 2GB / an eighth of the disk) as an
+emergency spillway, switches to strict overcommit (`vm.overcommit_memory=2`,
+per the Postgres docs) so an oversized allocation fails just that one query
+with a clean `out of memory` instead of summoning the OOM killer, and shields
+the postmaster (`oom_score_adj -900`, with `PG_OOM_ADJUST_FILE` resetting
+backends to 0) so if the killer runs anyway it takes a recoverable backend,
+not the whole cluster. `temp_file_limit` (¼ disk) keeps a runaway sort's
+spill files from filling the disk — disk-full is a cluster-wide PANIC, the
+limit is a one-query error.
 | `PG_VM_POOL_USER` / `PG_VM_POOL_PASSWORD` | `postgres` / unset | probe+bootstrap credentials, and (if set) the required client password |
 | `PG_VM_POOL_IDLE_TIMEOUT_SECS` | `900` | stop a VM after this long with no connections; `0` disables |
 | `PG_VM_POOL_KEEPALIVE_SCHEMAS` | none | comma-separated schemas exempt from idle reaping |
