@@ -82,8 +82,38 @@ impl Config {
     }
 }
 
+/// Every env var the pooler reads. `from_env` warns about any other
+/// `PG_VM_POOL_*` in the environment: a typo'd name (PG_VM_POOL_SIZE for
+/// PG_VM_POOL_SIZE_CLASS) otherwise silently falls back to the default and
+/// reads as "the pooler ignored my config".
+const KNOWN_VARS: &[&str] = &[
+    "PG_VM_POOL_LISTEN",
+    "PG_VM_POOL_IMAGE",
+    "PG_VM_POOL_SIZE_CLASS",
+    "PG_VM_POOL_USER",
+    "PG_VM_POOL_PASSWORD",
+    "PG_VM_POOL_IDLE_TIMEOUT_SECS",
+    "PG_VM_POOL_READY_TIMEOUT_SECS",
+    "PG_VM_POOL_CONNECT_TIMEOUT_SECS",
+    "PG_VM_POOL_DIRECT_CONNECT",
+    "PG_VM_POOL_DATA_DISK_GB",
+    "PG_VM_POOL_KEEPALIVE_SCHEMAS",
+    "PG_VM_POOL_STATE_FILE",
+    "PG_VM_POOL_TLS_CERT",
+    "PG_VM_POOL_TLS_KEY",
+];
+
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
+        for (key, _) in std::env::vars() {
+            if key.starts_with("PG_VM_POOL_") && !KNOWN_VARS.contains(&key.as_str()) {
+                tracing::warn!(
+                    "ignoring unknown env var {key} — not a pooler setting \
+                     (check the name against the README's config table)"
+                );
+            }
+        }
+
         let listen = std::env::var("PG_VM_POOL_LISTEN")
             .unwrap_or_else(|_| "127.0.0.1:6432".to_string());
         let listen_addr: SocketAddr = listen

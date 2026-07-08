@@ -169,7 +169,11 @@ shared_buffers_mb=$((mem_mb / 4))
 effective_cache_mb=$((mem_mb * 3 / 4))
 # Sorts/aggregations benefit from generous work_mem; concurrency is low (one
 # app through the pooler), but cap it so many sessions can't OOM a big VM.
-work_mem_mb=$((mem_mb / 64)); [ "$work_mem_mb" -gt 64 ] && work_mem_mb=64
+# Sized at mem/32: Quickstore's count/validation queries lean on hashed
+# subplans (per-row NOT EXISTS anti-joins collapse into one in-memory hash
+# only when the ref table's hash fits in work_mem × hash_mem_multiplier) —
+# too small and the planner silently degrades to per-row rescans.
+work_mem_mb=$((mem_mb / 32)); [ "$work_mem_mb" -gt 256 ] && work_mem_mb=256
 [ "$work_mem_mb" -lt 4 ] && work_mem_mb=4
 # Index builds / VACUUM after bulk loads.
 maint_mem_mb=$((mem_mb / 8)); [ "$maint_mem_mb" -gt 1024 ] && maint_mem_mb=1024
@@ -177,7 +181,10 @@ maint_mem_mb=$((mem_mb / 8)); [ "$maint_mem_mb" -gt 1024 ] && maint_mem_mb=1024
 # shared_buffers).
 temp_buffers_mb=$((mem_mb / 32)); [ "$temp_buffers_mb" -gt 128 ] && temp_buffers_mb=128
 # Parallel query only helps with >1 vCPU; on 1 it just context-switches.
-gather_workers=$((cpus / 2))
+# cpus-1 workers + the leader saturates the VM for one analytics query at a
+# time — the right trade for single-tenant count/scan bursts.
+gather_workers=$((cpus - 1))
+[ "$gather_workers" -gt 4 ] && gather_workers=4
 
 # Let WAL grow with the data disk so a ~1GB COPY doesn't checkpoint-storm,
 # while never letting recycled WAL crowd the data on small disks.
@@ -225,6 +232,27 @@ effective_io_concurrency = 200
 # Datasets ≤1GB and short mixed queries: JIT compile overhead hurts more
 # than it helps at this scale.
 jit = off
+
+# Counts/validation scans run right after bulk loads. Stock autovacuum can
+# lag a fresh 1GB import by minutes, during which the planner works from
+# stale (or no) stats — mis-planning the count queries' anti-joins — and the
+# unset visibility map blocks index-only count(*) scans. Single tenant, so
+# aggressive thresholds cost little and keep the first post-import count as
+# fast as the tenth.
+autovacuum_naptime = 15s
+autovacuum_vacuum_scale_factor = 0.05
+autovacuum_vacuum_insert_scale_factor = 0.05
+autovacuum_analyze_scale_factor = 0.02
+
+# Persist server logs under PGDATA (= the data disk), so crash forensics
+# survive the reboot that follows a crash — stderr only reaches the serial
+# console, and the VM's dmesg dies with each power-cycle. %a gives a
+# seven-day ring of weekday files; truncate-on-rotation caps disk use.
+logging_collector = on
+log_filename = 'postgresql-%a.log'
+log_rotation_age = 1d
+log_rotation_size = 0
+log_truncate_on_rotation = on
 EOF
 chown postgres:postgres "$PGDATA/heyvm-tuning.conf"
 # Include must precede nothing in particular — later lines in postgresql.conf
