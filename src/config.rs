@@ -14,9 +14,15 @@ pub struct Config {
     /// Postgres role the pooler uses for the readiness probe + bootstrap. With
     /// the pg-fc image's `trust` host auth this needs no password.
     pub pg_user: String,
-    /// Optional password for [`Self::pg_user`]. `None` (unset) suits the pg-fc
-    /// image's `trust` host auth; set it when the VM's Postgres requires a
-    /// password (scram/md5) so the readiness probe + bootstrap can authenticate.
+    /// Password for [`Self::pg_user`], and — doing double duty — the password
+    /// the pooler itself requires from clients before proxying them anywhere.
+    /// `None` (unset) means both: no client auth gate (any client that reaches
+    /// `listen_addr` is proxied straight through) and the pg-fc image's
+    /// `trust` host auth for the probe. Set it whenever the pooler is
+    /// reachable beyond localhost (see [`Self::listen_addr`]) — the backend
+    /// VM's own Postgres can stay on `trust`, since this is the layer meant to
+    /// gate access instead. Sent in the clear absent client TLS, so pair it
+    /// with [`Self::tls_cert`]/[`Self::tls_key`] on any non-loopback listener.
     pub pg_password: Option<String>,
     /// Inactivity timeout: a non-keep-alive VM is stopped after this long with
     /// no open client connections. `None` disables idle reaping (VMs stay up

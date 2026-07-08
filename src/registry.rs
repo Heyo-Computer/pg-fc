@@ -118,6 +118,12 @@ impl SchemaRegistry {
         }
     }
 
+    /// Password clients must present before the pooler proxies them anywhere;
+    /// `None` if `PG_VM_POOL_PASSWORD` is unset (no client auth gate).
+    pub fn client_password(&self) -> Option<&str> {
+        self.cfg.pg_password.as_deref()
+    }
+
     /// Check out the entry for `schema`, bringing the VM up on first request.
     /// The returned guard keeps the VM off the reaper's radar until dropped.
     /// Concurrent callers for the same schema share one bring-up.

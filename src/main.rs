@@ -5,6 +5,7 @@
 //! `pg-<schema>` Firecracker VM, tunnels to its Postgres, and splices the
 //! connection through. One isolated VM per schema, behind a single URL.
 
+mod auth;
 mod config;
 mod proxy;
 mod registry;
@@ -48,6 +49,13 @@ async fn main() -> Result<()> {
             None
         }
     };
+    if cfg.pg_password.is_some() && tls.is_none() && !listen_addr.ip().is_loopback() {
+        warn!(
+            "PG_VM_POOL_PASSWORD is set but TLS is not and PG_VM_POOL_LISTEN \
+             ({listen_addr}) is not loopback — client passwords will cross \
+             the network in cleartext; set PG_VM_POOL_TLS_CERT/KEY"
+        );
+    }
     let registry = Arc::new(SchemaRegistry::new(cfg));
     registry.spawn_reaper();
 
@@ -71,7 +79,10 @@ async fn handle_conn(
     registry: Arc<SchemaRegistry>,
     tls: Option<Arc<TlsReloader>>,
 ) -> Result<()> {
-    let (client, info) = startup::read_startup(client, tls.as_deref()).await?;
+    let (mut client, info) = startup::read_startup(client, tls.as_deref()).await?;
+    if let Some(password) = registry.client_password() {
+        auth::require_password(&mut client, password).await?;
+    }
     let schema = info.database.clone();
     if !is_valid_schema(&schema) {
         anyhow::bail!("rejecting invalid schema name {schema:?}");

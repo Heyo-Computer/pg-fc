@@ -7,6 +7,27 @@ endpoint — one VM per schema, created and stopped/restarted on demand. The
 Firecracker image is the unit the pooler manages; the pooler is what a real
 client actually connects to.
 
+## Prerequisites
+
+Linux only — Firecracker needs KVM, so there's no macOS host support.
+
+**To build the Postgres rootfs image** (`build-rootfs.sh`):
+
+| dependency | why |
+|---|---|
+| Docker | builds the image from `Dockerfile` before it's flattened |
+| `e2fsprogs` (`mkfs.ext4`) | formats the output image |
+| root/`sudo` | needed to loopback-mount the image while the container fs is exported into it |
+
+**To run `pg-vm-pool` and boot the VMs it manages:**
+
+| dependency | why |
+|---|---|
+| Rust (edition 2024 toolchain) | builds `pg-vm-pool` (`cargo build --release`) |
+| Firecracker + KVM access (`/dev/kvm`, user in the `kvm` group) | actually boots each per-schema microVM |
+| `heyvm` / `heyvmd` (from the sibling `heyo` project) | the VM control plane: `heyvmd` (or `heyvm --api --port 34099`) serves the local sandbox HTTP API pg-vm-pool drives, and the `heyvm` CLI builds the `pg` image (`heyvm mvm build`) |
+| `heyo-sdk` crate, `>= 0.1.5` | Rust client for that API; pulled automatically by `cargo build` from crates.io, already pinned in `Cargo.toml` — no separate install needed |
+
 ## Postgres VM
 
 A Firecracker rootfs that boots straight into Postgres, with the data directory
@@ -82,9 +103,16 @@ restarts, and idle reaping. The schema→VM binding is persisted in
 survives pooler restarts.
 
 Connect as `user=postgres`; the VM image's `trust` host auth needs no password
-(see the auth note in `init.sh`). Set `PG_VM_POOL_USER`/`PG_VM_POOL_PASSWORD`
-if a VM's Postgres instead requires password auth (scram/md5) — the pooler uses
-them for its readiness probe and per-schema bootstrap connection.
+(see the auth note in `init.sh`). `PG_VM_POOL_PASSWORD` does double duty:
+
+- it's what the pooler itself uses for its readiness probe and per-schema
+  bootstrap connection, if a VM's Postgres requires password auth (scram/md5)
+  instead of `trust`;
+- and, separately, if set it's also the password the pooler **requires from
+  clients** (a plain `AuthenticationCleartextPassword` challenge) before it
+  proxies them anywhere — see "Client auth" below. Unset means no client auth
+  gate at all: fine on a loopback-only `PG_VM_POOL_LISTEN`, not once it's
+  reachable from elsewhere.
 
 Config via env (all optional):
 
@@ -92,7 +120,7 @@ Config via env (all optional):
 |-----|---------|---------|
 | `PG_VM_POOL_LISTEN` | `127.0.0.1:6432` | client listen address |
 | `PG_VM_POOL_IMAGE` | `pg` | Firecracker image per schema |
-| `PG_VM_POOL_USER` / `PG_VM_POOL_PASSWORD` | `postgres` / unset | probe+bootstrap credentials |
+| `PG_VM_POOL_USER` / `PG_VM_POOL_PASSWORD` | `postgres` / unset | probe+bootstrap credentials, and (if set) the required client password |
 | `PG_VM_POOL_IDLE_TIMEOUT_SECS` | `900` | stop a VM after this long with no connections; `0` disables |
 | `PG_VM_POOL_KEEPALIVE_SCHEMAS` | none | comma-separated schemas exempt from idle reaping |
 | `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size |
@@ -128,6 +156,23 @@ then `supervisorctl reread && supervisorctl update pg-vm-pool` — note a plain
 `restart` does **not** reload `environment=`; `update` does. Comma-containing
 values (like `KEEPALIVE_SCHEMAS`) must be double-quoted. Logs land in
 `/var/log/pg-vm-pool/pg-vm-pool.log`.
+
+### Client auth
+
+The pooler has no client auth gate by default — any client that can reach
+`PG_VM_POOL_LISTEN` is proxied straight through to a VM, whatever the VM's
+Postgres itself would accept. Set `PG_VM_POOL_PASSWORD` to close that: the
+pooler then answers each client's `StartupMessage` with an
+`AuthenticationCleartextPassword` challenge and rejects (`28P01`, "password
+authentication failed") anyone who doesn't send it back before ever dialing
+the backend VM. This is deliberately a separate layer from backend auth — the
+VM's own Postgres can (and by default does) stay on `trust`, since gating
+access is now the pooler's job.
+
+Because it's cleartext, the password crosses the network unencrypted unless
+the connection is also TLS — required reading if `PG_VM_POOL_LISTEN` binds to
+anything other than `127.0.0.1` (the pooler logs a startup warning in that
+case). Set `PG_VM_POOL_TLS_CERT`/`KEY` alongside it; see TLS below.
 
 ### TLS
 
