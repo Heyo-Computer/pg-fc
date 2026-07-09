@@ -159,6 +159,11 @@ limit is a one-query error.
 | `PG_VM_POOL_DIRECT_CONNECT` | on | dial guest IP directly; `0` forces the tunnel |
 | `PG_VM_POOL_STATE_FILE` | `~/.heyo/pg-vm-pool/registry.tsv` | persisted schema→VM map |
 | `PG_VM_POOL_TLS_CERT` / `PG_VM_POOL_TLS_KEY` | unset (TLS off) | PEM cert chain + key; see TLS below |
+| `PG_VM_POOL_DASHBOARD_LISTEN` | unset (dashboard off) | HTTP listen address for the admin dashboard; setting it enables the dashboard — see Dashboard below |
+| `PG_VM_POOL_DASHBOARD_USER` / `PG_VM_POOL_DASHBOARD_PASSWORD` | unset (no auth) | HTTP Basic auth credentials for the dashboard (must be set together) |
+| `PG_VM_POOL_POOLER_LOG` | `/var/log/pg-vm-pool/pg-vm-pool.log` | pooler log file the dashboard tails |
+| `PG_VM_POOL_HEYVMD_LOG` | `/var/log/heyvmd/heyvmd.log` | heyvmd log file the dashboard tails |
+| `PG_VM_POOL_DASHBOARD_LOG_LINES` | `200` | how many trailing lines the dashboard shows per log |
 
 **Direct connect (default):** when the pooler shares the host with the VMs (the
 local-daemon deployment), it dials each VM's Postgres directly at its `guest_ip`
@@ -248,6 +253,42 @@ Then set `PG_VM_POOL_TLS_CERT`/`KEY` to those copies (see the commented lines
 in the supervisor conf). For clients beyond localhost also set
 `PG_VM_POOL_LISTEN=0.0.0.0:6432`, open the firewall, and have clients dial the
 certificate's hostname (`sslmode=verify-full host=pg.example.com`).
+
+### Dashboard
+
+An optional server-side-rendered admin dashboard runs **inside the pooler
+process** (a background task sharing the live registry), so it can show the
+pooler's in-memory session counts alongside the daemon's VM inventory. It's
+**off by default** and enabled purely by setting a listen address:
+
+```sh
+PG_VM_POOL_DASHBOARD_LISTEN=127.0.0.1:8080 \
+PG_VM_POOL_DASHBOARD_USER=admin \
+PG_VM_POOL_DASHBOARD_PASSWORD=secret \
+target/release/pg-vm-pool
+```
+
+What it gives you (browse to the listen address):
+
+- **VM/session overview** (`/`) — every heyvmd sandbox, with power state,
+  size class, uptime, live pooler sessions, idle timer, and per-VM CPU
+  load / memory / `/workspace` disk usage. Pooler-managed `pg-<schema>` VMs
+  are grouped first and link to a detail page.
+- **Logs** — tail the pooler log (`/logs/pooler`), the heyvmd log
+  (`/logs/heyvmd`), and any VM's in-guest Postgres log (`/logs/vm/<id>`).
+- **Controls** — stop / start / reboot / resize any VM from its detail page.
+  Note that a pooler-managed VM stopped here auto-restarts on the next client
+  connection, and a resize takes effect on the VM's next boot.
+
+Resource usage and the per-VM Postgres log are read from inside each guest;
+every daemon and guest call is timeout-bounded, so one wedged VM can't hang a
+page. Access is gated by HTTP **Basic auth** when
+`PG_VM_POOL_DASHBOARD_USER`/`PASSWORD` are set (they must be set together, or
+startup fails). The dashboard can stop and resize **every** VM on the host, so
+prefer a loopback/private `PG_VM_POOL_DASHBOARD_LISTEN`; binding it to a
+non-loopback address without Basic auth logs a startup warning. The two log
+paths default to the supervisord locations above and are overridable with
+`PG_VM_POOL_POOLER_LOG` / `PG_VM_POOL_HEYVMD_LOG`.
 
 ### Testing
 

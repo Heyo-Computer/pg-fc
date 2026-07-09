@@ -17,3 +17,11 @@ futures = "0.3.32"
 # off so we don't drag in the aws-lc-rs provider on top.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pki-types = "1"
+# Admin dashboard: axum for the HTTP surface, maud for server-side-rendered
+# HTML (its `axum` feature makes `Markup: IntoResponse`), base64 for decoding
+# the HTTP Basic auth header. The hyper/http/tower stack axum 0.8 pulls is
+# already resolved in Cargo.lock via heyo-sdk's reqwest, so no version conflict.
+axum = "0.8"
+maud = { version = "0.27", features = ["axum"] }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }

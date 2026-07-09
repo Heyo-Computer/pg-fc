@@ -27,8 +27,9 @@ const VM_PG_PORT: u16 = 5432;
 const PG_PROBE_WINDOW: Duration = Duration::from_secs(15);
 
 /// Fresh options targeting the local heyvmd daemon. Built per call so we don't
-/// rely on `HeyoClientOptions: Clone`.
-fn local_opts() -> HeyoClientOptions {
+/// rely on `HeyoClientOptions: Clone`. Shared with the dashboard so its control
+/// actions hit the same daemon.
+pub(crate) fn local_opts() -> HeyoClientOptions {
     HeyoClientOptions {
         base_url: Some(DEFAULT_LOCAL_BASE_URL.to_string()),
         ..Default::default()

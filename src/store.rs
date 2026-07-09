@@ -48,6 +48,17 @@ impl Store {
         self.map.lock().unwrap().get(schema).cloned()
     }
 
+    /// Every `(schema, sandbox_id)` pair known to the store — the durable list of
+    /// schemas the pooler has backed, including those whose VM is now stopped.
+    pub fn entries(&self) -> Vec<(String, String)> {
+        self.map
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     /// Record `schema -> id` and flush to disk. Best-effort: a write failure is
     /// logged, not fatal (the in-memory map still serves this process). Skips
     /// the write when the mapping is unchanged.

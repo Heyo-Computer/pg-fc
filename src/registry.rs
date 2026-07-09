@@ -64,6 +64,28 @@ impl SchemaEntry {
         *self.last_active.lock().unwrap() = Instant::now();
     }
 
+    /// Live client connections currently spliced through this entry. Read-only
+    /// view of the private `active` counter for the dashboard; the proxy path
+    /// mutates it only through `ConnGuard`.
+    pub fn active_count(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    /// How long since the last connect/disconnect on this entry.
+    pub fn idle_for(&self) -> Duration {
+        self.last_active.lock().unwrap().elapsed()
+    }
+
+    /// The sandbox id of the VM backing this entry.
+    pub fn sandbox_id(&self) -> String {
+        self.sandbox.sandbox_id().to_string()
+    }
+
+    /// True when reached over an iroh tunnel rather than a direct guest IP.
+    pub fn is_tunneled(&self) -> bool {
+        self.tunnel.is_some()
+    }
+
     /// Idle = not keep-alive, no live connections, and quiet for `>= timeout`.
     fn is_idle(&self, timeout: Duration) -> bool {
         !self.keepalive
@@ -96,6 +118,18 @@ impl Drop for ConnGuard {
     }
 }
 
+/// A plain, owned point-in-time view of one warm schema entry — no `Sandbox`,
+/// `Pool`, or lock handles — safe to hand to the dashboard's render layer.
+pub struct EntrySnapshot {
+    pub schema: String,
+    pub sandbox_id: String,
+    pub target: SocketAddr,
+    pub active: usize,
+    pub idle_secs: u64,
+    pub keepalive: bool,
+    pub tunneled: bool,
+}
+
 pub struct SchemaRegistry {
     cfg: Config,
     // Outer Mutex guards the map only; the per-schema OnceCell serializes the
@@ -122,6 +156,40 @@ impl SchemaRegistry {
     /// `None` if `PG_VM_POOL_PASSWORD` is unset (no client auth gate).
     pub fn client_password(&self) -> Option<&str> {
         self.cfg.pg_password.as_deref()
+    }
+
+    /// The configured idle-reaping timeout (`None` when reaping is disabled), so
+    /// a dashboard can label how close a warm VM is to being stopped.
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        self.cfg.idle_timeout
+    }
+
+    /// Point-in-time view of every *warm* schema entry (VMs the pooler currently
+    /// holds). Takes the same map lock the reaper/checkout use, but holds it only
+    /// for a fast, await-free read — no meaningful contention. Stopped/reaped
+    /// schemas aren't warm; pair with [`Self::store_entries`] for those.
+    pub async fn snapshot(&self) -> Vec<EntrySnapshot> {
+        let map = self.entries.lock().await;
+        map.iter()
+            .filter_map(|(schema, cell)| {
+                cell.get().map(|e| EntrySnapshot {
+                    schema: schema.clone(),
+                    sandbox_id: e.sandbox_id(),
+                    target: e.target,
+                    active: e.active_count(),
+                    idle_secs: e.idle_for().as_secs(),
+                    keepalive: e.keepalive,
+                    tunneled: e.is_tunneled(),
+                })
+            })
+            .collect()
+    }
+
+    /// The durable `schema → sandbox-id` pairs the pooler has ever backed,
+    /// surviving eviction and restarts — used to recover the schema name for a
+    /// VM that's currently stopped (not warm).
+    pub fn store_entries(&self) -> Vec<(String, String)> {
+        self.store.entries()
     }
 
     /// Check out the entry for `schema`, bringing the VM up on first request.

@@ -87,8 +87,9 @@ async fn send_auth_failed<S: AsyncWrite + Unpin>(stream: &mut S) -> Result<()> {
 }
 
 /// Fixed-time comparison so a client probing the pooler directly can't learn
-/// the password one byte at a time from response latency.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// the password one byte at a time from response latency. Also reused by the
+/// dashboard's HTTP Basic auth check.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
