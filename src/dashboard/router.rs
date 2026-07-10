@@ -9,8 +9,7 @@ use super::{auth, handlers, state::DashState};
 
 pub fn build(state: DashState) -> Router {
     Router::new()
-        .route("/", get(handlers::index))
-        .route("/sandboxes", get(handlers::sandboxes))
+        .route("/", get(handlers::databases))
         .route("/vm/{id}", get(handlers::vm_detail))
         .route("/logs/pooler", get(handlers::logs_pooler))
         .route("/logs/heyvmd", get(handlers::logs_heyvmd))

@@ -27,8 +27,7 @@ fn shell(title: &str, body: Markup) -> Markup {
                 header.nav {
                     a.brand href="/" { "pg-vm-pool" }
                     nav {
-                        a href="/" { "VMs" }
-                        a href="/sandboxes" { "all sandboxes" }
+                        a href="/" { "Databases" }
                         a href="/logs/pooler" { "pooler log" }
                         a href="/logs/heyvmd" { "heyvmd log" }
                     }
@@ -51,35 +50,15 @@ fn banner(b: &Banner) -> Markup {
     }
 }
 
-pub fn index_page(st: &DashState, rows: &[VmRow], b: &Banner) -> Markup {
-    let active = rows.iter().filter(|r| r.is_running()).count();
-    let sessions: usize = rows.iter().filter_map(|r| r.live_sessions).sum();
-    shell(
-        "VMs",
-        html! {
-            (banner(b))
-            div.summary {
-                span { b { (rows.len()) } " VMs" }
-                span { b { (active) } " running" }
-                span { b { (sessions) } " live sessions" }
-                @if st.cfg.basic_auth.is_none() {
-                    span.warn { "auth: OFF" }
-                }
-            }
-            (vm_table(rows))
-        },
-    )
-}
-
-/// Paged, searchable list of every daemon sandbox.
-pub fn sandboxes_page(p: &SandboxPage) -> Markup {
+/// The main Databases view: a paged, searchable list of every daemon sandbox.
+pub fn databases_page(st: &DashState, p: &SandboxPage) -> Markup {
     let first = (p.page - 1) * p.per + 1;
     let last = first + p.rows.len().saturating_sub(1);
     shell(
-        "all sandboxes",
+        "Databases",
         html! {
-            h1 { "all sandboxes" }
-            form.search method="get" action="/sandboxes" {
+            h1 { "Databases" }
+            form.search method="get" action="/" {
                 input type="search" name="q" value=(p.q)
                     placeholder="filter by id, name, schema, status, image, or guest ip";
                 @if p.state != model::DEFAULT_STATE {
@@ -99,6 +78,9 @@ pub fn sandboxes_page(p: &SandboxPage) -> Markup {
                     span { "showing " b { (first) "–" (last) } " of " b { (p.matched) } }
                 }
                 span.dim { (p.total) " total" }
+                @if st.cfg.basic_auth.is_none() {
+                    span.warn { "auth: OFF" }
+                }
             }
             @if p.matched > 0 {
                 (vm_table(&p.rows))
@@ -148,9 +130,9 @@ fn pager(p: &SandboxPage) -> Markup {
     }
 }
 
-/// Build a `/sandboxes` link, omitting params that hold their default value.
+/// Build a Databases-list link, omitting params that hold their default value.
 fn list_href(q: &str, state: &str, page: usize, per: usize) -> String {
-    let mut href = String::from("/sandboxes?");
+    let mut href = String::from("/?");
     if page != 1 {
         href.push_str(&format!("page={page}&"));
     }
@@ -186,7 +168,7 @@ pub fn vm_detail_page(st: &DashState, r: &VmRow, db: Option<&DbStats>, b: &Banne
     shell(
         &r.name,
         html! {
-            p { a href="/" { "← all VMs" } }
+            p { a href="/" { "← Databases" } }
             (banner(b))
             h1 { (r.name) " " (status_badge(&r.status)) }
 
@@ -275,7 +257,7 @@ pub fn log_page(title: &str, source: &str, text: &str) -> Markup {
     shell(
         title,
         html! {
-            p { a href="/" { "← all VMs" } }
+            p { a href="/" { "← Databases" } }
             h1 { "log · " (title) }
             p.dim { code { (source) } }
             pre.log { (text) }
@@ -287,7 +269,7 @@ pub fn not_found_page(id: &str) -> Markup {
     shell(
         "not found",
         html! {
-            p { a href="/" { "← all VMs" } }
+            p { a href="/" { "← Databases" } }
             h1 { "VM not found" }
             p { "No sandbox with id " code { (id) } " is known to the daemon." }
         },
@@ -298,7 +280,7 @@ pub fn error_page(err: &anyhow::Error) -> Markup {
     shell(
         "error",
         html! {
-            p { a href="/" { "← all VMs" } }
+            p { a href="/" { "← Databases" } }
             h1 { "Something went wrong" }
             pre.log { (format!("{err:#}")) }
         },

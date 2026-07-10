@@ -27,17 +27,8 @@ pub struct Banner {
     pub err: Option<String>,
 }
 
-pub async fn index(
-    State(st): State<DashState>,
-    Query(banner): Query<Banner>,
-) -> Result<Markup, AppError> {
-    let rows = model::build_rows(&st).await?;
-    Ok(views::index_page(&st, &rows, &banner))
-}
-
-/// Query params for the browse-all view. All optional so `/sandboxes` bare
-/// works; junk numeric input is a 400 from the extractor, which is fine for an
-/// admin tool.
+/// Query params for the Databases list. All optional so `/` bare works; junk
+/// numeric input is a 400 from the extractor, which is fine for an admin tool.
 #[derive(Deserialize)]
 pub struct ListParams {
     #[serde(default)]
@@ -48,10 +39,11 @@ pub struct ListParams {
     pub per: Option<usize>,
 }
 
-/// Paged, searchable list of every daemon sandbox. Lazy by construction: one
-/// bounded daemon read, filtering happens in-process, and only the visible
-/// page is joined with pooler state and rendered. No guest access.
-pub async fn sandboxes(
+/// The main Databases view: a paged, searchable list of every daemon sandbox.
+/// Lazy by construction: one bounded daemon read, filtering happens
+/// in-process, and only the visible page is joined with pooler state and
+/// rendered. No guest access.
+pub async fn databases(
     State(st): State<DashState>,
     Query(p): Query<ListParams>,
 ) -> Result<Markup, AppError> {
@@ -59,7 +51,7 @@ pub async fn sandboxes(
     let page = p.page.unwrap_or(1);
     let state = p.state.as_deref().unwrap_or(model::DEFAULT_STATE);
     let pg = model::build_page(&st, &p.q, state, page, per).await?;
-    Ok(views::sandboxes_page(&pg))
+    Ok(views::databases_page(&st, &pg))
 }
 
 pub async fn vm_detail(

@@ -6,12 +6,12 @@
 //! `PG_VM_POOL_DASHBOARD_LISTEN` is set; gated behind HTTP Basic auth when
 //! `PG_VM_POOL_DASHBOARD_USER`/`PASSWORD` are configured.
 //!
-//! It lists every heyvmd sandbox with power state, allocated size (vCPU/RAM),
-//! uptime, and live pooler sessions; `/sandboxes` is the same data as a paged,
-//! searchable view (the daemon's list endpoint has no server-side paging, so
-//! the filter/page slice happens in-process and only the visible page is
-//! joined and rendered). On the detail page it also shows live DB
-//! size/backends read over the pooler's own warm PG pool. It drives
+//! The main "Databases" view (`/`) is a paged, searchable, state-filtered
+//! list of every heyvmd sandbox — power state, allocated size (vCPU/RAM),
+//! uptime, and live pooler sessions. The daemon's list endpoints have no
+//! server-side paging, so the filter/page slice happens in-process and only
+//! the visible page is joined and rendered. On the detail page it also shows
+//! live DB size/backends read over the pooler's own warm PG pool. It drives
 //! stop/start/reboot/resize on any VM, and tails the pooler / heyvmd / per-VM
 //! Postgres logs.
 //!
