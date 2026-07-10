@@ -42,6 +42,8 @@ pub async fn index(
 pub struct ListParams {
     #[serde(default)]
     pub q: String,
+    /// State filter; defaults to showing only running sandboxes.
+    pub state: Option<String>,
     pub page: Option<usize>,
     pub per: Option<usize>,
 }
@@ -55,7 +57,8 @@ pub async fn sandboxes(
 ) -> Result<Markup, AppError> {
     let per = p.per.unwrap_or(model::DEFAULT_PER).clamp(1, model::MAX_PER);
     let page = p.page.unwrap_or(1);
-    let pg = model::build_page(&st, &p.q, page, per).await?;
+    let state = p.state.as_deref().unwrap_or(model::DEFAULT_STATE);
+    let pg = model::build_page(&st, &p.q, state, page, per).await?;
     Ok(views::sandboxes_page(&pg))
 }
 

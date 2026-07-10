@@ -82,21 +82,23 @@ pub fn sandboxes_page(p: &SandboxPage) -> Markup {
             form.search method="get" action="/sandboxes" {
                 input type="search" name="q" value=(p.q)
                     placeholder="filter by id, name, schema, status, image, or guest ip";
+                @if p.state != model::DEFAULT_STATE {
+                    input type="hidden" name="state" value=(p.state);
+                }
                 @if p.per != model::DEFAULT_PER {
                     input type="hidden" name="per" value=(p.per);
                 }
                 button type="submit" { "search" }
-                @if !p.q.is_empty() { a.button-link href="/sandboxes" { "clear" } }
+                @if !p.q.is_empty() { a.button-link href=(list_href("", &p.state, 1, p.per)) { "clear" } }
             }
+            (state_pills(p))
             div.summary {
                 @if p.matched == 0 {
                     span { "no sandboxes match" }
                 } @else {
                     span { "showing " b { (first) "–" (last) } " of " b { (p.matched) } }
                 }
-                @if !p.q.is_empty() {
-                    span.dim { (p.total) " total" }
-                }
+                span.dim { (p.total) " total" }
             }
             @if p.matched > 0 {
                 (vm_table(&p.rows))
@@ -106,34 +108,62 @@ pub fn sandboxes_page(p: &SandboxPage) -> Markup {
     )
 }
 
-/// Prev/next page controls; hidden when everything fits on one page.
-fn pager(p: &SandboxPage) -> Markup {
+/// State filter pills: "all" plus every state with matches (and the selected
+/// state even at zero, so the active filter stays visible/escapable). Counts
+/// are within the current search, so they show where the matches live.
+fn state_pills(p: &SandboxPage) -> Markup {
+    let all: usize = p.state_counts.iter().map(|(_, n)| n).sum();
     html! {
-        @if p.pages > 1 {
-            div.pager {
-                @if p.page > 1 {
-                    a.button-link href=(page_href(p, p.page - 1)) { "← prev" }
-                }
-                span { "page " (p.page) " of " (p.pages) }
-                @if p.page < p.pages {
-                    a.button-link href=(page_href(p, p.page + 1)) { "next →" }
+        div.pills {
+            a.pill.selected[p.state == model::STATE_ALL]
+                href=(list_href(&p.q, model::STATE_ALL, 1, p.per)) {
+                "all " span.count { (all) }
+            }
+            @for (label, n) in &p.state_counts {
+                @if *n > 0 || p.state == *label {
+                    a.pill.selected[p.state == *label]
+                        href=(list_href(&p.q, label, 1, p.per)) {
+                        (label) " " span.count { (n) }
+                    }
                 }
             }
         }
     }
 }
 
-/// Build a `/sandboxes` link that lands on `page` while preserving the current
-/// search and page size.
-fn page_href(p: &SandboxPage, page: usize) -> String {
-    let mut href = format!("/sandboxes?page={page}");
-    if !p.q.is_empty() {
-        href.push_str("&q=");
-        href.push_str(&urlenc(&p.q));
+/// Prev/next page controls; hidden when everything fits on one page.
+fn pager(p: &SandboxPage) -> Markup {
+    html! {
+        @if p.pages > 1 {
+            div.pager {
+                @if p.page > 1 {
+                    a.button-link href=(list_href(&p.q, &p.state, p.page - 1, p.per)) { "← prev" }
+                }
+                span { "page " (p.page) " of " (p.pages) }
+                @if p.page < p.pages {
+                    a.button-link href=(list_href(&p.q, &p.state, p.page + 1, p.per)) { "next →" }
+                }
+            }
+        }
     }
-    if p.per != model::DEFAULT_PER {
-        href.push_str(&format!("&per={}", p.per));
+}
+
+/// Build a `/sandboxes` link, omitting params that hold their default value.
+fn list_href(q: &str, state: &str, page: usize, per: usize) -> String {
+    let mut href = String::from("/sandboxes?");
+    if page != 1 {
+        href.push_str(&format!("page={page}&"));
     }
+    if state != model::DEFAULT_STATE {
+        href.push_str(&format!("state={}&", urlenc(state)));
+    }
+    if !q.is_empty() {
+        href.push_str(&format!("q={}&", urlenc(q)));
+    }
+    if per != model::DEFAULT_PER {
+        href.push_str(&format!("per={per}&"));
+    }
+    href.truncate(href.len() - 1); // trailing '&' or the bare '?'
     href
 }
 
@@ -506,6 +536,13 @@ form.search { display:flex; align-items:center; gap:.4rem; margin:.8rem 0; }
 form.search input[type=search] { flex:1; max-width:420px; font:inherit; padding:.3rem .6rem;
         background:var(--btn-bg); color:var(--fg); border:1px solid var(--btn-border); border-radius:6px; }
 .pager { display:flex; align-items:center; gap:1rem; margin:1rem 0; color:var(--dim); }
+.pills { display:flex; flex-wrap:wrap; gap:.4rem; margin:.6rem 0; }
+.pill { display:inline-block; padding:.15rem .65rem; border-radius:999px; font-size:.85rem;
+        border:1px solid var(--btn-border); background:var(--btn-bg); color:var(--fg); }
+.pill:hover { border-color:var(--btn-hover); text-decoration:none; }
+.pill.selected { background:var(--sess-bg); color:var(--sess-fg); border-color:var(--sess-fg); font-weight:600; }
+.pill .count { color:var(--dim); font-weight:400; }
+.pill.selected .count { color:var(--sess-fg); }
 .note { color:var(--muted); font-size:.85rem; }
 code { background:var(--code-bg); padding:.1rem .3rem; border-radius:4px; font-size:.85em; }
 pre.log { background:var(--pre-bg); color:var(--pre-fg); padding:1rem; border-radius:8px; overflow-x:auto;

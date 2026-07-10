@@ -35,6 +35,22 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_PER: usize = 25;
 pub const MAX_PER: usize = 200;
 
+/// State filter values, in display order. Each is a [`status_str`] label; the
+/// sentinel [`STATE_ALL`] disables the filter. The view defaults to showing
+/// only running sandboxes — on a busy host the stopped tail dwarfs the live
+/// set.
+pub const STATE_FILTERS: [&str; 7] = [
+    "running",
+    "provisioning",
+    "stopped",
+    "paused",
+    "cold-stored",
+    "failed",
+    "unknown",
+];
+pub const DEFAULT_STATE: &str = "running";
+pub const STATE_ALL: &str = "all";
+
 /// The subset of the daemon's raw sandbox record we render. Extra JSON fields
 /// are ignored; missing ones default, so this tolerates daemon schema drift.
 #[derive(Deserialize)]
@@ -292,19 +308,37 @@ pub struct SandboxPage {
     pub per: usize,
     /// The search text as applied (trimmed), echoed back into the form.
     pub q: String,
+    /// The state filter as applied: a [`STATE_FILTERS`] label or [`STATE_ALL`].
+    pub state: String,
+    /// Sandboxes per state label among the search-matched set (state filter
+    /// not applied), in [`STATE_FILTERS`] order — drives the filter pills.
+    pub state_counts: Vec<(&'static str, usize)>,
 }
 
 /// Build one page of the searchable all-sandboxes view. Same system footprint
 /// as [`build_rows`] — one bounded daemon read plus in-process pooler lookups,
-/// no guest access — but lazier: the filter runs on the raw records and only
+/// no guest access — but lazier: the filters run on the raw records and only
 /// the `per` rows in the page window are joined into full [`VmRow`]s.
-pub async fn build_page(st: &DashState, q: &str, page: usize, per: usize) -> Result<SandboxPage> {
+pub async fn build_page(
+    st: &DashState,
+    q: &str,
+    state: &str,
+    page: usize,
+    per: usize,
+) -> Result<SandboxPage> {
     let list = fetch_inventory().await?;
     let total = list.len();
     let (snap, store) = pooler_maps(st).await;
 
     let needle = q.trim().to_lowercase();
-    let mut hits: Vec<RawSandbox> = list
+    let state = {
+        let s = state.trim().to_lowercase();
+        if s.is_empty() { DEFAULT_STATE.to_string() } else { s }
+    };
+
+    // Search filter first (state-agnostic) — this set also feeds the per-state
+    // pill counts, so switching state filters shows where the matches live.
+    let q_hits: Vec<RawSandbox> = list
         .into_iter()
         .filter(|s| {
             needle.is_empty() || {
@@ -318,6 +352,20 @@ pub async fn build_page(st: &DashState, q: &str, page: usize, per: usize) -> Res
                 matches_query(s, schema, &needle)
             }
         })
+        .collect();
+
+    let mut state_counts: Vec<(&'static str, usize)> =
+        STATE_FILTERS.iter().map(|l| (*l, 0)).collect();
+    for s in &q_hits {
+        let label = status_str(&s.status);
+        if let Some(c) = state_counts.iter_mut().find(|(l, _)| *l == label) {
+            c.1 += 1;
+        }
+    }
+
+    let mut hits: Vec<RawSandbox> = q_hits
+        .into_iter()
+        .filter(|s| state_matches(s, &state))
         .collect();
     // Stable order (name, then id as tie-break) so page boundaries don't
     // shuffle between requests.
@@ -340,7 +388,17 @@ pub async fn build_page(st: &DashState, q: &str, page: usize, per: usize) -> Res
         pages,
         per,
         q: q.trim().to_string(),
+        state,
+        state_counts,
     })
+}
+
+/// Does this sandbox pass the state filter? `state` is a lowercased
+/// [`STATE_FILTERS`] label or [`STATE_ALL`]; an unrecognized value simply
+/// matches nothing (an admin typo'd a URL — an empty page is clearer than a
+/// silently ignored filter).
+fn state_matches(s: &RawSandbox, state: &str) -> bool {
+    state == STATE_ALL || status_str(&s.status) == state
 }
 
 /// Case-insensitive substring match against the fields an operator actually
@@ -464,6 +522,21 @@ mod tests {
         assert!(matches_query(&s, None, "running"));
         assert!(!matches_query(&s, None, "stopped"));
         assert!(!matches_query(&s, Some("tenant_west"), "east"));
+    }
+
+    #[test]
+    fn state_filter_matches_label_or_all() {
+        let running = raw("sb-1", "pg-a", "running");
+        let stopped = raw("sb-2", "pg-b", "stopped");
+        assert!(state_matches(&running, "running"));
+        assert!(!state_matches(&stopped, "running"));
+        assert!(state_matches(&stopped, "stopped"));
+        assert!(state_matches(&running, STATE_ALL));
+        assert!(state_matches(&stopped, STATE_ALL));
+        // Unrecognized filter matches nothing rather than everything.
+        assert!(!state_matches(&running, "bogus"));
+        // Every filter label is a status_str label, so pill counts line up.
+        assert!(STATE_FILTERS.contains(&status_str(&running.status)));
     }
 
     #[test]
