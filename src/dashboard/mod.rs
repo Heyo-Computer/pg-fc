@@ -6,10 +6,18 @@
 //! `PG_VM_POOL_DASHBOARD_LISTEN` is set; gated behind HTTP Basic auth when
 //! `PG_VM_POOL_DASHBOARD_USER`/`PASSWORD` are configured.
 //!
-//! It lists every heyvmd sandbox with power state, size, uptime, live sessions,
-//! and per-VM CPU/memory/disk usage; tails the pooler / heyvmd / per-VM Postgres
-//! logs; and drives stop/start/reboot/resize on any VM. Every daemon and guest
-//! call is timeout-bounded so one wedged VM can't hang a request.
+//! It lists every heyvmd sandbox with power state, allocated size (vCPU/RAM),
+//! uptime, and live pooler sessions; on the detail page it also shows live DB
+//! size/backends read over the pooler's own warm PG pool. It drives
+//! stop/start/reboot/resize on any VM, and tails the pooler / heyvmd / per-VM
+//! Postgres logs.
+//!
+//! Guest-console access (SDK `commands()` exec) goes through the VM's PID-1
+//! serial-console shell on this image and can halt the VM, so the browsable
+//! pages (index + detail) perform **no** guest access — only daemon reads and
+//! safe PG-pool queries. The one guest exec, the per-VM Postgres log tail, is
+//! confined to its own explicitly-navigated `/logs/vm/{id}` page. Every daemon
+//! and guest call is timeout-bounded so one wedged VM can't hang a request.
 
 mod auth;
 mod error;
@@ -18,7 +26,6 @@ mod logs;
 mod model;
 mod router;
 mod state;
-mod sysinfo;
 mod views;
 
 use std::sync::Arc;

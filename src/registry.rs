@@ -118,6 +118,12 @@ impl Drop for ConnGuard {
     }
 }
 
+/// Live database usage for a warm entry, read over its warm pool.
+pub struct DbStats {
+    pub db_size_bytes: i64,
+    pub backends: i32,
+}
+
 /// A plain, owned point-in-time view of one warm schema entry — no `Sandbox`,
 /// `Pool`, or lock handles — safe to hand to the dashboard's render layer.
 pub struct EntrySnapshot {
@@ -190,6 +196,36 @@ impl SchemaRegistry {
     /// VM that's currently stopped (not warm).
     pub fn store_entries(&self) -> Vec<(String, String)> {
         self.store.entries()
+    }
+
+    /// Live database stats for a warm, pooler-managed VM, read over the pooler's
+    /// own warm Postgres pool — the *same* safe TCP path the liveness probe uses,
+    /// **not** a guest console exec, so it never disturbs the VM. `None` when the
+    /// VM isn't warm or the query fails/times out.
+    pub async fn db_stats(&self, sandbox_id: &str, schema: &str) -> Option<DbStats> {
+        let entry = {
+            let map = self.entries.lock().await;
+            map.values().find_map(|cell| {
+                let e = cell.get()?;
+                (e.sandbox_id() == sandbox_id).then(|| e.clone())
+            })
+        }?;
+        let query = async {
+            let client = entry.pool.get().await.ok()?;
+            let row = client
+                .query_opt(
+                    "SELECT pg_database_size(datname), numbackends \
+                     FROM pg_stat_database WHERE datname = $1",
+                    &[&schema],
+                )
+                .await
+                .ok()??;
+            Some(DbStats {
+                db_size_bytes: row.get(0),
+                backends: row.get(1),
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(3), query).await.ok()?
     }
 
     /// Check out the entry for `schema`, bringing the VM up on first request.

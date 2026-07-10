@@ -1,22 +1,23 @@
 //! Merge the daemon's VM inventory with the pooler's live session snapshot and
 //! its durable schema↔VM map into a flat list of rows for rendering.
+//!
+//! Note: this deliberately performs **no guest-console access** (no `commands()`
+//! exec, no `files()` read). Those go through the VM's PID-1 serial-console
+//! shell on this image and can halt the VM, so the dashboard only reads the
+//! daemon's inventory here and live DB stats over the pooler's own PG pool.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use futures::stream::{self, StreamExt};
-use heyo_sdk::{Sandbox, SandboxStatus};
+use heyo_sdk::{Sandbox, SandboxInfo, SandboxStatus};
 
 use crate::vm;
 
 use super::state::DashState;
-use super::sysinfo::{self, ResourceUsage};
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Cap on concurrent guest usage probes so a host with many VMs doesn't open a
-/// probe to every one of them at once.
-const USAGE_CONCURRENCY: usize = 6;
+const GET_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// One VM as shown in the dashboard: daemon facts left-joined with pooler state.
 pub struct VmRow {
@@ -40,8 +41,6 @@ pub struct VmRow {
     pub target: Option<std::net::SocketAddr>,
     /// True when reached over an iroh tunnel rather than a direct guest IP.
     pub tunneled: Option<bool>,
-    /// CPU/memory/disk from the guest; `None` for non-running or unreachable VMs.
-    pub usage: Option<ResourceUsage>,
 }
 
 impl VmRow {
@@ -50,8 +49,8 @@ impl VmRow {
     }
 }
 
-/// Build the full VM list: list sandboxes, join the registry snapshot + store,
-/// then fetch guest resource usage for running VMs in bounded parallel.
+/// Build the full VM list: list sandboxes, join the registry snapshot + store.
+/// No guest access — safe to call on every page load / refresh.
 pub async fn build_rows(st: &DashState) -> Result<Vec<VmRow>> {
     let list = tokio::time::timeout(LIST_TIMEOUT, Sandbox::list(vm::local_opts()))
         .await
@@ -100,29 +99,9 @@ pub async fn build_rows(st: &DashState) -> Result<Vec<VmRow>> {
                 keepalive: entry.map(|e| e.keepalive).unwrap_or(false),
                 target: entry.map(|e| e.target),
                 tunneled: entry.map(|e| e.tunneled),
-                usage: None,
             }
         })
         .collect();
-
-    // Fetch usage only for running VMs, in bounded parallel — a hung or stopped
-    // VM yields None (rendered "—") rather than failing or stalling the page.
-    let running: Vec<(usize, String)> = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| r.is_running())
-        .map(|(i, r)| (i, r.id.clone()))
-        .collect();
-
-    let usages = stream::iter(running)
-        .map(|(i, id)| async move { (i, sysinfo::fetch_by_id(&id).await.ok()) })
-        .buffer_unordered(USAGE_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-
-    for (i, usage) in usages {
-        rows[i].usage = usage;
-    }
 
     // Pooler-managed VMs first, then alphabetical by name.
     rows.sort_by(|a, b| {
@@ -138,4 +117,15 @@ pub async fn build_rows(st: &DashState) -> Result<Vec<VmRow>> {
 /// handful of VMs).
 pub async fn find_row(st: &DashState, id: &str) -> Result<Option<VmRow>> {
     Ok(build_rows(st).await?.into_iter().find(|r| r.id == id))
+}
+
+/// Authoritative per-VM info straight from the daemon. Read-only (`GET`), no
+/// guest access. Call only for running VMs — `get()` on a *stopped* Firecracker
+/// VM has a daemon-side rehydrate side effect (see `vm::bring_up_existing`).
+pub async fn get_info(id: &str) -> Result<SandboxInfo> {
+    let sb = Sandbox::connect(id.to_string(), vm::local_opts()).context("connecting to VM")?;
+    tokio::time::timeout(GET_TIMEOUT, sb.get())
+        .await
+        .context("fetching sandbox info timed out")?
+        .context("fetching sandbox info")
 }

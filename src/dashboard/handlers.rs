@@ -43,14 +43,21 @@ pub async fn vm_detail(
     let Some(row) = model::find_row(&st, &id).await? else {
         return Ok(views::not_found_page(&id));
     };
-    let log = if row.is_running() {
-        logs::tail_vm_log(&id, st.cfg.log_lines)
-            .await
-            .unwrap_or_else(|e| format!("(log unavailable: {e})"))
+    // Enrich with authoritative daemon info (read-only GET, no guest access);
+    // only for running VMs to avoid the get() rehydrate side effect on stopped
+    // Firecracker VMs. Best-effort.
+    let info = if row.is_running() {
+        model::get_info(&id).await.ok()
     } else {
-        "(VM not running — no live log)".to_string()
+        None
     };
-    Ok(views::vm_detail_page(&st, &row, &log, &banner))
+    // Live DB usage over the pooler's warm PG pool (safe TCP path, no guest exec)
+    // — only meaningful for a warm, pooler-managed VM.
+    let db = match &row.schema {
+        Some(schema) if row.is_running() => st.registry.db_stats(&id, schema).await,
+        _ => None,
+    };
+    Ok(views::vm_detail_page(&st, &row, info.as_ref(), db.as_ref(), &banner))
 }
 
 pub async fn logs_pooler(State(st): State<DashState>) -> Result<Markup, AppError> {

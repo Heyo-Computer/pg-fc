@@ -271,17 +271,24 @@ target/release/pg-vm-pool
 What it gives you (browse to the listen address):
 
 - **VM/session overview** (`/`) — every heyvmd sandbox, with power state,
-  size class, uptime, live pooler sessions, idle timer, and per-VM CPU
-  load / memory / `/workspace` disk usage. Pooler-managed `pg-<schema>` VMs
-  are grouped first and link to a detail page.
+  allocated size (vCPU/RAM), uptime, and live pooler sessions. Pooler-managed
+  `pg-<schema>` VMs are grouped first and link to a detail page.
+- **Detail page** — full daemon config (size class + resources, image, region,
+  guest IP, TTL, status) plus live **database size and backend count**, read
+  over the pooler's own warm Postgres connection (a normal query, not a guest
+  command).
 - **Logs** — tail the pooler log (`/logs/pooler`), the heyvmd log
   (`/logs/heyvmd`), and any VM's in-guest Postgres log (`/logs/vm/<id>`).
 - **Controls** — stop / start / reboot / resize any VM from its detail page.
   Note that a pooler-managed VM stopped here auto-restarts on the next client
   connection, and a resize takes effect on the VM's next boot.
 
-Resource usage and the per-VM Postgres log are read from inside each guest;
-every daemon and guest call is timeout-bounded, so one wedged VM can't hang a
+The browsable pages (index + detail) perform **no in-guest command execution** —
+they read only the daemon inventory and the pooler's own PG pool, so viewing or
+refreshing a VM never disturbs it. The one exception is the per-VM Postgres log
+page (`/logs/vm/<id>`), which runs `tail` inside the guest and is therefore a
+deliberate, explicitly-navigated action rather than part of the detail view.
+Every daemon and guest call is timeout-bounded, so one wedged VM can't hang a
 page. Access is gated by HTTP **Basic auth** when
 `PG_VM_POOL_DASHBOARD_USER`/`PASSWORD` are set (they must be set together, or
 startup fails). The dashboard can stop and resize **every** VM on the host, so
