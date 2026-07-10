@@ -73,6 +73,31 @@ pub struct Config {
     /// Envs `PG_VM_POOL_TLS_CERT` / `PG_VM_POOL_TLS_KEY`.
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
+    /// Admin dashboard settings. `dashboard.is_none()` (the default) means the
+    /// dashboard is disabled — it's enabled by setting `PG_VM_POOL_DASHBOARD_LISTEN`.
+    pub dashboard: Option<DashboardConfig>,
+}
+
+/// Settings for the optional server-side-rendered admin dashboard. Present
+/// (`Some`) only when `PG_VM_POOL_DASHBOARD_LISTEN` is set — that env var is the
+/// on/off switch.
+#[derive(Clone)]
+pub struct DashboardConfig {
+    /// Where the dashboard's HTTP server listens. Prefer a loopback/private
+    /// address; pair a public bind with basic auth. Env `PG_VM_POOL_DASHBOARD_LISTEN`.
+    pub listen: SocketAddr,
+    /// HTTP Basic auth `(user, password)`. `None` disables the auth gate (a
+    /// warning is logged when bound non-loopback). Both must be set together.
+    /// Envs `PG_VM_POOL_DASHBOARD_USER` / `PG_VM_POOL_DASHBOARD_PASSWORD`.
+    pub basic_auth: Option<(String, String)>,
+    /// Path to the pooler's own log file (supervisord captures stdout+stderr
+    /// here). Env `PG_VM_POOL_POOLER_LOG`.
+    pub pooler_log: PathBuf,
+    /// Path to heyvmd's log file. Env `PG_VM_POOL_HEYVMD_LOG`.
+    pub heyvmd_log: PathBuf,
+    /// How many trailing lines to show when tailing a log. Env
+    /// `PG_VM_POOL_DASHBOARD_LOG_LINES` (default 200).
+    pub log_lines: usize,
 }
 
 impl Config {
@@ -101,6 +126,12 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_STATE_FILE",
     "PG_VM_POOL_TLS_CERT",
     "PG_VM_POOL_TLS_KEY",
+    "PG_VM_POOL_DASHBOARD_LISTEN",
+    "PG_VM_POOL_DASHBOARD_USER",
+    "PG_VM_POOL_DASHBOARD_PASSWORD",
+    "PG_VM_POOL_POOLER_LOG",
+    "PG_VM_POOL_HEYVMD_LOG",
+    "PG_VM_POOL_DASHBOARD_LOG_LINES",
 ];
 
 impl Config {
@@ -190,6 +221,8 @@ impl Config {
             .map(str::to_string)
             .collect();
 
+        let dashboard = DashboardConfig::from_env()?;
+
         Ok(Self {
             listen_addr,
             image,
@@ -205,12 +238,67 @@ impl Config {
             state_file,
             tls_cert,
             tls_key,
+            dashboard,
         })
     }
 }
 
+impl DashboardConfig {
+    /// Build the dashboard config from the environment. Returns `Ok(None)` when
+    /// `PG_VM_POOL_DASHBOARD_LISTEN` is unset (dashboard disabled). Errors on an
+    /// unparseable listen address or a half-set basic-auth credential.
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        // Empty string treated as unset, matching the PASSWORD/TLS handling above.
+        let Some(listen) = std::env::var("PG_VM_POOL_DASHBOARD_LISTEN")
+            .ok()
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        let listen: SocketAddr = listen.parse().map_err(|e| {
+            anyhow::anyhow!("invalid PG_VM_POOL_DASHBOARD_LISTEN {listen:?}: {e}")
+        })?;
+
+        let user = std::env::var("PG_VM_POOL_DASHBOARD_USER")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let password = std::env::var("PG_VM_POOL_DASHBOARD_PASSWORD")
+            .ok()
+            .filter(|s| !s.is_empty());
+        // Half-set credentials are a config mistake: fail fast rather than
+        // silently serve unauthenticated (mirrors the TLS cert/key pairing rule).
+        let basic_auth = match (user, password) {
+            (Some(u), Some(p)) => Some((u, p)),
+            (None, None) => None,
+            _ => anyhow::bail!(
+                "PG_VM_POOL_DASHBOARD_USER and PG_VM_POOL_DASHBOARD_PASSWORD must be \
+                 set together (or neither)"
+            ),
+        };
+
+        let pooler_log = std::env::var("PG_VM_POOL_POOLER_LOG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/var/log/pg-vm-pool/pg-vm-pool.log"));
+        let heyvmd_log = std::env::var("PG_VM_POOL_HEYVMD_LOG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/var/log/heyvmd/heyvmd.log"));
+        let log_lines = std::env::var("PG_VM_POOL_DASHBOARD_LOG_LINES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200usize);
+
+        Ok(Some(Self {
+            listen,
+            basic_auth,
+            pooler_log,
+            heyvmd_log,
+            log_lines,
+        }))
+    }
+}
+
 /// Case-insensitive, matching heyo's own CLI parsing convention.
-fn parse_size_class(v: &str) -> anyhow::Result<SandboxSize> {
+pub(crate) fn parse_size_class(v: &str) -> anyhow::Result<SandboxSize> {
     match v.trim().to_ascii_lowercase().as_str() {
         "micro" => Ok(SandboxSize::Micro),
         "mini" => Ok(SandboxSize::Mini),

@@ -7,6 +7,7 @@
 
 mod auth;
 mod config;
+mod dashboard;
 mod proxy;
 mod registry;
 mod startup;
@@ -56,8 +57,30 @@ async fn main() -> Result<()> {
              the network in cleartext; set PG_VM_POOL_TLS_CERT/KEY"
         );
     }
+    // Pull the dashboard settings out before `cfg` is moved into the registry.
+    let dashboard_cfg = cfg.dashboard.clone();
     let registry = Arc::new(SchemaRegistry::new(cfg));
     registry.spawn_reaper();
+
+    // Optional admin dashboard: enabled only when PG_VM_POOL_DASHBOARD_LISTEN is
+    // set. Runs in its own task sharing the registry, so it never blocks the PG
+    // accept loop below.
+    if let Some(dash) = dashboard_cfg {
+        if !dash.listen.ip().is_loopback() && dash.basic_auth.is_none() {
+            warn!(
+                "dashboard bound to non-loopback {} without basic auth — anyone who \
+                 can reach it can stop/resize every VM; set PG_VM_POOL_DASHBOARD_USER/\
+                 PASSWORD or bind a loopback address",
+                dash.listen
+            );
+        }
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            if let Err(e) = dashboard::serve(dash, registry).await {
+                warn!("dashboard exited: {e:#}");
+            }
+        });
+    }
 
     let listener = TcpListener::bind(listen_addr).await?;
     info!("pg-vm-pool listening on {listen_addr}");

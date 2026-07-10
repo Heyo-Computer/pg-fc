@@ -186,17 +186,27 @@ temp_buffers_mb=$((mem_mb / 32)); [ "$temp_buffers_mb" -gt 128 ] && temp_buffers
 gather_workers=$((cpus - 1))
 [ "$gather_workers" -gt 4 ] && gather_workers=4
 
-# Let WAL grow with the data disk so a ~1GB COPY doesn't checkpoint-storm,
-# while never letting recycled WAL crowd the data on small disks.
-max_wal_mb=1024
+# WAL budget. Disk-full is the one crash this VM cannot recover from on its
+# own: ENOSPC on a WAL write is a PANIC, and the end-of-recovery checkpoint
+# needs WAL space too, so a full disk means a crash loop until someone grows
+# the volume. Peak usage is a Quickstore bulk import, where the COPY temp
+# table (~1x dataset), the destination sheet table (~1x), WAL, and the
+# swapfile all share this disk at once. WAL gets disk/8 — a soft cap that
+# only overshoots when checkpoints lag — leaving ~2x-dataset headroom plus
+# swap (also capped at disk/8, above) on the default 4GB volume. The 512MB
+# floor trades checkpoint frequency for safety on tiny disks: worst case is
+# more checkpoints during a big load, never a WAL-full PANIC.
+max_wal_mb=512
 temp_limit_mb=1024
 if [ -b "$DATA_DEV" ]; then
     disk_mb=$(($(blockdev --getsize64 "$DATA_DEV") / 1024 / 1024))
-    max_wal_mb=$((disk_mb / 4))
-    [ "$max_wal_mb" -lt 1024 ] && max_wal_mb=1024
+    max_wal_mb=$((disk_mb / 8))
+    [ "$max_wal_mb" -lt 512 ] && max_wal_mb=512
     [ "$max_wal_mb" -gt 4096 ] && max_wal_mb=4096
     # Cap per-process spill files: a runaway sort filling the disk is a PANIC
     # (whole-cluster crash), while hitting this limit only errors that query.
+    # Temp *tables* don't count against this limit — they're ordinary relation
+    # files, budgeted in the arithmetic above.
     temp_limit_mb=$((disk_mb / 4))
 fi
 
@@ -222,7 +232,9 @@ wal_compression = lz4
 
 # The pooler stop-kills this VM anyway, so commits already ride on WAL crash
 # recovery; async commit trades <1s of confirmed-commit durability (never
-# integrity) for a large ingest speedup — the Quickstore bargain.
+# integrity) for a large ingest speedup — the Quickstore bargain. The pooler
+# issues a CHECKPOINT before each idle stop, so the routine reap path loses
+# nothing; only a genuine mid-flight crash can drop that sub-second window.
 synchronous_commit = off
 
 # Virtio SSD-backed storage: random reads cost ~sequential, deep readahead ok.
