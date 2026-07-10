@@ -1,13 +1,13 @@
 //! Server-side-rendered HTML (maud). All values are interpolated through maud,
 //! which HTML-escapes by default; no secrets are ever rendered.
 
-use heyo_sdk::{SandboxInfo, SandboxStatus};
+use heyo_sdk::SandboxStatus;
 use maud::{html, Markup, DOCTYPE};
 
 use crate::registry::DbStats;
 
 use super::handlers::Banner;
-use super::model::VmRow;
+use super::model::{self, SandboxPage, VmRow};
 use super::state::DashState;
 
 const SIZE_CLASSES: [&str; 5] = ["micro", "mini", "small", "medium", "large"];
@@ -28,6 +28,7 @@ fn shell(title: &str, body: Markup) -> Markup {
                     a.brand href="/" { "pg-vm-pool" }
                     nav {
                         a href="/" { "VMs" }
+                        a href="/sandboxes" { "all sandboxes" }
                         a href="/logs/pooler" { "pooler log" }
                         a href="/logs/heyvmd" { "heyvmd log" }
                     }
@@ -65,58 +66,93 @@ pub fn index_page(st: &DashState, rows: &[VmRow], b: &Banner) -> Markup {
                     span.warn { "auth: OFF" }
                 }
             }
-            table {
-                thead {
-                    tr {
-                        th { "VM" }
-                        th { "schema" }
-                        th { "status" }
-                        th { "size" }
-                        th { "uptime" }
-                        th { "sessions" }
-                        th { "actions" }
-                    }
+            (vm_table(rows))
+        },
+    )
+}
+
+/// Paged, searchable list of every daemon sandbox.
+pub fn sandboxes_page(p: &SandboxPage) -> Markup {
+    let first = (p.page - 1) * p.per + 1;
+    let last = first + p.rows.len().saturating_sub(1);
+    shell(
+        "all sandboxes",
+        html! {
+            h1 { "all sandboxes" }
+            form.search method="get" action="/sandboxes" {
+                input type="search" name="q" value=(p.q)
+                    placeholder="filter by id, name, schema, status, image, or guest ip";
+                @if p.per != model::DEFAULT_PER {
+                    input type="hidden" name="per" value=(p.per);
                 }
-                tbody {
-                    @for r in rows {
-                        tr {
-                            td { a href={ "/vm/" (r.id) } { (r.name) } }
-                            td.dim { (r.schema.as_deref().unwrap_or("—")) }
-                            td { (status_badge(&r.status)) }
-                            td { (size_cell(r.size_class.as_deref())) }
-                            td { (if r.is_running() { human_secs(r.uptime_secs) } else { "—".into() }) }
-                            td { (sessions_cell(r)) }
-                            td.actions { (action_buttons(&r.id, &r.status)) }
-                        }
-                    }
+                button type="submit" { "search" }
+                @if !p.q.is_empty() { a.button-link href="/sandboxes" { "clear" } }
+            }
+            div.summary {
+                @if p.matched == 0 {
+                    span { "no sandboxes match" }
+                } @else {
+                    span { "showing " b { (first) "–" (last) } " of " b { (p.matched) } }
                 }
+                @if !p.q.is_empty() {
+                    span.dim { (p.total) " total" }
+                }
+            }
+            @if p.matched > 0 {
+                (vm_table(&p.rows))
+                (pager(p))
             }
         },
     )
 }
 
-pub fn vm_detail_page(
-    st: &DashState,
-    r: &VmRow,
-    info: Option<&SandboxInfo>,
-    db: Option<&DbStats>,
-    b: &Banner,
-) -> Markup {
-    // Prefer the authoritative per-VM info where present, fall back to the row.
-    let size_class = info
-        .and_then(|i| i.size_class.clone())
-        .or_else(|| r.size_class.clone());
-    let image = info.map(|i| i.image.clone());
-    let region = info.and_then(|i| i.region.clone());
-    let guest_ip = info
-        .and_then(|i| i.guest_ip.clone())
-        .or_else(|| r.guest_ip.clone());
-    let ttl = info.and_then(|i| i.ttl_seconds).or(r.ttl_seconds);
-    let changed = info.map(|i| i.status_changed_at.clone());
-    let error = info
-        .and_then(|i| i.error_message.clone())
-        .or_else(|| r.error_message.clone());
+/// Prev/next page controls; hidden when everything fits on one page.
+fn pager(p: &SandboxPage) -> Markup {
+    html! {
+        @if p.pages > 1 {
+            div.pager {
+                @if p.page > 1 {
+                    a.button-link href=(page_href(p, p.page - 1)) { "← prev" }
+                }
+                span { "page " (p.page) " of " (p.pages) }
+                @if p.page < p.pages {
+                    a.button-link href=(page_href(p, p.page + 1)) { "next →" }
+                }
+            }
+        }
+    }
+}
 
+/// Build a `/sandboxes` link that lands on `page` while preserving the current
+/// search and page size.
+fn page_href(p: &SandboxPage, page: usize) -> String {
+    let mut href = format!("/sandboxes?page={page}");
+    if !p.q.is_empty() {
+        href.push_str("&q=");
+        href.push_str(&urlenc(&p.q));
+    }
+    if p.per != model::DEFAULT_PER {
+        href.push_str(&format!("&per={}", p.per));
+    }
+    href
+}
+
+/// Minimal RFC 3986 percent-encoder for a query value (search text is
+/// user-typed, so it can contain anything).
+fn urlenc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+pub fn vm_detail_page(st: &DashState, r: &VmRow, db: Option<&DbStats>, b: &Banner) -> Markup {
     shell(
         &r.name,
         html! {
@@ -129,38 +165,30 @@ pub fn vm_detail_page(
                 dt { "id" }          dd { code { (r.id) } }
                 dt { "schema" }      dd { (r.schema.as_deref().unwrap_or("—")) }
                 dt { "pooler-managed" } dd { (yesno(r.pool_managed)) }
-                dt { "size class" }
-                dd {
-                    (size_class.as_deref().unwrap_or("unknown"))
-                    @if let Some(res) = size_class.as_deref().and_then(size_resources) {
-                        span.dim { " · " (res) }
-                    }
-                }
-                @if let Some(img) = &image { dt { "image" } dd { (img) } }
-                @if let Some(reg) = &region { dt { "region" } dd { (reg) } }
+                dt { "vCPUs" } dd { (r.cpus.map(|c| c.to_string()).unwrap_or_else(|| "—".into())) }
+                dt { "memory" } dd { (r.memory_bytes.map(human_bytes).unwrap_or_else(|| "—".into())) }
+                dt { "disk" } dd { (r.disk_size_gb.map(|g| format!("{g} GB")).unwrap_or_else(|| "—".into())) }
+                @if let Some(sc) = &r.size_class { dt { "size class" } dd { (sc) } }
+                @if let Some(img) = &r.image { dt { "image" } dd { (img) } }
+                @if let Some(reg) = &r.region { dt { "region" } dd { (reg) } }
                 dt { "uptime" } dd { (if r.is_running() { human_secs(r.uptime_secs) } else { "—".into() }) }
-                dt { "guest ip" } dd { (guest_ip.as_deref().unwrap_or("—")) }
-                @if let Some(t) = ttl {
+                dt { "guest ip" } dd { (r.guest_ip.as_deref().unwrap_or("—")) }
+                @if let Some(t) = r.ttl_seconds {
                     dt { "ttl" } dd { (if t == 0 { "0 (pinned)".to_string() } else { human_secs(t) }) }
                 }
-                @if let Some(c) = &changed { dt { "status changed" } dd.dim { (c) } }
+                @if let Some(c) = &r.status_changed_at { dt { "status changed" } dd.dim { (c) } }
                 dt { "keep-alive" } dd { (yesno(r.keepalive)) }
                 @if let Some(target) = r.target {
                     dt { "splice target" }
                     dd { code { (target.to_string()) } (if r.tunneled == Some(true) { " (tunnel)" } else { " (direct)" }) }
                 }
-                @if let Some(err) = &error { dt { "error" } dd.err { (err) } }
+                @if let Some(err) = &r.error_message { dt { "error" } dd.err { (err) } }
             }
 
             h2 { "resource usage" }
             dl.detail {
                 dt { "allocated" }
-                dd {
-                    @match size_class.as_deref().and_then(size_resources) {
-                        Some(res) => (res),
-                        None => "—",
-                    }
-                }
+                dd { (allocated_str(r).unwrap_or_else(|| "—".into())) }
                 dt { "live sessions" } dd { (sessions_cell(r)) }
                 @if let Some(idle) = r.idle_secs {
                     dt { "idle for" }
@@ -186,7 +214,7 @@ pub fn vm_detail_page(
                     label { "resize to " }
                     select name="size_class" {
                         @for s in SIZE_CLASSES {
-                            option value=(s) selected[size_class.as_deref() == Some(s)] { (s) }
+                            option value=(s) selected[r.size_class.as_deref() == Some(s)] { (s) }
                         }
                     }
                     button type="submit" { "resize" }
@@ -249,6 +277,38 @@ pub fn error_page(err: &anyhow::Error) -> Markup {
 
 // ---- fragments -------------------------------------------------------------
 
+/// The VM list table, shared by the index and the paged all-sandboxes view.
+fn vm_table(rows: &[VmRow]) -> Markup {
+    html! {
+        table {
+            thead {
+                tr {
+                    th { "VM" }
+                    th { "schema" }
+                    th { "status" }
+                    th { "size" }
+                    th { "uptime" }
+                    th { "sessions" }
+                    th { "actions" }
+                }
+            }
+            tbody {
+                @for r in rows {
+                    tr {
+                        td { a href={ "/vm/" (r.id) } { (r.name) } }
+                        td.dim { (r.schema.as_deref().unwrap_or("—")) }
+                        td { (status_badge(&r.status)) }
+                        td { (size_cell(r)) }
+                        td { (if r.is_running() { human_secs(r.uptime_secs) } else { "—".into() }) }
+                        td { (sessions_cell(r)) }
+                        td.actions { (action_buttons(&r.id, &r.status)) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn action_buttons(id: &str, status: &SandboxStatus) -> Markup {
     let running = *status == SandboxStatus::Running;
     html! {
@@ -261,15 +321,40 @@ fn action_buttons(id: &str, status: &SandboxStatus) -> Markup {
     }
 }
 
-fn size_cell(size: Option<&str>) -> Markup {
+fn size_cell(r: &VmRow) -> Markup {
+    // Prefer the concrete cpus/memory the daemon reports; fall back to a size
+    // class label, then to nothing.
     html! {
-        @match size {
-            Some(s) => {
-                (s)
-                @if let Some(res) = size_resources(s) { span.dim.sub { (res) } }
+        @match (r.cpus, r.memory_bytes) {
+            (Some(c), Some(m)) => {
+                (format!("{c} vCPU"))
+                span.dim.sub { (human_bytes(m)) }
             }
-            None => span.dim { "—" },
+            _ => @match r.size_class.as_deref() {
+                Some(s) => { (s) }
+                None => span.dim { "—" },
+            },
         }
+    }
+}
+
+/// Human-readable allocated resources for the detail page ("4 vCPU · 8.0 GiB ·
+/// 4 GB disk"), from whatever the daemon reported.
+fn allocated_str(r: &VmRow) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(c) = r.cpus {
+        parts.push(format!("{c} vCPU"));
+    }
+    if let Some(m) = r.memory_bytes {
+        parts.push(human_bytes(m));
+    }
+    if let Some(g) = r.disk_size_gb {
+        parts.push(format!("{g} GB disk"));
+    }
+    if parts.is_empty() {
+        r.size_class.clone()
+    } else {
+        Some(parts.join(" · "))
     }
 }
 
@@ -284,28 +369,15 @@ fn sessions_cell(r: &VmRow) -> Markup {
 }
 
 fn status_badge(status: &SandboxStatus) -> Markup {
-    let (label, class) = match status {
-        SandboxStatus::Running => ("running", "s-running"),
-        SandboxStatus::Provisioning => ("provisioning", "s-prov"),
-        SandboxStatus::Stopped => ("stopped", "s-stopped"),
-        SandboxStatus::Paused => ("paused", "s-stopped"),
-        SandboxStatus::Failed => ("failed", "s-failed"),
-        SandboxStatus::ColdStored => ("cold-stored", "s-stopped"),
-        SandboxStatus::Unknown => ("unknown", "s-unknown"),
+    let class = match status {
+        SandboxStatus::Running => "s-running",
+        SandboxStatus::Provisioning => "s-prov",
+        SandboxStatus::Stopped | SandboxStatus::Paused | SandboxStatus::ColdStored => "s-stopped",
+        SandboxStatus::Failed => "s-failed",
+        SandboxStatus::Unknown => "s-unknown",
     };
-    html! { span.badge class=(class) { (label) } }
-}
-
-/// Allocated resources per size tier (matches the tier table in config/README).
-fn size_resources(size: &str) -> Option<&'static str> {
-    match size {
-        "micro" => Some("0.25 vCPU · 512 MB"),
-        "mini" => Some("0.5 vCPU · 1 GB"),
-        "small" => Some("1 vCPU · 2 GB"),
-        "medium" => Some("2 vCPU · 4 GB"),
-        "large" => Some("4 vCPU · 8 GB"),
-        _ => None,
-    }
+    // Label comes from the model so searching e.g. "running" matches the badge.
+    html! { span.badge class=(class) { (model::status_str(status)) } }
 }
 
 fn yesno(b: bool) -> &'static str {
@@ -430,6 +502,10 @@ section.controls h2 { margin-top:0; }
 form.resize { display:flex; align-items:center; gap:.4rem; }
 select { font:inherit; padding:.2rem; background:var(--btn-bg); color:var(--fg);
          border:1px solid var(--btn-border); border-radius:6px; }
+form.search { display:flex; align-items:center; gap:.4rem; margin:.8rem 0; }
+form.search input[type=search] { flex:1; max-width:420px; font:inherit; padding:.3rem .6rem;
+        background:var(--btn-bg); color:var(--fg); border:1px solid var(--btn-border); border-radius:6px; }
+.pager { display:flex; align-items:center; gap:1rem; margin:1rem 0; color:var(--dim); }
 .note { color:var(--muted); font-size:.85rem; }
 code { background:var(--code-bg); padding:.1rem .3rem; border-radius:4px; font-size:.85em; }
 pre.log { background:var(--pre-bg); color:var(--pre-fg); padding:1rem; border-radius:8px; overflow-x:auto;

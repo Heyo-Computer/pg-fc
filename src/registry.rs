@@ -17,6 +17,12 @@ use crate::config::Config;
 use crate::store::Store;
 use crate::vm;
 
+/// Bound on the pre-stop CHECKPOINT the reaper issues before killing an idle
+/// VM. An immediate checkpoint flushes at most shared_buffers of dirty pages
+/// to virtio-SSD storage — seconds on any size class — so a longer wait means
+/// something is wedged and the stop should proceed.
+const PRE_STOP_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A ready, warm VM for one schema. `target` is where client bytes are spliced
 /// — either the VM's guest IP directly (same-host, no tunnel) or the local end
 /// of an iroh tunnel. Holding `tunnel` (when present) keeps that forward alive;
@@ -356,6 +362,27 @@ impl SchemaRegistry {
         }
         for (schema, entry) in victims {
             info!("idle-stopping VM for schema {schema} (no connections for >= {timeout:?})");
+            // Checkpoint before the kill. `sandbox.stop()` is an unclean
+            // power-off (Postgres never sees a shutdown signal), and the VMs
+            // run synchronous_commit=off — so without this, up to the last
+            // ~600ms of acked commits ride on luck and every restart replays
+            // WAL back to the previous checkpoint. One CHECKPOINT over the
+            // warm pool flushes everything acked and empties the replay
+            // queue, making the next boot's recovery a no-op. Best-effort:
+            // if it fails or times out we stop anyway — crash recovery
+            // handles it, that's the design.
+            let checkpoint = async {
+                let client = entry.pool.get().await?;
+                client.batch_execute("CHECKPOINT").await?;
+                Ok::<(), anyhow::Error>(())
+            };
+            match tokio::time::timeout(PRE_STOP_CHECKPOINT_TIMEOUT, checkpoint).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("pre-stop CHECKPOINT for schema {schema} failed: {e:#}"),
+                Err(_) => warn!(
+                    "pre-stop CHECKPOINT for schema {schema} timed out after {PRE_STOP_CHECKPOINT_TIMEOUT:?}"
+                ),
+            }
             if let Err(e) = entry.sandbox.stop().await {
                 warn!("failed to stop idle VM for schema {schema}: {e:#}");
             }

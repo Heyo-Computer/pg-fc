@@ -104,7 +104,10 @@ that's alive but recovering (answers `57P03` during WAL replay), and only the
 former triggers an automatic stop/start of the VM — a fresh boot re-runs
 `init.sh`, which relaunches Postgres.
 Each schema's data lives on its VM's persistent disk and survives stops,
-restarts, and idle reaping. The schema→VM binding is persisted in
+restarts, and idle reaping. Before an idle stop the pooler issues a
+`CHECKPOINT` over its warm connection, so the unclean VM kill loses no
+acknowledged commits (the VMs run `synchronous_commit=off`) and the next boot
+skips WAL replay entirely. The schema→VM binding is persisted in
 `PG_VM_POOL_STATE_FILE` (default `~/.heyo/pg-vm-pool/registry.tsv`) so it also
 survives pooler restarts.
 

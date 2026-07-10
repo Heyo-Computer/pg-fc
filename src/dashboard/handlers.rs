@@ -35,6 +35,30 @@ pub async fn index(
     Ok(views::index_page(&st, &rows, &banner))
 }
 
+/// Query params for the browse-all view. All optional so `/sandboxes` bare
+/// works; junk numeric input is a 400 from the extractor, which is fine for an
+/// admin tool.
+#[derive(Deserialize)]
+pub struct ListParams {
+    #[serde(default)]
+    pub q: String,
+    pub page: Option<usize>,
+    pub per: Option<usize>,
+}
+
+/// Paged, searchable list of every daemon sandbox. Lazy by construction: one
+/// bounded daemon read, filtering happens in-process, and only the visible
+/// page is joined with pooler state and rendered. No guest access.
+pub async fn sandboxes(
+    State(st): State<DashState>,
+    Query(p): Query<ListParams>,
+) -> Result<Markup, AppError> {
+    let per = p.per.unwrap_or(model::DEFAULT_PER).clamp(1, model::MAX_PER);
+    let page = p.page.unwrap_or(1);
+    let pg = model::build_page(&st, &p.q, page, per).await?;
+    Ok(views::sandboxes_page(&pg))
+}
+
 pub async fn vm_detail(
     State(st): State<DashState>,
     Path(id): Path<String>,
@@ -43,21 +67,13 @@ pub async fn vm_detail(
     let Some(row) = model::find_row(&st, &id).await? else {
         return Ok(views::not_found_page(&id));
     };
-    // Enrich with authoritative daemon info (read-only GET, no guest access);
-    // only for running VMs to avoid the get() rehydrate side effect on stopped
-    // Firecracker VMs. Best-effort.
-    let info = if row.is_running() {
-        model::get_info(&id).await.ok()
-    } else {
-        None
-    };
     // Live DB usage over the pooler's warm PG pool (safe TCP path, no guest exec)
     // — only meaningful for a warm, pooler-managed VM.
     let db = match &row.schema {
         Some(schema) if row.is_running() => st.registry.db_stats(&id, schema).await,
         _ => None,
     };
-    Ok(views::vm_detail_page(&st, &row, info.as_ref(), db.as_ref(), &banner))
+    Ok(views::vm_detail_page(&st, &row, db.as_ref(), &banner))
 }
 
 pub async fn logs_pooler(State(st): State<DashState>) -> Result<Markup, AppError> {

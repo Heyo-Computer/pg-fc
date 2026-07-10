@@ -5,19 +5,64 @@
 //! exec, no `files()` read). Those go through the VM's PID-1 serial-console
 //! shell on this image and can halt the VM, so the dashboard only reads the
 //! daemon's inventory here and live DB stats over the pooler's own PG pool.
+//!
+//! We fetch `/deployed-sandboxes` as raw JSON (via the SDK's HTTP client) rather
+//! than through `Sandbox::list`, because the typed `SandboxInfo` drops the
+//! concrete `cpus`/`memory`/`disk_size_gb` the daemon stores — and those (not
+//! the mostly-unpopulated `size_class`) are what actually describe a VM's size.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use heyo_sdk::{Sandbox, SandboxInfo, SandboxStatus};
+use axum::http::Method;
+use heyo_sdk::{HeyoClient, RequestOptions, SandboxStatus};
+use serde::Deserialize;
 
+use crate::registry::EntrySnapshot;
 use crate::vm;
 
 use super::state::DashState;
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(10);
-const GET_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Default / maximum rows per page on the browse-all view. The cap bounds how
+/// much HTML one request can render no matter what `?per=` a client asks for.
+pub const DEFAULT_PER: usize = 25;
+pub const MAX_PER: usize = 200;
+
+/// The subset of the daemon's raw sandbox record we render. Extra JSON fields
+/// are ignored; missing ones default, so this tolerates daemon schema drift.
+#[derive(Deserialize)]
+struct RawSandbox {
+    id: String,
+    #[serde(default)]
+    name: String,
+    status: SandboxStatus,
+    #[serde(default)]
+    size_class: Option<String>,
+    #[serde(default)]
+    uptime_secs: u64,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
+    #[serde(default)]
+    guest_ip: Option<String>,
+    #[serde(default)]
+    error_message: Option<String>,
+    #[serde(default)]
+    status_changed_at: Option<String>,
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    // Concrete resource config (from the sandbox record / sandbox.yaml).
+    #[serde(default)]
+    cpus: Option<u32>,
+    #[serde(default)]
+    memory: Option<u64>, // bytes
+    #[serde(default)]
+    disk_size_gb: Option<u32>,
+}
 
 /// One VM as shown in the dashboard: daemon facts left-joined with pooler state.
 pub struct VmRow {
@@ -29,6 +74,12 @@ pub struct VmRow {
     pub pool_managed: bool,
     pub status: SandboxStatus,
     pub size_class: Option<String>,
+    pub cpus: Option<u32>,
+    pub memory_bytes: Option<u64>,
+    pub disk_size_gb: Option<u32>,
+    pub image: Option<String>,
+    pub region: Option<String>,
+    pub status_changed_at: Option<String>,
     pub uptime_secs: u64,
     pub ttl_seconds: Option<u64>,
     pub guest_ip: Option<String>,
@@ -49,58 +100,94 @@ impl VmRow {
     }
 }
 
-/// Build the full VM list: list sandboxes, join the registry snapshot + store.
-/// No guest access — safe to call on every page load / refresh.
-pub async fn build_rows(st: &DashState) -> Result<Vec<VmRow>> {
-    let list = tokio::time::timeout(LIST_TIMEOUT, Sandbox::list(vm::local_opts()))
-        .await
-        .context("listing sandboxes timed out")?
-        .context("listing sandboxes")?;
+/// Fetch the daemon's raw sandbox inventory: one timeout-bounded HTTP GET to
+/// the local daemon, no guest access. The daemon offers no server-side paging
+/// or filtering on this endpoint, so this always returns the full list;
+/// callers slice/filter in-process.
+async fn fetch_inventory() -> Result<Vec<RawSandbox>> {
+    let client = HeyoClient::new(vm::local_opts()).context("building heyo client")?;
+    tokio::time::timeout(
+        LIST_TIMEOUT,
+        client.request::<Vec<RawSandbox>>(
+            Method::GET,
+            "/deployed-sandboxes",
+            None::<&()>,
+            RequestOptions::default(),
+        ),
+    )
+    .await
+    .context("listing sandboxes timed out")?
+    .context("listing sandboxes")
+}
 
-    // Warm entries: sandbox_id → live snapshot.
-    let snap: HashMap<String, _> = st
+/// The pooler-side join inputs, keyed by sandbox id: warm-entry snapshots and
+/// the durable schema↔VM map. Both are cheap in-process reads (one brief map
+/// lock, no I/O).
+async fn pooler_maps(
+    st: &DashState,
+) -> (HashMap<String, EntrySnapshot>, HashMap<String, String>) {
+    let snap = st
         .registry
         .snapshot()
         .await
         .into_iter()
         .map(|e| (e.sandbox_id.clone(), e))
         .collect();
-
-    // Durable schema names for VMs that aren't currently warm: sandbox_id → schema.
-    let store: HashMap<String, String> = st
+    let store = st
         .registry
         .store_entries()
         .into_iter()
         .map(|(schema, id)| (id, schema))
         .collect();
+    (snap, store)
+}
+
+/// Left-join one raw daemon record with the pooler's state.
+fn join_row(
+    s: RawSandbox,
+    snap: &HashMap<String, EntrySnapshot>,
+    store: &HashMap<String, String>,
+) -> VmRow {
+    let entry = snap.get(&s.id);
+    let schema = entry
+        .map(|e| e.schema.clone())
+        .or_else(|| store.get(&s.id).cloned())
+        .or_else(|| s.name.strip_prefix("pg-").map(str::to_string));
+    let pool_managed = schema.is_some() || s.name.starts_with("pg-");
+    VmRow {
+        id: s.id,
+        name: s.name,
+        schema,
+        pool_managed,
+        status: s.status,
+        size_class: s.size_class,
+        cpus: s.cpus,
+        memory_bytes: s.memory,
+        disk_size_gb: s.disk_size_gb,
+        image: s.image,
+        region: s.region,
+        status_changed_at: s.status_changed_at,
+        uptime_secs: s.uptime_secs,
+        ttl_seconds: s.ttl_seconds,
+        guest_ip: s.guest_ip,
+        error_message: s.error_message,
+        live_sessions: entry.map(|e| e.active),
+        idle_secs: entry.map(|e| e.idle_secs),
+        keepalive: entry.map(|e| e.keepalive).unwrap_or(false),
+        target: entry.map(|e| e.target),
+        tunneled: entry.map(|e| e.tunneled),
+    }
+}
+
+/// Build the full VM list: fetch the raw sandbox inventory, join the registry
+/// snapshot + store. No guest access — safe to call on every page load/refresh.
+pub async fn build_rows(st: &DashState) -> Result<Vec<VmRow>> {
+    let list = fetch_inventory().await?;
+    let (snap, store) = pooler_maps(st).await;
 
     let mut rows: Vec<VmRow> = list
         .into_iter()
-        .map(|info| {
-            let entry = snap.get(&info.id);
-            let schema = entry
-                .map(|e| e.schema.clone())
-                .or_else(|| store.get(&info.id).cloned())
-                .or_else(|| info.name.strip_prefix("pg-").map(str::to_string));
-            let pool_managed = schema.is_some() || info.name.starts_with("pg-");
-            VmRow {
-                id: info.id.clone(),
-                name: info.name.clone(),
-                schema,
-                pool_managed,
-                status: info.status.clone(),
-                size_class: info.size_class.clone(),
-                uptime_secs: info.uptime_secs,
-                ttl_seconds: info.ttl_seconds,
-                guest_ip: info.guest_ip.clone(),
-                error_message: info.error_message.clone(),
-                live_sessions: entry.map(|e| e.active),
-                idle_secs: entry.map(|e| e.idle_secs),
-                keepalive: entry.map(|e| e.keepalive).unwrap_or(false),
-                target: entry.map(|e| e.target),
-                tunneled: entry.map(|e| e.tunneled),
-            }
-        })
+        .map(|s| join_row(s, &snap, &store))
         .collect();
 
     // Pooler-managed VMs first, then alphabetical by name.
@@ -113,19 +200,177 @@ pub async fn build_rows(st: &DashState) -> Result<Vec<VmRow>> {
     Ok(rows)
 }
 
+/// One page of the browse-all view.
+pub struct SandboxPage {
+    /// Only the rows on the current page — everything off-page stays a raw
+    /// record and is never joined or rendered.
+    pub rows: Vec<VmRow>,
+    /// Total sandboxes the daemon reported (pre-filter).
+    pub total: usize,
+    /// How many matched the search.
+    pub matched: usize,
+    /// Current page, 1-based, clamped to `pages`.
+    pub page: usize,
+    /// Total pages for the current match set (>= 1).
+    pub pages: usize,
+    pub per: usize,
+    /// The search text as applied (trimmed), echoed back into the form.
+    pub q: String,
+}
+
+/// Build one page of the searchable all-sandboxes view. Same system footprint
+/// as [`build_rows`] — one bounded daemon read plus in-process pooler lookups,
+/// no guest access — but lazier: the filter runs on the raw records and only
+/// the `per` rows in the page window are joined into full [`VmRow`]s.
+pub async fn build_page(st: &DashState, q: &str, page: usize, per: usize) -> Result<SandboxPage> {
+    let list = fetch_inventory().await?;
+    let total = list.len();
+    let (snap, store) = pooler_maps(st).await;
+
+    let needle = q.trim().to_lowercase();
+    let mut hits: Vec<RawSandbox> = list
+        .into_iter()
+        .filter(|s| {
+            needle.is_empty() || {
+                // Recovered schema names come from the pooler maps; a schema
+                // implied by a `pg-` name prefix is already covered by the
+                // name match.
+                let schema = snap
+                    .get(&s.id)
+                    .map(|e| e.schema.as_str())
+                    .or_else(|| store.get(&s.id).map(String::as_str));
+                matches_query(s, schema, &needle)
+            }
+        })
+        .collect();
+    // Stable order (name, then id as tie-break) so page boundaries don't
+    // shuffle between requests.
+    hits.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+
+    let matched = hits.len();
+    let (page, pages) = page_window(matched, page, per);
+    let rows = hits
+        .into_iter()
+        .skip((page - 1) * per)
+        .take(per)
+        .map(|s| join_row(s, &snap, &store))
+        .collect();
+
+    Ok(SandboxPage {
+        rows,
+        total,
+        matched,
+        page,
+        pages,
+        per,
+        q: q.trim().to_string(),
+    })
+}
+
+/// Case-insensitive substring match against the fields an operator actually
+/// searches by. `needle` must already be lowercased and non-empty.
+fn matches_query(s: &RawSandbox, schema: Option<&str>, needle: &str) -> bool {
+    let hay = |v: &str| v.to_lowercase().contains(needle);
+    hay(&s.id)
+        || hay(&s.name)
+        || schema.is_some_and(hay)
+        || hay(status_str(&s.status))
+        || s.image.as_deref().is_some_and(hay)
+        || s.guest_ip.as_deref().is_some_and(hay)
+}
+
+/// Clamp a 1-based page request against the match count → `(page, pages)`.
+/// Zero matches still yields one (empty) page so the view always has a valid
+/// page number to render.
+fn page_window(matched: usize, page: usize, per: usize) -> (usize, usize) {
+    let pages = matched.div_ceil(per).max(1);
+    (page.clamp(1, pages), pages)
+}
+
+/// Human label for a sandbox status — shared by the status badges and the
+/// search filter, so searching "running" matches what the badge shows.
+pub fn status_str(status: &SandboxStatus) -> &'static str {
+    match status {
+        SandboxStatus::Running => "running",
+        SandboxStatus::Provisioning => "provisioning",
+        SandboxStatus::Stopped => "stopped",
+        SandboxStatus::Paused => "paused",
+        SandboxStatus::Failed => "failed",
+        SandboxStatus::ColdStored => "cold-stored",
+        SandboxStatus::Unknown => "unknown",
+    }
+}
+
 /// Find one VM row by id (rebuilds the full list; fine for an admin tool with a
 /// handful of VMs).
 pub async fn find_row(st: &DashState, id: &str) -> Result<Option<VmRow>> {
     Ok(build_rows(st).await?.into_iter().find(|r| r.id == id))
 }
 
-/// Authoritative per-VM info straight from the daemon. Read-only (`GET`), no
-/// guest access. Call only for running VMs — `get()` on a *stopped* Firecracker
-/// VM has a daemon-side rehydrate side effect (see `vm::bring_up_existing`).
-pub async fn get_info(id: &str) -> Result<SandboxInfo> {
-    let sb = Sandbox::connect(id.to_string(), vm::local_opts()).context("connecting to VM")?;
-    tokio::time::timeout(GET_TIMEOUT, sb.get())
-        .await
-        .context("fetching sandbox info timed out")?
-        .context("fetching sandbox info")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_sandbox_captures_cpus_and_memory() {
+        // Shape mirrors the daemon's sandbox record (cf. the sandbox.yaml a
+        // `large` VM reports: cpus: 4, memory: 8589934592, disk_size_gb: 4).
+        let json = r#"{
+            "id": "sb-f88677f0",
+            "name": "pg-aNb6mPp6",
+            "status": "running",
+            "image": "pg",
+            "ttl_seconds": 0,
+            "disk_size_gb": 4,
+            "cpus": 4,
+            "memory": 8589934592,
+            "guest_ip": "172.25.223.194",
+            "status_changed_at": "2026-07-09T00:00:00Z"
+        }"#;
+        let s: RawSandbox = serde_json::from_str(json).unwrap();
+        assert_eq!(s.cpus, Some(4));
+        assert_eq!(s.memory, Some(8_589_934_592));
+        assert_eq!(s.disk_size_gb, Some(4));
+        assert_eq!(s.status, SandboxStatus::Running);
+    }
+
+    #[test]
+    fn raw_sandbox_tolerates_missing_size_fields() {
+        // Older/other daemons may omit cpus/memory — must not fail the list.
+        let json = r#"{"id":"sb-x","name":"pg-y","status":"stopped","status_changed_at":"t"}"#;
+        let s: RawSandbox = serde_json::from_str(json).unwrap();
+        assert_eq!(s.cpus, None);
+        assert_eq!(s.memory, None);
+        assert_eq!(s.status, SandboxStatus::Stopped);
+    }
+
+    fn raw(id: &str, name: &str, status: &str) -> RawSandbox {
+        let json = format!(r#"{{"id":"{id}","name":"{name}","status":"{status}"}}"#);
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn query_matches_id_name_schema_and_status_case_insensitively() {
+        let s = raw("sb-F88677", "pg-aNb6mPp6", "running");
+        assert!(matches_query(&s, None, "sb-f88"));
+        assert!(matches_query(&s, None, "anb6"));
+        assert!(matches_query(&s, Some("tenant_west"), "west"));
+        assert!(matches_query(&s, None, "running"));
+        assert!(!matches_query(&s, None, "stopped"));
+        assert!(!matches_query(&s, Some("tenant_west"), "east"));
+    }
+
+    #[test]
+    fn page_window_clamps_to_valid_pages() {
+        // Zero matches still renders one empty page.
+        assert_eq!(page_window(0, 1, 25), (1, 1));
+        assert_eq!(page_window(0, 7, 25), (1, 1));
+        // 51 rows at 25/page → 3 pages; out-of-range requests clamp.
+        assert_eq!(page_window(51, 1, 25), (1, 3));
+        assert_eq!(page_window(51, 3, 25), (3, 3));
+        assert_eq!(page_window(51, 9, 25), (3, 3));
+        assert_eq!(page_window(51, 0, 25), (1, 3));
+        // Exact multiple has no phantom extra page.
+        assert_eq!(page_window(50, 2, 25), (2, 2));
+    }
 }

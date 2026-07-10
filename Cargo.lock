@@ -2561,6 +2561,7 @@ dependencies = [
  "maud",
  "rustls-pki-types",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-postgres",
  "tokio-rustls",
