@@ -130,6 +130,20 @@ Config via env (all optional):
 | `PG_VM_POOL_LISTEN` | `127.0.0.1:6432` | client listen address |
 | `PG_VM_POOL_IMAGE` | `pg` | Firecracker image per schema |
 | `PG_VM_POOL_SIZE_CLASS` | `micro` | VM resource tier for every schema's VM: `micro` (0.25 CPU, 512MB), `mini` (0.5 CPU, 1GB), `small` (1 CPU, 2GB), `medium` (2 CPU, 4GB), `large` (4 CPU, 8GB) |
+| `PG_VM_POOL_USER` / `PG_VM_POOL_PASSWORD` | `postgres` / unset | probe+bootstrap credentials, and (if set) the required client password |
+| `PG_VM_POOL_IDLE_TIMEOUT_SECS` | `900` | stop a VM after this long with no connections; `0` disables |
+| `PG_VM_POOL_KEEPALIVE_SCHEMAS` | none | comma-separated schemas exempt from idle reaping |
+| `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size |
+| `PG_VM_POOL_READY_TIMEOUT_SECS` | `300` | max wait for VM+Postgres readiness |
+| `PG_VM_POOL_CONNECT_TIMEOUT_SECS` | `30` | iroh tunnel handshake cap |
+| `PG_VM_POOL_DIRECT_CONNECT` | on | dial guest IP directly; `0` forces the tunnel |
+| `PG_VM_POOL_STATE_FILE` | `~/.heyo/pg-vm-pool/registry.tsv` | persisted schema→VM map |
+| `PG_VM_POOL_TLS_CERT` / `PG_VM_POOL_TLS_KEY` | unset (TLS off) | PEM cert chain + key; see TLS below |
+| `PG_VM_POOL_DASHBOARD_LISTEN` | unset (dashboard off) | HTTP listen address for the admin dashboard; setting it enables the dashboard — see Dashboard below |
+| `PG_VM_POOL_DASHBOARD_USER` / `PG_VM_POOL_DASHBOARD_PASSWORD` | unset (no auth) | HTTP Basic auth credentials for the dashboard (must be set together) |
+| `PG_VM_POOL_POOLER_LOG` | `/var/log/pg-vm-pool/pg-vm-pool.log` | pooler log file the dashboard tails |
+| `PG_VM_POOL_HEYVMD_LOG` | `/var/log/heyvmd/heyvmd.log` | heyvmd log file the dashboard tails |
+| `PG_VM_POOL_DASHBOARD_LOG_LINES` | `200` | how many trailing lines the dashboard shows per log |
 
 Postgres inside each VM **tunes itself to the VM's resources at every boot**:
 `init.sh` reads live RAM/vCPUs/disk and regenerates
@@ -153,20 +167,6 @@ backends to 0) so if the killer runs anyway it takes a recoverable backend,
 not the whole cluster. `temp_file_limit` (¼ disk) keeps a runaway sort's
 spill files from filling the disk — disk-full is a cluster-wide PANIC, the
 limit is a one-query error.
-| `PG_VM_POOL_USER` / `PG_VM_POOL_PASSWORD` | `postgres` / unset | probe+bootstrap credentials, and (if set) the required client password |
-| `PG_VM_POOL_IDLE_TIMEOUT_SECS` | `900` | stop a VM after this long with no connections; `0` disables |
-| `PG_VM_POOL_KEEPALIVE_SCHEMAS` | none | comma-separated schemas exempt from idle reaping |
-| `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size |
-| `PG_VM_POOL_READY_TIMEOUT_SECS` | `300` | max wait for VM+Postgres readiness |
-| `PG_VM_POOL_CONNECT_TIMEOUT_SECS` | `30` | iroh tunnel handshake cap |
-| `PG_VM_POOL_DIRECT_CONNECT` | on | dial guest IP directly; `0` forces the tunnel |
-| `PG_VM_POOL_STATE_FILE` | `~/.heyo/pg-vm-pool/registry.tsv` | persisted schema→VM map |
-| `PG_VM_POOL_TLS_CERT` / `PG_VM_POOL_TLS_KEY` | unset (TLS off) | PEM cert chain + key; see TLS below |
-| `PG_VM_POOL_DASHBOARD_LISTEN` | unset (dashboard off) | HTTP listen address for the admin dashboard; setting it enables the dashboard — see Dashboard below |
-| `PG_VM_POOL_DASHBOARD_USER` / `PG_VM_POOL_DASHBOARD_PASSWORD` | unset (no auth) | HTTP Basic auth credentials for the dashboard (must be set together) |
-| `PG_VM_POOL_POOLER_LOG` | `/var/log/pg-vm-pool/pg-vm-pool.log` | pooler log file the dashboard tails |
-| `PG_VM_POOL_HEYVMD_LOG` | `/var/log/heyvmd/heyvmd.log` | heyvmd log file the dashboard tails |
-| `PG_VM_POOL_DASHBOARD_LOG_LINES` | `200` | how many trailing lines the dashboard shows per log |
 
 **Direct connect (default):** when the pooler shares the host with the VMs (the
 local-daemon deployment), it dials each VM's Postgres directly at its `guest_ip`
