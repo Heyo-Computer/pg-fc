@@ -62,13 +62,17 @@ pub async fn vm_detail(
     let Some(row) = model::find_row(&st, &id).await? else {
         return Ok(views::not_found_page(&id));
     };
-    // Live DB usage over the pooler's warm PG pool (safe TCP path, no guest exec)
-    // — only meaningful for a warm, pooler-managed VM.
-    let db = match &row.schema {
-        Some(schema) if row.is_running() => st.registry.db_stats(&id, schema).await,
-        _ => None,
+    // Live DB usage and guest-OS stats over the pooler's warm PG pool (safe
+    // TCP path, no guest-console access) — only meaningful for a warm,
+    // pooler-managed VM. Fetched concurrently; each is independently bounded.
+    let (db, guest) = match &row.schema {
+        Some(schema) if row.is_running() => tokio::join!(
+            st.registry.db_stats(&id, schema),
+            st.registry.guest_stats(&id),
+        ),
+        _ => (None, None),
     };
-    Ok(views::vm_detail_page(&st, &row, db.as_ref(), &banner))
+    Ok(views::vm_detail_page(&st, &row, db.as_ref(), guest.as_ref(), &banner))
 }
 
 pub async fn logs_pooler(State(st): State<DashState>) -> Result<Markup, AppError> {

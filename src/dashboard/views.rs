@@ -4,7 +4,7 @@
 use heyo_sdk::SandboxStatus;
 use maud::{html, Markup, DOCTYPE};
 
-use crate::registry::DbStats;
+use crate::registry::{DbStats, GuestStats};
 
 use super::handlers::Banner;
 use super::model::{self, SandboxPage, VmRow};
@@ -164,7 +164,13 @@ fn urlenc(s: &str) -> String {
     out
 }
 
-pub fn vm_detail_page(st: &DashState, r: &VmRow, db: Option<&DbStats>, b: &Banner) -> Markup {
+pub fn vm_detail_page(
+    st: &DashState,
+    r: &VmRow,
+    db: Option<&DbStats>,
+    guest: Option<&GuestStats>,
+    b: &Banner,
+) -> Markup {
     shell(
         &r.name,
         html! {
@@ -216,6 +222,34 @@ pub fn vm_detail_page(st: &DashState, r: &VmRow, db: Option<&DbStats>, b: &Banne
                     dt { "backend conns" } dd { (s.backends) }
                 } @else if r.pool_managed && r.is_running() {
                     dt { "database" } dd.dim { "(VM not warm in the pooler — no live DB stats)" }
+                }
+                @if let Some(g) = guest {
+                    @if let Some((total, avail)) = g.mem {
+                        dt { "guest memory" }
+                        dd {
+                            (human_bytes(total.saturating_sub(avail))) " used"
+                            span.dim { " of " (human_bytes(total)) }
+                        }
+                    }
+                    @if let Some((l1, l5, l15)) = g.load {
+                        dt { "load average" }
+                        dd { (format!("{l1:.2} / {l5:.2} / {l15:.2}")) span.dim { " (1 / 5 / 15 min)" } }
+                    }
+                    @if let Some((total, used, avail)) = g.disk {
+                        dt { "data disk" }
+                        dd {
+                            (human_bytes(used)) " used"
+                            span.dim { " of " (human_bytes(total)) " · " (human_bytes(avail)) " free" }
+                        }
+                    }
+                }
+            }
+            @if guest.is_some() {
+                p.note {
+                    "Guest memory/load/disk are read over the pooler's Postgres "
+                    "connection (" code { "pg_read_file" } " on " code { "/proc" } ", "
+                    code { "df" } " via " code { "COPY FROM PROGRAM" } ") — "
+                    "no guest-console access."
                 }
             }
 
