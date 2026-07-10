@@ -10,6 +10,9 @@
 //! than through `Sandbox::list`, because the typed `SandboxInfo` drops the
 //! concrete `cpus`/`memory`/`disk_size_gb` the daemon stores — and those (not
 //! the mostly-unpopulated `size_class`) are what actually describe a VM's size.
+//! `/deployed-sandboxes` alone misses persisted-but-stopped sandboxes the
+//! daemon hasn't loaded into memory (see [`fetch_inventory`]), so the inventory
+//! also walks `GET /sandboxes/inactive`.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -18,6 +21,7 @@ use anyhow::{Context, Result};
 use axum::http::Method;
 use heyo_sdk::{HeyoClient, RequestOptions, SandboxStatus};
 use serde::Deserialize;
+use tracing::warn;
 
 use crate::registry::EntrySnapshot;
 use crate::vm;
@@ -100,13 +104,42 @@ impl VmRow {
     }
 }
 
-/// Fetch the daemon's raw sandbox inventory: one timeout-bounded HTTP GET to
-/// the local daemon, no guest access. The daemon offers no server-side paging
-/// or filtering on this endpoint, so this always returns the full list;
-/// callers slice/filter in-process.
+/// Page envelope of `GET /sandboxes/inactive`. The records are the daemon's
+/// *native* `SandboxInfo` shape, not the compat shape `/deployed-sandboxes`
+/// returns — close enough that [`RawSandbox`]'s serde defaults absorb the
+/// differences (no `uptime_secs`/`status_changed_at`; same lowercase status
+/// strings).
+#[derive(Deserialize)]
+struct InactivePage {
+    #[serde(default)]
+    sandboxes: Vec<RawSandbox>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+const INACTIVE_PAGE_SIZE: usize = 200;
+/// Backstop on the inactive-list walk so a pathological daemon answer can't
+/// spin the dashboard: 25 pages × 200 = 5000 sandboxes per request, far above
+/// any real inventory.
+const MAX_INACTIVE_PAGES: usize = 25;
+
+/// Fetch the daemon's full sandbox inventory, no guest access anywhere:
+///
+/// * `GET /deployed-sandboxes` — sandboxes in the daemon's in-memory map.
+///   This is *not* everything: for the Firecracker backend the daemon only
+///   reconciles **running** VMs from disk into memory, so a persisted sandbox
+///   stopped before the last daemon restart never shows up here.
+/// * `GET /sandboxes/inactive` (cursor-paged) — exactly those on-disk,
+///   not-in-memory sandboxes, reported as `stopped`. Best-effort: an older
+///   daemon without the route, or a walk timeout, degrades to the deployed
+///   list rather than failing the page.
+///
+/// Every HTTP call is bounded by [`LIST_TIMEOUT`]; the walk is bounded by
+/// [`MAX_INACTIVE_PAGES`]. Neither endpoint filters server-side, so callers
+/// slice/filter in-process.
 async fn fetch_inventory() -> Result<Vec<RawSandbox>> {
     let client = HeyoClient::new(vm::local_opts()).context("building heyo client")?;
-    tokio::time::timeout(
+    let mut all = tokio::time::timeout(
         LIST_TIMEOUT,
         client.request::<Vec<RawSandbox>>(
             Method::GET,
@@ -117,7 +150,50 @@ async fn fetch_inventory() -> Result<Vec<RawSandbox>> {
     )
     .await
     .context("listing sandboxes timed out")?
-    .context("listing sandboxes")
+    .context("listing sandboxes")?;
+
+    // The two lists are disjoint by construction (inactive = on disk but not
+    // in memory), but a sandbox can start between the two reads — dedupe by
+    // id, keeping the live deployed record.
+    let mut seen: std::collections::HashSet<String> =
+        all.iter().map(|s| s.id.clone()).collect();
+
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_INACTIVE_PAGES {
+        let mut opts = RequestOptions::default();
+        opts.query
+            .push(("count".to_string(), INACTIVE_PAGE_SIZE.to_string()));
+        if let Some(c) = &cursor {
+            opts.query.push(("cursor".to_string(), c.clone()));
+        }
+        let page = match tokio::time::timeout(
+            LIST_TIMEOUT,
+            client.request::<InactivePage>(Method::GET, "/sandboxes/inactive", None::<&()>, opts),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                warn!("listing inactive sandboxes failed (showing deployed only): {e:#}");
+                break;
+            }
+            Err(_) => {
+                warn!("listing inactive sandboxes timed out (showing deployed only)");
+                break;
+            }
+        };
+        for s in page.sandboxes {
+            if seen.insert(s.id.clone()) {
+                all.push(s);
+            }
+        }
+        match page.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+
+    Ok(all)
 }
 
 /// The pooler-side join inputs, keyed by sandbox id: warm-entry snapshots and
@@ -342,6 +418,36 @@ mod tests {
         assert_eq!(s.cpus, None);
         assert_eq!(s.memory, None);
         assert_eq!(s.status, SandboxStatus::Stopped);
+    }
+
+    #[test]
+    fn inactive_page_parses_native_sandbox_info() {
+        // The native `SandboxInfo` shape the /sandboxes/inactive route returns:
+        // `image` is a bare string, `uptime` is a serde Duration object, and
+        // there is no `uptime_secs`/`status_changed_at`/`cpus`/`memory`.
+        let json = r#"{
+            "sandboxes": [{
+                "id": "sb-cold1",
+                "name": "pg-old",
+                "sandbox_type": "vm",
+                "status": "stopped",
+                "image": "pg",
+                "uptime": {"secs": 0, "nanos": 0},
+                "cpu_usage": null,
+                "memory_usage": null,
+                "remotely_accessible": false,
+                "guest_ip": "172.25.0.2"
+            }],
+            "cursor": null,
+            "next_cursor": "sb-cold1"
+        }"#;
+        let page: InactivePage = serde_json::from_str(json).unwrap();
+        assert_eq!(page.sandboxes.len(), 1);
+        let s = &page.sandboxes[0];
+        assert_eq!(s.status, SandboxStatus::Stopped);
+        assert_eq!(s.uptime_secs, 0);
+        assert_eq!(s.guest_ip.as_deref(), Some("172.25.0.2"));
+        assert_eq!(page.next_cursor.as_deref(), Some("sb-cold1"));
     }
 
     fn raw(id: &str, name: &str, status: &str) -> RawSandbox {
