@@ -97,6 +97,11 @@ pub struct VmRow {
     pub cpus: Option<u32>,
     pub memory_bytes: Option<u64>,
     pub disk_size_gb: Option<u32>,
+    /// Daemon-sampled CPU of the VM's host process(es), `top` convention:
+    /// percent of one core, so a busy 4-vCPU guest can read up to ~400.
+    /// `None` when the daemon's usage poller doesn't cover this VM (stopped,
+    /// or an older daemon without `/system/usage`).
+    pub cpu_percent: Option<f32>,
     pub image: Option<String>,
     pub region: Option<String>,
     pub status_changed_at: Option<String>,
@@ -133,6 +138,67 @@ struct InactivePage {
     next_cursor: Option<String>,
 }
 
+/// Envelope of `GET /system/usage`: the daemon's latest cached host +
+/// per-sandbox CPU/memory sample. `snapshot` is `null` until the daemon's
+/// background poller publishes its first sample (~one poll interval after
+/// daemon startup).
+#[derive(Deserialize)]
+struct UsageEnvelope {
+    #[serde(default)]
+    snapshot: Option<UsageSnapshot>,
+}
+
+#[derive(Deserialize)]
+struct UsageSnapshot {
+    #[serde(default)]
+    sandboxes: Vec<SandboxUsage>,
+}
+
+/// The slice of the daemon's per-sandbox usage sample we render (the snapshot
+/// serializes camelCase, unlike the sandbox records).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SandboxUsage {
+    sandbox_id: String,
+    cpu_percent: f32,
+}
+
+/// Fetch the daemon's cached per-sandbox usage sample, keyed by sandbox id.
+/// Best-effort: an older daemon without the route, a timeout, or a poller
+/// that hasn't sampled yet all degrade to "no CPU shown" rather than failing
+/// the page. The endpoint serves the poller's cache — it never samples inline.
+async fn fetch_usage(client: &HeyoClient) -> HashMap<String, f32> {
+    let resp = tokio::time::timeout(
+        LIST_TIMEOUT,
+        client.request::<UsageEnvelope>(
+            Method::GET,
+            "/system/usage",
+            None::<&()>,
+            RequestOptions::default(),
+        ),
+    )
+    .await;
+    let snapshot = match resp {
+        Ok(Ok(env)) => env.snapshot,
+        Ok(Err(e)) => {
+            warn!("fetching usage failed (hiding cpu): {e:#}");
+            None
+        }
+        Err(_) => {
+            warn!("fetching usage timed out (hiding cpu)");
+            None
+        }
+    };
+    snapshot
+        .map(|s| {
+            s.sandboxes
+                .into_iter()
+                .map(|u| (u.sandbox_id, u.cpu_percent))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 const INACTIVE_PAGE_SIZE: usize = 200;
 /// Backstop on the inactive-list walk so a pathological daemon answer can't
 /// spin the dashboard: 25 pages × 200 = 5000 sandboxes per request, far above
@@ -153,8 +219,7 @@ const MAX_INACTIVE_PAGES: usize = 25;
 /// Every HTTP call is bounded by [`LIST_TIMEOUT`]; the walk is bounded by
 /// [`MAX_INACTIVE_PAGES`]. Neither endpoint filters server-side, so callers
 /// slice/filter in-process.
-async fn fetch_inventory() -> Result<Vec<RawSandbox>> {
-    let client = HeyoClient::new(vm::local_opts()).context("building heyo client")?;
+async fn fetch_inventory(client: &HeyoClient) -> Result<Vec<RawSandbox>> {
     let mut all = tokio::time::timeout(
         LIST_TIMEOUT,
         client.request::<Vec<RawSandbox>>(
@@ -234,11 +299,13 @@ async fn pooler_maps(
     (snap, store)
 }
 
-/// Left-join one raw daemon record with the pooler's state.
+/// Left-join one raw daemon record with the pooler's state and the daemon's
+/// usage sample.
 fn join_row(
     s: RawSandbox,
     snap: &HashMap<String, EntrySnapshot>,
     store: &HashMap<String, String>,
+    usage: &HashMap<String, f32>,
 ) -> VmRow {
     let entry = snap.get(&s.id);
     let schema = entry
@@ -246,6 +313,7 @@ fn join_row(
         .or_else(|| store.get(&s.id).cloned())
         .or_else(|| s.name.strip_prefix("pg-").map(str::to_string));
     let pool_managed = schema.is_some() || s.name.starts_with("pg-");
+    let cpu_percent = usage.get(&s.id).copied();
     VmRow {
         id: s.id,
         name: s.name,
@@ -256,6 +324,7 @@ fn join_row(
         cpus: s.cpus,
         memory_bytes: s.memory,
         disk_size_gb: s.disk_size_gb,
+        cpu_percent,
         image: s.image,
         region: s.region,
         status_changed_at: s.status_changed_at,
@@ -271,15 +340,18 @@ fn join_row(
     }
 }
 
-/// Build the full VM list: fetch the raw sandbox inventory, join the registry
-/// snapshot + store. No guest access — safe to call on every page load/refresh.
+/// Build the full VM list: fetch the raw sandbox inventory and the daemon's
+/// usage sample, join the registry snapshot + store. No guest access — safe
+/// to call on every page load/refresh.
 pub async fn build_rows(st: &DashState) -> Result<Vec<VmRow>> {
-    let list = fetch_inventory().await?;
+    let client = HeyoClient::new(vm::local_opts()).context("building heyo client")?;
+    let (list, usage) = tokio::join!(fetch_inventory(&client), fetch_usage(&client));
+    let list = list?;
     let (snap, store) = pooler_maps(st).await;
 
     let mut rows: Vec<VmRow> = list
         .into_iter()
-        .map(|s| join_row(s, &snap, &store))
+        .map(|s| join_row(s, &snap, &store, &usage))
         .collect();
 
     // Pooler-managed VMs first, then alphabetical by name.
@@ -316,7 +388,7 @@ pub struct SandboxPage {
 }
 
 /// Build one page of the searchable all-sandboxes view. Same system footprint
-/// as [`build_rows`] — one bounded daemon read plus in-process pooler lookups,
+/// as [`build_rows`] — bounded daemon reads plus in-process pooler lookups,
 /// no guest access — but lazier: the filters run on the raw records and only
 /// the `per` rows in the page window are joined into full [`VmRow`]s.
 pub async fn build_page(
@@ -326,7 +398,9 @@ pub async fn build_page(
     page: usize,
     per: usize,
 ) -> Result<SandboxPage> {
-    let list = fetch_inventory().await?;
+    let client = HeyoClient::new(vm::local_opts()).context("building heyo client")?;
+    let (list, usage) = tokio::join!(fetch_inventory(&client), fetch_usage(&client));
+    let list = list?;
     let total = list.len();
     let (snap, store) = pooler_maps(st).await;
 
@@ -377,7 +451,7 @@ pub async fn build_page(
         .into_iter()
         .skip((page - 1) * per)
         .take(per)
-        .map(|s| join_row(s, &snap, &store))
+        .map(|s| join_row(s, &snap, &store, &usage))
         .collect();
 
     Ok(SandboxPage {
@@ -506,6 +580,37 @@ mod tests {
         assert_eq!(s.uptime_secs, 0);
         assert_eq!(s.guest_ip.as_deref(), Some("172.25.0.2"));
         assert_eq!(page.next_cursor.as_deref(), Some("sb-cold1"));
+    }
+
+    #[test]
+    fn usage_envelope_parses_camel_case_snapshot() {
+        // The shape `GET /system/usage` returns once the daemon's poller has
+        // published a sample (snapshot serializes camelCase).
+        let json = r#"{
+            "available": true,
+            "snapshot": {
+                "sampledAtMs": 1752000000000,
+                "host": {"cpuPercent": 12.5, "cpuCount": 16,
+                         "memoryTotalBytes": 68719476736, "memoryUsedBytes": 8589934592},
+                "sandboxes": [
+                    {"sandboxId": "sb-f88677f0", "name": "pg-aNb6mPp6",
+                     "cpuPercent": 137.2, "memoryBytes": 524288000, "pids": [4242]}
+                ]
+            }
+        }"#;
+        let env: UsageEnvelope = serde_json::from_str(json).unwrap();
+        let snap = env.snapshot.unwrap();
+        assert_eq!(snap.sandboxes.len(), 1);
+        assert_eq!(snap.sandboxes[0].sandbox_id, "sb-f88677f0");
+        assert!((snap.sandboxes[0].cpu_percent - 137.2).abs() < 1e-3);
+    }
+
+    #[test]
+    fn usage_envelope_tolerates_unprimed_poller() {
+        // Before the poller's first sample the daemon reports a null snapshot.
+        let json = r#"{"available": false, "snapshot": null}"#;
+        let env: UsageEnvelope = serde_json::from_str(json).unwrap();
+        assert!(env.snapshot.is_none());
     }
 
     fn raw(id: &str, name: &str, status: &str) -> RawSandbox {

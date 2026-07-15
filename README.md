@@ -37,7 +37,8 @@ on a separate volume mounted at `/workspace`.
 
 | file | purpose |
 |------|---------|
-| `Dockerfile` | Debian + Postgres image; ships `init.sh` as `/init.sh` |
+| `Dockerfile` | Debian + Postgres 16 image; ships `init.sh` as `/init.sh` |
+| `Dockerfile.pg18` | Same image built with Postgres 18 (`heyvm mvm build -f Dockerfile.pg18 --name pg18`); a data volume initdb'd by one major can't be opened by the other |
 | `init.sh` | PID 1 inside the microVM: mounts pseudo-fs + data volume, init's the cluster, exec's postgres |
 | `build-rootfs.sh` | Builds the image and flattens it into a bootable ext4 rootfs |
 

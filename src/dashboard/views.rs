@@ -57,7 +57,10 @@ pub fn databases_page(st: &DashState, p: &SandboxPage) -> Markup {
     shell(
         "Databases",
         html! {
-            h1 { "Databases" }
+            div.pagehead {
+                h1 { "Databases" }
+                a.button-link href=(list_href(&p.q, &p.state, p.page, p.per)) { "↻ refresh" }
+            }
             form.search method="get" action="/" {
                 input type="search" name="q" value=(p.q)
                     placeholder="filter by id, name, schema, status, image, or guest ip";
@@ -176,7 +179,12 @@ pub fn vm_detail_page(
         html! {
             p { a href="/" { "← Databases" } }
             (banner(b))
-            h1 { (r.name) " " (status_badge(&r.status)) }
+            div.pagehead {
+                h1 { (r.name) " " (status_badge(&r.status)) }
+                // A plain GET back to the canonical URL: re-reads daemon +
+                // pooler state and drops any one-shot ?msg/?err banner.
+                a.button-link href={ "/vm/" (r.id) } { "↻ refresh" }
+            }
 
             h2 { "configuration" }
             dl.detail {
@@ -207,6 +215,17 @@ pub fn vm_detail_page(
             dl.detail {
                 dt { "allocated" }
                 dd { (allocated_str(r).unwrap_or_else(|| "—".into())) }
+                @if let Some(cpu) = r.cpu_percent {
+                    dt { "cpu" }
+                    dd {
+                        (format!("{cpu:.1}%"))
+                        @if let Some(c) = r.cpus {
+                            span.dim { " of " (c as u64 * 100) "% (" (c) " vCPU)" }
+                        } @else {
+                            span.dim { " of one core per vCPU" }
+                        }
+                    }
+                }
                 dt { "live sessions" } dd { (sessions_cell(r)) }
                 @if let Some(idle) = r.idle_secs {
                     dt { "idle for" }
@@ -244,12 +263,19 @@ pub fn vm_detail_page(
                     }
                 }
             }
-            @if guest.is_some() {
+            @if guest.is_some() || r.cpu_percent.is_some() {
                 p.note {
-                    "Guest memory/load/disk are read over the pooler's Postgres "
-                    "connection (" code { "pg_read_file" } " on " code { "/proc" } ", "
-                    code { "df" } " via " code { "COPY FROM PROGRAM" } ") — "
-                    "no guest-console access."
+                    @if r.cpu_percent.is_some() {
+                        "CPU is heyvmd's host-side sample of the VM's "
+                        "process(es), " code { "top" } " convention: 100% = one "
+                        "core, so a busy guest can exceed 100%. "
+                    }
+                    @if guest.is_some() {
+                        "Guest memory/load/disk are read over the pooler's Postgres "
+                        "connection (" code { "pg_read_file" } " on " code { "/proc" } ", "
+                        code { "df" } " via " code { "COPY FROM PROGRAM" } ") — "
+                        "no guest-console access."
+                    }
                 }
             }
 
@@ -333,6 +359,7 @@ fn vm_table(rows: &[VmRow]) -> Markup {
                     th { "schema" }
                     th { "status" }
                     th { "size" }
+                    th { "cpu" }
                     th { "uptime" }
                     th { "sessions" }
                     th { "actions" }
@@ -345,6 +372,7 @@ fn vm_table(rows: &[VmRow]) -> Markup {
                         td.dim { (r.schema.as_deref().unwrap_or("—")) }
                         td { (status_badge(&r.status)) }
                         td { (size_cell(r)) }
+                        td { (cpu_cell(r)) }
                         td { (if r.is_running() { human_secs(r.uptime_secs) } else { "—".into() }) }
                         td { (sessions_cell(r)) }
                         td.actions { (action_buttons(&r.id, &r.status)) }
@@ -401,6 +429,17 @@ fn allocated_str(r: &VmRow) -> Option<String> {
         r.size_class.clone()
     } else {
         Some(parts.join(" · "))
+    }
+}
+
+/// Daemon-sampled CPU (`top` convention: 100% = one core), same source as the
+/// detail page's cpu row.
+fn cpu_cell(r: &VmRow) -> Markup {
+    html! {
+        @match r.cpu_percent {
+            Some(cpu) => { (format!("{cpu:.1}%")) }
+            None => span.dim { "—" },
+        }
     }
 }
 
@@ -507,6 +546,8 @@ a:hover { text-decoration:underline; }
 .nav nav { display:flex; gap:1rem; }
 main { padding:1.2rem; max-width:1200px; margin:0 auto; }
 h1 { font-size:1.3rem; }
+.pagehead { display:flex; align-items:center; justify-content:space-between; gap:1rem; }
+.pagehead h1 { margin:.6rem 0; }
 h2 { font-size:1rem; margin:1.4rem 0 .5rem; }
 .summary { display:flex; gap:1.5rem; margin:.5rem 0 1rem; color:var(--dim); }
 .summary b { color:var(--fg); }
