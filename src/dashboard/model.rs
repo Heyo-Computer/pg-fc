@@ -111,6 +111,10 @@ pub struct VmRow {
     pub error_message: Option<String>,
     /// Live client sessions through the pooler; `None` when no warm entry exists.
     pub live_sessions: Option<usize>,
+    /// Client connection slots (free, total) the pooler will admit to this
+    /// VM's Postgres. free == 0 means new clients are queueing at the pooler
+    /// rather than being refused by the database.
+    pub client_slots: Option<(usize, usize)>,
     pub idle_secs: Option<u64>,
     pub keepalive: bool,
     /// Where the pooler splices client bytes (warm entries only).
@@ -236,8 +240,7 @@ async fn fetch_inventory(client: &HeyoClient) -> Result<Vec<RawSandbox>> {
     // The two lists are disjoint by construction (inactive = on disk but not
     // in memory), but a sandbox can start between the two reads — dedupe by
     // id, keeping the live deployed record.
-    let mut seen: std::collections::HashSet<String> =
-        all.iter().map(|s| s.id.clone()).collect();
+    let mut seen: std::collections::HashSet<String> = all.iter().map(|s| s.id.clone()).collect();
 
     let mut cursor: Option<String> = None;
     for _ in 0..MAX_INACTIVE_PAGES {
@@ -280,9 +283,7 @@ async fn fetch_inventory(client: &HeyoClient) -> Result<Vec<RawSandbox>> {
 /// The pooler-side join inputs, keyed by sandbox id: warm-entry snapshots and
 /// the durable schema↔VM map. Both are cheap in-process reads (one brief map
 /// lock, no I/O).
-async fn pooler_maps(
-    st: &DashState,
-) -> (HashMap<String, EntrySnapshot>, HashMap<String, String>) {
+async fn pooler_maps(st: &DashState) -> (HashMap<String, EntrySnapshot>, HashMap<String, String>) {
     let snap = st
         .registry
         .snapshot()
@@ -333,6 +334,7 @@ fn join_row(
         guest_ip: s.guest_ip,
         error_message: s.error_message,
         live_sessions: entry.map(|e| e.active),
+        client_slots: entry.map(|e| (e.free_slots, e.slot_limit)),
         idle_secs: entry.map(|e| e.idle_secs),
         keepalive: entry.map(|e| e.keepalive).unwrap_or(false),
         target: entry.map(|e| e.target),
@@ -407,7 +409,11 @@ pub async fn build_page(
     let needle = q.trim().to_lowercase();
     let state = {
         let s = state.trim().to_lowercase();
-        if s.is_empty() { DEFAULT_STATE.to_string() } else { s }
+        if s.is_empty() {
+            DEFAULT_STATE.to_string()
+        } else {
+            s
+        }
     };
 
     // Search filter first (state-agnostic) — this set also feeds the per-state

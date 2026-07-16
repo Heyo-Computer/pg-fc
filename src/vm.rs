@@ -69,10 +69,74 @@ pub async fn ensure_vm(
 
     let (target, tunnel, pool) = ready_pg(cfg, &sandbox, &name).await?;
     ensure_database(&pool, schema).await?;
+    let slots = client_slot_budget(&pool, &name).await;
 
     Ok(Arc::new(SchemaEntry::new(
-        sandbox, target, tunnel, pool, keepalive,
+        sandbox, target, tunnel, pool, keepalive, slots,
     )))
+}
+
+/// How many client connections this VM's Postgres can actually take, read from
+/// the server itself rather than assumed.
+///
+/// init.sh derives `max_connections` per size class, so the pooler must not
+/// hardcode it: the number differs across size classes, and a VM that changes
+/// class picks up a new one on its next boot. Ask the server.
+///
+/// The budget is what's left for *ordinary clients* after the two claims that
+/// aren't theirs: `superuser_reserved_connections`, and this pooler's own
+/// housekeeping pool (probes, bootstrap, stats, pre-stop CHECKPOINT), which
+/// connects as superuser and so draws from the same well.
+///
+/// On any failure, fall back to a conservative floor rather than refusing to
+/// serve — an unknown limit shouldn't take the VM down, and a low guess only
+/// costs queueing.
+async fn client_slot_budget(pool: &Pool, name: &str) -> usize {
+    const FALLBACK_SLOTS: usize = 20;
+    let read = async {
+        let client = pool.get().await.ok()?;
+        let max: i64 = client
+            .query_one("SELECT current_setting('max_connections')::int8", &[])
+            .await
+            .ok()?
+            .get(0);
+        let reserved: i64 = client
+            .query_one(
+                "SELECT current_setting('superuser_reserved_connections')::int8",
+                &[],
+            )
+            .await
+            .ok()?
+            .get(0);
+        Some((max, reserved))
+    };
+    match read.await {
+        Some((max, reserved)) => {
+            let slots = slots_from_limits(max, reserved);
+            info!(
+                "{name}: admitting at most {slots} client connections \
+                 (max_connections={max}, superuser_reserved={reserved}, \
+                 pooler pool={POOL_MAX_SIZE})"
+            );
+            slots
+        }
+        None => {
+            warn!("{name}: could not read max_connections; admitting at most {FALLBACK_SLOTS}");
+            FALLBACK_SLOTS
+        }
+    }
+}
+
+/// Client slots left over from `max_connections` once the reserved superuser
+/// slots and the pooler's own housekeeping pool are subtracted.
+///
+/// Saturates at 1 rather than 0: admitting nobody would make the VM useless,
+/// and a guest configured this tightly is better served by letting one client
+/// through at a time than by refusing every client. Never returns more than the
+/// arithmetic allows — over-admitting is the exact failure this exists to stop.
+fn slots_from_limits(max: i64, reserved: i64) -> usize {
+    let budget = max - reserved - POOL_MAX_SIZE as i64;
+    usize::try_from(budget.max(1)).unwrap_or(1)
 }
 
 /// Resolve the splice target and connection pool for a running VM's Postgres:
@@ -562,7 +626,9 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             loop {
-                let Ok((sock, _)) = listener.accept().await else { break };
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
                 std::mem::forget(sock);
             }
         });
@@ -577,6 +643,28 @@ mod tests {
             !matches!(probe_pg(&pool).await, PgProbe::Unreachable(_)),
             "a local pool checkout failure must not be reported as Unreachable"
         );
+    }
+
+    /// The budget must never exceed what the server will actually accept —
+    /// over-admitting reintroduces the `too many clients` FATAL this exists to
+    /// prevent. A guest with a tiny max_connections must clamp down, not fall
+    /// back to some default larger than the server allows.
+    #[test]
+    fn slot_budget_never_over_admits() {
+        // The `large` VM in init.sh: 100 max, 5 reserved, 4 for our pool.
+        assert_eq!(slots_from_limits(100, 5), 91);
+        // The `micro` VM: 25 max.
+        assert_eq!(slots_from_limits(25, 5), 16);
+        // Degenerate guests: clamp to 1, never to a fallback bigger than the
+        // server's own limit.
+        for (max, reserved) in [(10, 5), (9, 5), (5, 5), (3, 5), (1, 0), (0, 0)] {
+            let slots = slots_from_limits(max, reserved);
+            assert!(slots >= 1, "must admit at least one client");
+            assert!(
+                slots as i64 <= max.max(1),
+                "slots_from_limits({max}, {reserved}) = {slots} exceeds max_connections={max}"
+            );
+        }
     }
 
     #[tokio::test]

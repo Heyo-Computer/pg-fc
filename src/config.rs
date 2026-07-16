@@ -46,6 +46,15 @@ pub struct Config {
     /// retry, instead of hanging past what the app tolerates. Much shorter than
     /// `ready_timeout` on purpose.
     pub connect_timeout: Duration,
+    /// How long a client waits for a free connection slot on its schema's VM
+    /// before the pooler gives up and errors it.
+    ///
+    /// The pooler splices 1:1, so the guest's `max_connections` would
+    /// otherwise be enforced by Postgres as a hard `FATAL: too many clients`
+    /// on the (N+1)th client. Queueing here turns that into backpressure. Env
+    /// `PG_VM_POOL_ADMIT_TIMEOUT_SECS`; `0` disables the wait (fail
+    /// immediately when full).
+    pub admit_timeout: Duration,
     /// Size (GiB) of the per-schema persistent data disk attached at
     /// `/dev/vdb` and mounted at `/workspace` (where `PGDATA` lives). This is
     /// what makes a schema's data survive a VM stop/start/restart — without it
@@ -120,6 +129,7 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_IDLE_TIMEOUT_SECS",
     "PG_VM_POOL_READY_TIMEOUT_SECS",
     "PG_VM_POOL_CONNECT_TIMEOUT_SECS",
+    "PG_VM_POOL_ADMIT_TIMEOUT_SECS",
     "PG_VM_POOL_DIRECT_CONNECT",
     "PG_VM_POOL_DATA_DISK_GB",
     "PG_VM_POOL_KEEPALIVE_SCHEMAS",
@@ -145,8 +155,8 @@ impl Config {
             }
         }
 
-        let listen = std::env::var("PG_VM_POOL_LISTEN")
-            .unwrap_or_else(|_| "127.0.0.1:6432".to_string());
+        let listen =
+            std::env::var("PG_VM_POOL_LISTEN").unwrap_or_else(|_| "127.0.0.1:6432".to_string());
         let listen_addr: SocketAddr = listen
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid PG_VM_POOL_LISTEN {listen:?}: {e}"))?;
@@ -177,6 +187,10 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(300u64);
         let connect_secs = std::env::var("PG_VM_POOL_CONNECT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30u64);
+        let admit_secs = std::env::var("PG_VM_POOL_ADMIT_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(30u64);
@@ -232,6 +246,7 @@ impl Config {
             idle_timeout,
             ready_timeout: Duration::from_secs(ready_secs),
             connect_timeout: Duration::from_secs(connect_secs),
+            admit_timeout: Duration::from_secs(admit_secs),
             data_disk_gb,
             keepalive_schemas,
             direct_connect,
@@ -255,9 +270,9 @@ impl DashboardConfig {
         else {
             return Ok(None);
         };
-        let listen: SocketAddr = listen.parse().map_err(|e| {
-            anyhow::anyhow!("invalid PG_VM_POOL_DASHBOARD_LISTEN {listen:?}: {e}")
-        })?;
+        let listen: SocketAddr = listen
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid PG_VM_POOL_DASHBOARD_LISTEN {listen:?}: {e}"))?;
 
         let user = std::env::var("PG_VM_POOL_DASHBOARD_USER")
             .ok()

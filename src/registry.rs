@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use deadpool_postgres::Pool;
 use heyo_sdk::{P2pTunnel, Sandbox};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
 use crate::config::Config;
@@ -39,6 +39,21 @@ pub struct SchemaEntry {
     pub pool: Pool,
     /// Exempt from idle reaping (a permanent keep-alive schema).
     pub keepalive: bool,
+    /// Admission control for the VM's Postgres. The pooler splices client
+    /// connections 1:1, so without a bound here the guest's `max_connections`
+    /// is enforced by *Postgres*, as a `FATAL: sorry, too many clients
+    /// already` on the (N+1)th client. That FATAL is what an application sees
+    /// as a hard connection error mid-import, and the usual reaction — tear
+    /// the pool down and retry — strands every transaction already in flight.
+    ///
+    /// Holding a permit for each spliced connection converts that rejection
+    /// into a wait: over-eager clients queue at the pooler instead of being
+    /// refused by the database. This bounds the guest; it does not multiplex
+    /// (see `checkout`).
+    slots: Arc<Semaphore>,
+    /// What `slots` started with, for reporting (a `Semaphore` only exposes
+    /// what's currently free).
+    slot_limit: usize,
     /// Number of client connections currently spliced through this entry.
     active: AtomicUsize,
     /// Last time a connection started or ended. `active == 0` plus a stale
@@ -54,6 +69,7 @@ impl SchemaEntry {
         tunnel: Option<P2pTunnel>,
         pool: Pool,
         keepalive: bool,
+        slots: usize,
     ) -> Self {
         Self {
             sandbox,
@@ -61,9 +77,21 @@ impl SchemaEntry {
             tunnel,
             pool,
             keepalive,
+            slots: Arc::new(Semaphore::new(slots)),
+            slot_limit: slots,
             active: AtomicUsize::new(0),
             last_active: StdMutex::new(Instant::now()),
         }
+    }
+
+    /// Free client slots right now (0 = the next client will queue).
+    pub fn free_slots(&self) -> usize {
+        self.slots.available_permits()
+    }
+
+    /// Total client slots this VM's Postgres was measured to allow.
+    pub fn slot_limit(&self) -> usize {
+        self.slot_limit
     }
 
     fn touch(&self) {
@@ -103,13 +131,42 @@ impl SchemaEntry {
 /// RAII marker for one in-flight client connection. Bumps the entry's active
 /// count for its lifetime and refreshes activity on both ends, so the reaper
 /// never stops a VM with (or that just had) a live connection.
-pub struct ConnGuard(Arc<SchemaEntry>);
+///
+/// Also owns the entry's admission permit, so the guest's connection budget is
+/// released on exactly the same event that ends the splice — including an
+/// error or a panic on the proxy path. A permit leak here would silently
+/// shrink the VM's usable connection count until a restart, so it must not be
+/// released anywhere but `Drop`.
+pub struct ConnGuard(Arc<SchemaEntry>, #[allow(dead_code)] OwnedSemaphorePermit);
 
 impl ConnGuard {
-    fn new(entry: Arc<SchemaEntry>) -> Self {
+    /// Take an admission permit, then mark the entry active. Waits up to
+    /// `timeout` for a free slot; `None` means every slot is busy and the
+    /// caller should fail this client rather than queue forever.
+    async fn acquire(entry: Arc<SchemaEntry>, timeout: Duration) -> Option<Self> {
+        let permit = match entry.slots.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                // Queueing is the whole point, but it is also the moment the
+                // client stops getting what it asked for — say so. Silent
+                // backpressure reads as "the pooler is slow"; this names it.
+                let waited = Instant::now();
+                warn!(
+                    "all {} client slots busy on this VM; client is queueing \
+                     (up to {timeout:?}) instead of being refused by Postgres",
+                    entry.slot_limit()
+                );
+                let p = tokio::time::timeout(timeout, entry.slots.clone().acquire_owned())
+                    .await
+                    .ok()?
+                    .ok()?;
+                info!("client admitted after queueing {:?}", waited.elapsed());
+                p
+            }
+        };
         entry.active.fetch_add(1, Ordering::SeqCst);
         entry.touch();
-        Self(entry)
+        Some(Self(entry, permit))
     }
 
     pub fn entry(&self) -> &SchemaEntry {
@@ -158,6 +215,10 @@ pub struct EntrySnapshot {
     pub sandbox_id: String,
     pub target: SocketAddr,
     pub active: usize,
+    /// Client slots free / total on this VM's Postgres. `free == 0` means new
+    /// clients are queueing at the pooler.
+    pub free_slots: usize,
+    pub slot_limit: usize,
     pub idle_secs: u64,
     pub keepalive: bool,
     pub tunneled: bool,
@@ -210,6 +271,8 @@ impl SchemaRegistry {
                     sandbox_id: e.sandbox_id(),
                     target: e.target,
                     active: e.active_count(),
+                    free_slots: e.free_slots(),
+                    slot_limit: e.slot_limit(),
                     idle_secs: e.idle_for().as_secs(),
                     keepalive: e.keepalive,
                     tunneled: e.is_tunneled(),
@@ -272,8 +335,11 @@ impl SchemaRegistry {
                 .map(|row| (parse_meminfo(row.get(0)), parse_loadavg(row.get(1))))
                 .unwrap_or((None, None));
             let disk = df_data_dir(&mut client).await;
-            (mem.is_some() || load.is_some() || disk.is_some())
-                .then_some(GuestStats { mem, load, disk })
+            (mem.is_some() || load.is_some() || disk.is_some()).then_some(GuestStats {
+                mem,
+                load,
+                disk,
+            })
         };
         tokio::time::timeout(STATS_TIMEOUT, query).await.ok()?
     }
@@ -292,21 +358,32 @@ impl SchemaRegistry {
     /// Concurrent callers for the same schema share one bring-up.
     pub async fn checkout(&self, schema: &str) -> Result<ConnGuard> {
         loop {
-            // Warm path: take a guard while still holding the map lock, which the
-            // reaper also takes — so it can't evict this entry between its
-            // idle-check and our increment. The guard also keeps `active > 0`
-            // during the liveness probe below, so the reaper leaves it alone.
+            // Warm path: claim the entry under the map lock, which the reaper
+            // also takes — so it can't evict this entry between its idle-check
+            // and our claim. `touch()` is what does the claiming: it makes the
+            // entry non-idle for a full idle_timeout, which covers the window
+            // between dropping the lock and `active` actually being
+            // incremented. The permit is deliberately NOT taken here — it can
+            // block for `admit_timeout`, and holding the map lock across that
+            // would stall checkouts for every *other* schema behind this one.
             let (cell, warm) = {
                 let mut map = self.entries.lock().await;
                 let cell = map
                     .entry(schema.to_string())
                     .or_insert_with(|| Arc::new(OnceCell::new()))
                     .clone();
-                let warm = cell.get().map(|e| ConnGuard::new(e.clone()));
+                let warm = cell.get().inspect(|e| e.touch()).cloned();
                 (cell, warm)
             };
 
-            if let Some(guard) = warm {
+            if let Some(entry) = warm {
+                let Some(guard) = ConnGuard::acquire(entry, self.cfg.admit_timeout).await else {
+                    bail!(
+                        "schema {schema}: all client connection slots busy after {:?}; \
+                         the VM's Postgres is at its connection limit",
+                        self.cfg.admit_timeout
+                    );
+                };
                 // A VM stopped out-of-band (manual stop) or a tunnel dropped by a
                 // network change leaves a cached entry whose local tunnel still
                 // accepts but never reaches Postgres — splicing to it would hang.
@@ -340,7 +417,16 @@ impl SchemaRegistry {
                     // reattaches to it instead of creating a duplicate.
                     self.store.put(schema, entry.sandbox.sandbox_id());
                     info!("schema {schema}: VM ready in {:?}", started.elapsed());
-                    return Ok(ConnGuard::new(entry.clone()));
+                    let Some(guard) =
+                        ConnGuard::acquire(entry.clone(), self.cfg.admit_timeout).await
+                    else {
+                        bail!(
+                            "schema {schema}: all client connection slots busy after {:?}; \
+                             the VM's Postgres is at its connection limit",
+                            self.cfg.admit_timeout
+                        );
+                    };
+                    return Ok(guard);
                 }
                 Err(e) => {
                     warn!(
@@ -525,10 +611,7 @@ mod tests {
                  MemFree:          734500 kB\n\
                  MemAvailable:    7600004 kB\n\
                  Buffers:           12345 kB\n";
-        assert_eq!(
-            parse_meminfo(s),
-            Some((8_028_896 * 1024, 7_600_004 * 1024))
-        );
+        assert_eq!(parse_meminfo(s), Some((8_028_896 * 1024, 7_600_004 * 1024)));
         // Missing MemAvailable (ancient kernel) → None rather than garbage.
         assert_eq!(parse_meminfo("MemTotal: 100 kB\n"), None);
     }

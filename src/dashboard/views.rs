@@ -2,7 +2,7 @@
 //! which HTML-escapes by default; no secrets are ever rendered.
 
 use heyo_sdk::SandboxStatus;
-use maud::{html, Markup, DOCTYPE};
+use maud::{DOCTYPE, Markup, html};
 
 use crate::registry::{DbStats, GuestStats};
 
@@ -195,6 +195,16 @@ pub fn vm_detail_page(
                 dt { "memory" } dd { (r.memory_bytes.map(human_bytes).unwrap_or_else(|| "—".into())) }
                 dt { "disk" } dd { (r.disk_size_gb.map(|g| format!("{g} GB")).unwrap_or_else(|| "—".into())) }
                 @if let Some(sc) = &r.size_class { dt { "size class" } dd { (sc) } }
+                @if let Some((free, total)) = r.client_slots {
+                    dt { "client slots" }
+                    dd {
+                        @if free == 0 {
+                            span.badge.active { (format!("0 / {total} — clients queueing")) }
+                        } @else {
+                            (format!("{free} / {total} free"))
+                        }
+                    }
+                }
                 @if let Some(img) = &r.image { dt { "image" } dd { (img) } }
                 @if let Some(reg) = &r.region { dt { "region" } dd { (reg) } }
                 dt { "uptime" } dd { (if r.is_running() { human_secs(r.uptime_secs) } else { "—".into() }) }
