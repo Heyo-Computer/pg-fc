@@ -5,11 +5,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use deadpool_postgres::{Config as PgConfig, Pool, Runtime};
 use heyo_sdk::{
-    HeyoClientOptions, HeyoError, P2pTunnel, Sandbox, SandboxCreateOptions, SandboxDriver,
-    DEFAULT_LOCAL_BASE_URL,
+    DEFAULT_LOCAL_BASE_URL, HeyoClientOptions, HeyoError, P2pTunnel, Sandbox, SandboxCreateOptions,
+    SandboxDriver,
 };
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -26,6 +26,11 @@ const VM_PG_PORT: u16 = 5432;
 /// silent this long.
 const PG_PROBE_WINDOW: Duration = Duration::from_secs(15);
 
+/// Per-attempt bound inside that window. Only guards against a connect that
+/// hangs forever (the pool has no create timeout); it is not a health
+/// threshold — exceeding it yields `PgProbe::Stalled`, never `Unreachable`.
+const PG_PROBE_ATTEMPT: Duration = Duration::from_secs(3);
+
 /// Fresh options targeting the local heyvmd daemon. Built per call so we don't
 /// rely on `HeyoClientOptions: Clone`. Shared with the dashboard so its control
 /// actions hit the same daemon.
@@ -41,7 +46,11 @@ pub(crate) fn local_opts() -> HeyoClientOptions {
 /// reattaching by id avoids a data-loss race where a just-stopped VM is briefly
 /// absent from list-by-name and we'd otherwise create a duplicate with a fresh
 /// (empty) data disk.
-pub async fn ensure_vm(cfg: &Config, schema: &str, known_id: Option<&str>) -> Result<Arc<SchemaEntry>> {
+pub async fn ensure_vm(
+    cfg: &Config,
+    schema: &str,
+    known_id: Option<&str>,
+) -> Result<Arc<SchemaEntry>> {
     let name = format!("pg-{schema}");
     let keepalive = cfg.is_keepalive(schema);
 
@@ -124,7 +133,13 @@ async fn connect_pg(
 ///   - speaks Postgres protocol (e.g. 57P03 "the database system is starting
 ///     up" during WAL replay)  → the server is alive, wait out `ready_timeout`
 ///     like before — restarting mid-recovery would only restart recovery;
-///   - silent/refusing         → the postmaster is gone; stop+start the VM
+///   - stalled (accepted but never answered) → ambiguous, and a power-cycle
+///     here is destructive: an ingest-loaded VM can hold a connect past the
+///     probe bound while perfectly healthy. Treat it like `Responding` and
+///     wait. If it really is wedged, the client gets a timeout error and the
+///     next connect re-probes from scratch — recoverable, unlike a reboot
+///     that kills an in-flight load;
+///   - refusing                → the postmaster is gone; stop+start the VM
 ///     (a fresh boot re-runs init.sh, which relaunches Postgres) and wait for
 ///     readiness on the rebuilt connection. One cycle per connect attempt —
 ///     if PG still won't come up on a fresh boot, that's a real error the
@@ -142,49 +157,87 @@ async fn ready_pg(
             wait_pg_ready(&pool, cfg.ready_timeout, name).await?;
             Ok((target, tunnel, pool))
         }
+        PgProbe::Stalled(msg) => {
+            warn!(
+                "{name}: Postgres slow to answer ({msg}); waiting out \
+                 ready_timeout before considering a power-cycle"
+            );
+            // Don't reboot on a stall alone — but don't wedge forever either.
+            // A loaded server answers well inside ready_timeout; a black-holed
+            // forward never answers at all. Silence for the *whole* window is
+            // the evidence that separates them, so the reboot survives for the
+            // dead-tunnel case it exists for without firing at a busy VM.
+            if wait_pg_ready(&pool, cfg.ready_timeout, name).await.is_ok() {
+                return Ok((target, tunnel, pool));
+            }
+            warn!("{name}: still silent after ready_timeout; power-cycling the VM");
+            power_cycle(cfg, sandbox, name, pool, tunnel).await
+        }
         PgProbe::Unreachable(msg) => {
             warn!(
                 "{name}: Postgres unreachable inside a running VM ({msg}); \
                  power-cycling the VM"
             );
-            // Drop the stale pool/tunnel before the restart so nothing holds
-            // the old forward open across the reboot.
-            drop(pool);
-            drop(tunnel);
-            sandbox
-                .stop()
-                .await
-                .with_context(|| format!("stopping {name} for power-cycle"))?;
-            sandbox
-                .start()
-                .await
-                .with_context(|| format!("restarting {name} after power-cycle"))?;
-            sandbox
-                .wait_for_ready(cfg.ready_timeout)
-                .await
-                .with_context(|| format!("waiting for {name} after power-cycle"))?;
-            // Reconnect from scratch: the guest_ip/tunnel from before the
-            // reboot may no longer be valid.
-            let (target, tunnel, pool) = connect_pg(cfg, sandbox, name).await?;
-            wait_pg_ready(&pool, cfg.ready_timeout, name).await?;
-            info!("{name}: Postgres recovered after power-cycle");
-            Ok((target, tunnel, pool))
+            power_cycle(cfg, sandbox, name, pool, tunnel).await
         }
     }
 }
 
+/// Stop+start the VM and reconnect. A fresh boot re-runs init.sh, which
+/// relaunches Postgres and rebuilds the tunnel. One cycle per connect attempt —
+/// if PG still won't come up on a fresh boot, that's a real error the client
+/// should see (and the next connect retries from scratch).
+///
+/// Destructive: the stop is an unclean kill, so anything in flight on this VM
+/// dies with it. Only call this on evidence that nothing is listening — never
+/// on evidence that the server is merely slow.
+async fn power_cycle(
+    cfg: &Config,
+    sandbox: &Sandbox,
+    name: &str,
+    pool: Pool,
+    tunnel: Option<P2pTunnel>,
+) -> Result<(SocketAddr, Option<P2pTunnel>, Pool)> {
+    // Drop the stale pool/tunnel before the restart so nothing holds the old
+    // forward open across the reboot.
+    drop(pool);
+    drop(tunnel);
+    sandbox
+        .stop()
+        .await
+        .with_context(|| format!("stopping {name} for power-cycle"))?;
+    sandbox
+        .start()
+        .await
+        .with_context(|| format!("restarting {name} after power-cycle"))?;
+    sandbox
+        .wait_for_ready(cfg.ready_timeout)
+        .await
+        .with_context(|| format!("waiting for {name} after power-cycle"))?;
+    // Reconnect from scratch: the guest_ip/tunnel from before the reboot may no
+    // longer be valid.
+    let (target, tunnel, pool) = connect_pg(cfg, sandbox, name).await?;
+    wait_pg_ready(&pool, cfg.ready_timeout, name).await?;
+    info!("{name}: Postgres recovered after power-cycle");
+    Ok((target, tunnel, pool))
+}
+
 /// What a bounded `SELECT 1` attempt tells us about the server behind `pool`.
-enum PgProbe {
+pub(crate) enum PgProbe {
     Ready,
     /// Got a Postgres protocol response that isn't readiness (server error
     /// with a SQLSTATE, e.g. "starting up") — the process is alive.
     Responding(String),
-    /// No protocol response at all: connection refused, closed, or
-    /// black-holed. Nothing (or a dead tunnel) is listening.
+    /// The attempt ran out of time with no answer either way. Ambiguous: a
+    /// loaded server can take seconds to fork a backend, so this is NOT
+    /// evidence the postmaster is gone. See `probe_pg`.
+    Stalled(String),
+    /// No protocol response at all: connection refused or closed. Nothing is
+    /// listening on the port.
     Unreachable(String),
 }
 
-async fn probe_pg(pool: &Pool) -> PgProbe {
+pub(crate) async fn probe_pg(pool: &Pool) -> PgProbe {
     use deadpool_postgres::PoolError;
     let attempt = async {
         match pool.get().await {
@@ -198,9 +251,17 @@ async fn probe_pg(pool: &Pool) -> PgProbe {
     };
     // The pool has no create timeout, so a black-holed TCP connect (dead iroh
     // tunnel forward) would hang `get()` — bound each attempt.
-    match tokio::time::timeout(Duration::from_secs(3), attempt).await {
+    //
+    // A timeout is deliberately NOT `Unreachable`. A dead postmaster means a
+    // closed port, and a closed port answers *fast* (ECONNREFUSED) — it does
+    // not hang. Hanging means something accepted the connection and is slow to
+    // finish it: a backend fork behind heavy checkpoint I/O, or an allocation
+    // stalling under the guest's strict overcommit. Calling that "dead" is how
+    // a busy-but-healthy VM used to get power-cycled mid-ingest, which is
+    // strictly worse than the slowness it was reacting to.
+    match tokio::time::timeout(PG_PROBE_ATTEMPT, attempt).await {
         Ok(probe) => probe,
-        Err(_) => PgProbe::Unreachable("probe timed out (connection black-holed)".to_string()),
+        Err(_) => PgProbe::Stalled(format!("no answer within {PG_PROBE_ATTEMPT:?}")),
     }
 }
 
@@ -216,18 +277,25 @@ fn classify_pg_error(e: &tokio_postgres::Error) -> PgProbe {
 }
 
 /// Probe until the window closes: `Ready`/`Responding` short-circuit (the
-/// server exists — the caller decides how long to wait for readiness), only a
-/// full window of silence returns `Unreachable`.
+/// server exists — the caller decides how long to wait for readiness). Only a
+/// full window of *refusals* returns `Unreachable`; if anything in the window
+/// merely stalled, the port was open at least once and `Stalled` wins, since
+/// the caller must not take a destructive action on that evidence.
 async fn probe_pg_window(pool: &Pool, window: Duration) -> PgProbe {
     let deadline = Instant::now() + window;
-    let mut last_err;
+    let mut last_err = String::new();
+    let mut stalled: Option<String> = None;
     loop {
         match probe_pg(pool).await {
             PgProbe::Unreachable(msg) => last_err = msg,
+            PgProbe::Stalled(msg) => stalled = Some(msg),
             verdict => return verdict,
         }
         if Instant::now() >= deadline {
-            return PgProbe::Unreachable(last_err);
+            return match stalled {
+                Some(msg) => PgProbe::Stalled(msg),
+                None => PgProbe::Unreachable(last_err),
+            };
         }
         sleep(Duration::from_millis(500)).await;
     }
@@ -298,7 +366,10 @@ async fn bring_up_existing(cfg: &Config, name: &str, id: &str) -> Result<Option<
 
 /// Create a brand-new VM for a schema (with its persistent data disk).
 async fn create_vm(cfg: &Config, name: &str, keepalive: bool) -> Result<Sandbox> {
-    info!("creating VM {name}{}", if keepalive { " (keep-alive)" } else { "" });
+    info!(
+        "creating VM {name}{}",
+        if keepalive { " (keep-alive)" } else { "" }
+    );
     Sandbox::create(
         SandboxCreateOptions {
             name: Some(name.to_string()),
@@ -342,7 +413,11 @@ async fn direct_target(sandbox: &Sandbox) -> Result<Option<SocketAddr>> {
 /// hold it for the entry's lifetime). `P2pTunnel::connect` has no internal
 /// timeout — when iroh's relays churn (host IP flapping on WiFi) it can block
 /// for minutes — so bound the whole handshake and fail fast for a retry.
-async fn open_tunnel(cfg: &Config, sandbox: &Sandbox, name: &str) -> Result<(SocketAddr, P2pTunnel)> {
+async fn open_tunnel(
+    cfg: &Config,
+    sandbox: &Sandbox,
+    name: &str,
+) -> Result<(SocketAddr, P2pTunnel)> {
     let handshake = async {
         let ticket = sandbox
             .expose_tcp(VM_PG_PORT)
@@ -429,31 +504,69 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
 
+        // A closed port is the dead-postmaster signal: it refuses immediately.
+        // This is the one verdict that may power-cycle, so it must stay exact.
         match probe_pg_window(&pool_at(port), Duration::from_secs(1)).await {
             PgProbe::Unreachable(_) => {}
             PgProbe::Ready => panic!("refused port reported Ready"),
             PgProbe::Responding(m) => panic!("refused port reported Responding: {m}"),
+            PgProbe::Stalled(m) => panic!("refused port reported Stalled: {m}"),
         }
     }
 
     #[tokio::test]
-    async fn black_holed_listener_probes_unreachable() {
-        // Accepts TCP but never speaks Postgres — the shape of an iroh tunnel
-        // whose far end (the VM's postmaster) is dead.
+    async fn black_holed_listener_probes_stalled_not_unreachable() {
+        // Accepts TCP but never answers. Two very different things share this
+        // shape: a tunnel whose far end is dead, and a healthy Postgres too
+        // loaded to finish a backend fork inside the probe bound. They are
+        // indistinguishable here, so the probe must report the ambiguity
+        // (`Stalled`) rather than assert death — `ready_pg` resolves it by
+        // waiting out ready_timeout, which only the live server survives.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             loop {
-                let Ok((sock, _)) = listener.accept().await else { break };
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
                 std::mem::forget(sock); // hold the socket open, say nothing
             }
         });
 
         match probe_pg_window(&pool_at(port), Duration::from_secs(1)).await {
-            PgProbe::Unreachable(_) => {}
+            PgProbe::Stalled(_) => {}
             PgProbe::Ready => panic!("black-holed listener reported Ready"),
             PgProbe::Responding(m) => panic!("black-holed listener reported Responding: {m}"),
+            PgProbe::Unreachable(m) => {
+                panic!(
+                    "black-holed listener reported Unreachable ({m}) — this verdict can power-cycle a VM, and an accepted-but-slow connect is exactly what a loaded server looks like"
+                )
+            }
         }
+    }
+
+    /// The regression that motivated `Stalled`: a warm VM that accepts but is
+    /// slow must stay in the map. Evicting it drops into a re-init that
+    /// power-cycles the VM, killing whatever load made it slow in the first
+    /// place.
+    #[tokio::test]
+    async fn slow_listener_is_not_evicted_from_the_warm_path() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                std::mem::forget(sock);
+            }
+        });
+
+        // `entry_alive` keeps the entry for anything that isn't Unreachable.
+        assert!(
+            !matches!(probe_pg(&pool_at(port)).await, PgProbe::Unreachable(_)),
+            "a slow-but-listening VM must not be classified Unreachable"
+        );
     }
 }
 

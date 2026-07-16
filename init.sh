@@ -186,6 +186,59 @@ temp_buffers_mb=$((mem_mb / 32)); [ "$temp_buffers_mb" -gt 128 ] && temp_buffers
 gather_workers=$((cpus - 1))
 [ "$gather_workers" -gt 4 ] && gather_workers=4
 
+# --- connection budget vs. per-backend memory -------------------------------
+# max_connections was previously left at initdb's 100 for every size class,
+# while the knobs above scale with RAM: going micro→large takes work_mem 4MB→
+# 256MB and temp_buffers 16MB→128MB with the connection ceiling unmoved. The
+# per-backend appetite grows ~64x, the concurrency bound doesn't, and nothing
+# reconciles the two.
+#
+# That gap is load-bearing here because of the strict overcommit set above:
+# vm.overcommit_memory=2 makes the kernel refuse any allocation past
+# CommitLimit = swap + overcommit_ratio% of RAM, and CommitLimit is charged
+# against *committed* address space, not RSS. So the failure mode is an
+# allocation/fork error (and a client connect refused with no protocol reply)
+# while `free`/metrics still show RAM to spare — a VM that looks idle right up
+# until it stops accepting connections.
+#
+# Reconcile them: pick a concurrency ceiling, then size the per-backend knobs
+# to fit inside what CommitLimit can actually honor at that ceiling.
+os_reserve_mb=$((mem_mb / 16)); [ "$os_reserve_mb" -lt 256 ] && os_reserve_mb=256
+backend_budget_mb=$((mem_mb - shared_buffers_mb - os_reserve_mb))
+[ "$backend_budget_mb" -lt 64 ] && backend_budget_mb=64
+# Start from what the vCPU count can usefully service...
+max_conns=$((cpus * 25))
+[ "$max_conns" -lt 100 ] && max_conns=100
+[ "$max_conns" -gt 200 ] && max_conns=200
+# ...then refuse to advertise more than the budget can actually honor. A
+# backend needs ~10MB of process overhead before any tunable, plus the 8MB
+# temp_buffers floor below. Advertising connections past that point doesn't buy
+# concurrency, it just moves the failure: the kernel refuses an allocation deep
+# inside a transaction instead of Postgres cleanly refusing the connection at
+# the door. Prefer the clean refusal — that's what max_connections is for.
+affordable=$((backend_budget_mb / 18))
+[ "$max_conns" -gt "$affordable" ] && max_conns=$affordable
+[ "$max_conns" -lt 25 ] && max_conns=25
+per_conn_mb=$((backend_budget_mb / max_conns))
+[ "$per_conn_mb" -lt 12 ] && per_conn_mb=12
+# Split the allowance. temp_buffers is charged first and is *sticky* — once a
+# session touches a temp table its temp_buffers stay allocated until the
+# session ends, so with ON COMMIT DROP ingest it is committed per backend for
+# real. work_mem is transient (allocated as a sort/hash grows), so it takes
+# what's left rather than being budgeted at full worst-case concurrency.
+tb_cap=$((per_conn_mb / 2))
+[ "$temp_buffers_mb" -gt "$tb_cap" ] && temp_buffers_mb=$tb_cap
+[ "$temp_buffers_mb" -lt 8 ] && temp_buffers_mb=8
+wm_cap=$((per_conn_mb - temp_buffers_mb))
+[ "$work_mem_mb" -gt "$wm_cap" ] && work_mem_mb=$wm_cap
+[ "$work_mem_mb" -lt 4 ] && work_mem_mb=4
+# Autovacuum workers inherit maintenance_work_mem when autovacuum_work_mem is
+# left at -1: 3 workers x 1GB on a large VM, all against the same CommitLimit.
+# Give them their own, smaller allowance and leave maintenance_work_mem for
+# the foreground index builds it was sized for.
+autovac_mem_mb=$((maint_mem_mb / 4)); [ "$autovac_mem_mb" -gt 256 ] && autovac_mem_mb=256
+[ "$autovac_mem_mb" -lt 16 ] && autovac_mem_mb=16
+
 # WAL budget. Disk-full is the one crash this VM cannot recover from on its
 # own: ENOSPC on a WAL write is a PANIC, and the end-of-recovery checkpoint
 # needs WAL space too, so a full disk means a crash loop until someone grows
@@ -219,6 +272,17 @@ effective_cache_size = ${effective_cache_mb}MB
 work_mem = ${work_mem_mb}MB
 maintenance_work_mem = ${maint_mem_mb}MB
 temp_buffers = ${temp_buffers_mb}MB
+
+# Concurrency ceiling the per-backend knobs above were sized against
+# (${backend_budget_mb}MB of non-shared_buffers headroom / ${max_conns} connections =
+# ${per_conn_mb}MB each). Raising this without re-deriving work_mem/temp_buffers
+# re-opens the strict-overcommit failure it exists to bound.
+max_connections = ${max_conns}
+# The pooler's liveness probe connects as a superuser; these slots keep it
+# answerable even when the app has taken every ordinary connection, so a
+# saturated VM reports "too many clients" to the client rather than going dark
+# to the pooler and being misread as dead.
+superuser_reserved_connections = 5
 max_wal_size = ${max_wal_mb}MB
 temp_file_limit = ${temp_limit_mb}MB
 max_parallel_workers = ${cpus}
@@ -251,6 +315,7 @@ jit = off
 # unset visibility map blocks index-only count(*) scans. Single tenant, so
 # aggressive thresholds cost little and keep the first post-import count as
 # fast as the tenth.
+autovacuum_work_mem = ${autovac_mem_mb}MB
 autovacuum_naptime = 15s
 autovacuum_vacuum_scale_factor = 0.05
 autovacuum_vacuum_insert_scale_factor = 0.05

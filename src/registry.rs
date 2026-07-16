@@ -362,19 +362,22 @@ impl SchemaRegistry {
         }
     }
 
-    /// Timeout-bounded liveness probe: can we run `SELECT 1` on the VM's Postgres
-    /// through the tunnel? Catches both a stopped VM and a dead tunnel (either
-    /// makes `pool.get()`/the query hang, which the timeout bounds). Cheap on a
-    /// healthy warm VM (a local round-trip), so it's safe per checkout.
+    /// Liveness probe on the warm path: is anything still listening for this
+    /// entry? Catches a VM stopped out-of-band and a dead tunnel forward.
+    /// Cheap on a healthy VM (a local round-trip), so it's safe per checkout.
+    ///
+    /// Only a *refusal* counts as dead. This used to require a successful
+    /// `SELECT 1` within 3s and treat everything else — a slow answer, a
+    /// server error, connection saturation — as a dead VM, which then evicted
+    /// the entry and dropped into a re-init that power-cycles it. Every one of
+    /// those is survivable on its own; the reboot isn't, since the pooler stops
+    /// VMs with an unclean kill and takes any in-flight ingest with it. A
+    /// stalled probe in particular is the *expected* reading of a VM under a
+    /// heavy load, so the old check reliably killed VMs for being busy.
     async fn entry_alive(&self, entry: &SchemaEntry) -> bool {
-        let probe = async {
-            let client = entry.pool.get().await?;
-            client.simple_query("SELECT 1").await?;
-            Ok::<(), anyhow::Error>(())
-        };
-        matches!(
-            tokio::time::timeout(Duration::from_secs(3), probe).await,
-            Ok(Ok(()))
+        !matches!(
+            crate::vm::probe_pg(&entry.pool).await,
+            crate::vm::PgProbe::Unreachable(_)
         )
     }
 
