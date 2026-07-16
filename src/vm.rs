@@ -246,7 +246,12 @@ pub(crate) async fn probe_pg(pool: &Pool) -> PgProbe {
                 Err(e) => classify_pg_error(&e),
             },
             Err(PoolError::Backend(e)) => classify_pg_error(&e),
-            Err(e) => PgProbe::Unreachable(e.to_string()),
+            // Everything else `PoolError` reports (queued past `wait`, pool
+            // closed, no runtime) is a fact about *our* pool, not about the
+            // VM's postmaster — a probe that never left this process is not
+            // evidence the server is gone, and must never reach the verdict
+            // that power-cycles it.
+            Err(e) => PgProbe::Stalled(format!("pool checkout failed locally: {e}")),
         }
     };
     // The pool has no create timeout, so a black-holed TCP connect (dead iroh
@@ -440,6 +445,23 @@ async fn open_tunnel(
     Ok((SocketAddr::from(([127, 0, 0, 1], local_port)), tunnel))
 }
 
+/// Cap on the pooler's own connections to a VM's Postgres.
+///
+/// This pool is not the client data path — client bytes are spliced straight to
+/// the VM — so it only ever serves the pooler's own housekeeping: the liveness
+/// probe, the one-time database bootstrap, the dashboard's stat queries, and
+/// the pre-stop CHECKPOINT. A handful of slots covers all of that concurrently.
+///
+/// Left unset, deadpool defaults `max_size` to `logical_cpus * 2`, sized for a
+/// pool that *is* the data path. That default is read off the **pooler host**,
+/// which has nothing to do with the guest's `max_connections` — a 16-core host
+/// yields 32, so the pooler could hold a third of a large VM's 100 connections
+/// just to ask "are you alive?". Worse, `entry_alive` probes on every client
+/// checkout, so a burst of client connects grows this pool straight to its cap
+/// at exactly the moment the VM can least afford it, and the pool connects as
+/// superuser — so it eats the reserved slots and survives while the app starves.
+const POOL_MAX_SIZE: usize = 4;
+
 fn build_pool(
     host: &str,
     port: u16,
@@ -455,6 +477,19 @@ fn build_pool(
     // Only set a password when configured; leaving it None keeps `trust` auth
     // working (an empty-string password would be sent as a real credential).
     pg.password = password.map(str::to_string);
+    pg.pool = Some(deadpool_postgres::PoolConfig {
+        max_size: POOL_MAX_SIZE,
+        // Bound the queue for a slot. Callers treat a local checkout failure as
+        // `Stalled` (never `Unreachable`), so this can only cost a probe, never
+        // trigger a power-cycle. `create` bounds the TCP connect itself, which
+        // otherwise has no timeout at all.
+        timeouts: deadpool_postgres::Timeouts {
+            wait: Some(PG_PROBE_ATTEMPT),
+            create: Some(PG_PROBE_ATTEMPT),
+            recycle: Some(PG_PROBE_ATTEMPT),
+        },
+        ..Default::default()
+    });
     pg.create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)
         .context("building deadpool pool")
 }
@@ -495,6 +530,53 @@ mod tests {
 
     fn pool_at(port: u16) -> Pool {
         build_pool("127.0.0.1", port, "postgres", "postgres", None).unwrap()
+    }
+
+    /// The pooler's pool is housekeeping-only and must not scale with the
+    /// *pooler host's* core count — that number is unrelated to the guest's
+    /// max_connections, and the default (logical_cpus * 2 = 32 on a 16-core
+    /// host) would let the pooler hold a third of a large VM's connections
+    /// just to run liveness probes.
+    #[test]
+    fn pool_is_capped_independently_of_host_cores() {
+        let p = pool_at(5432);
+        assert_eq!(
+            p.status().max_size,
+            POOL_MAX_SIZE,
+            "pool must be explicitly capped, not inherited from host cores"
+        );
+        assert!(
+            POOL_MAX_SIZE * 4 < 100,
+            "several schema pools must still fit inside a guest's max_connections"
+        );
+    }
+
+    /// A checkout that fails inside our own pool (queued past `wait`, pool
+    /// closed) says nothing about the VM. It must never reach `Unreachable`,
+    /// which is the verdict that power-cycles.
+    #[tokio::test]
+    async fn local_pool_exhaustion_is_not_unreachable() {
+        // A listener that accepts but never speaks: checkouts occupy every slot
+        // and stall, so further checkouts queue past `wait` and fail locally.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else { break };
+                std::mem::forget(sock);
+            }
+        });
+        let pool = std::sync::Arc::new(pool_at(port));
+        // Saturate every slot, then probe against the exhausted pool.
+        for _ in 0..POOL_MAX_SIZE {
+            let p = pool.clone();
+            tokio::spawn(async move { p.get().await.map(|c| std::mem::forget(c)) });
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !matches!(probe_pg(&pool).await, PgProbe::Unreachable(_)),
+            "a local pool checkout failure must not be reported as Unreachable"
+        );
     }
 
     #[tokio::test]

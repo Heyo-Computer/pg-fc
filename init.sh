@@ -309,6 +309,21 @@ effective_io_concurrency = 200
 # than it helps at this scale.
 jit = off
 
+# Reclaim sessions abandoned mid-transaction. A client that opens a
+# transaction and then goes away (crashed importer, dropped socket the server
+# hasn't noticed) holds its connection slot *and* every lock it took until the
+# server times it out — which is how a handful of orphans turns into "too many
+# clients already" plus lock waits on tables nothing is actively writing.
+# Generous enough that no legitimate import trips it; this only ever fires on
+# a session that is idle *inside* a transaction, never on a running query.
+idle_in_transaction_session_timeout = 5min
+
+# Lock waits and deadlocks here are almost always two client-side operations
+# racing on the same table, and the deadlock report alone names only the two
+# statements at the moment of detection. Logging the waits gives the blocked/
+# blocking pairs leading up to it, which is what identifies the racing callers.
+log_lock_waits = on
+
 # Counts/validation scans run right after bulk loads. Stock autovacuum can
 # lag a fresh 1GB import by minutes, during which the planner works from
 # stale (or no) stats — mis-planning the count queries' anti-joins — and the
