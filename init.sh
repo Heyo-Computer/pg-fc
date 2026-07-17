@@ -287,6 +287,12 @@ max_wal_size = ${max_wal_mb}MB
 temp_file_limit = ${temp_limit_mb}MB
 max_parallel_workers = ${cpus}
 max_parallel_workers_per_gather = ${gather_workers}
+# Index builds are the one part of a snapshot/import that *can* use spare
+# cores, but the stock cap is 2 regardless of VM size — so a large VM builds
+# indexes on barely more than one core while the rest sit idle (the "under 2
+# cores, but the box has 4" the user is seeing on the index-build phase). Let
+# a build fan out to the same worker budget as a query.
+max_parallel_maintenance_workers = ${gather_workers}
 
 # Single-tenant, no replicas: minimal WAL (+ compression — jsonb squeezes
 # well) cuts bulk-load I/O substantially.
@@ -324,17 +330,30 @@ idle_in_transaction_session_timeout = 5min
 # blocking pairs leading up to it, which is what identifies the racing callers.
 log_lock_waits = on
 
-# Counts/validation scans run right after bulk loads. Stock autovacuum can
-# lag a fresh 1GB import by minutes, during which the planner works from
-# stale (or no) stats — mis-planning the count queries' anti-joins — and the
-# unset visibility map blocks index-only count(*) scans. Single tenant, so
-# aggressive thresholds cost little and keep the first post-import count as
-# fast as the tenth.
+# Autovacuum. The earlier tuning here optimized one workload — a single bulk
+# import followed by count/validation scans — where very aggressive thresholds
+# "cost little" because nothing else was running. That assumption is wrong for
+# the workload that actually breaks: a user creating snapshots (each a full
+# CREATE TABLE + INSERT SELECT copy of a sheet) *while actively using the
+# database*. Every fresh snapshot table crosses a 5%-insert threshold almost
+# immediately, so a 15s naptime had autovacuum waking constantly, contending
+# for the same virtio I/O the user's copies need, and fighting the snapshot's
+# DDL for locks (the "canceling autovacuum" / "lock not available" storm).
+#
+# Retuned to yield to the active app rather than race it. ANALYZE stays
+# relatively eager — it only samples, so it's cheap, and stale stats are what
+# mis-plan the count queries — while VACUUM (the expensive, I/O-heavy, lock-
+# taking part) triggers far less often. This trades a little table bloat for
+# giving the foreground workload the I/O it was being starved of.
 autovacuum_work_mem = ${autovac_mem_mb}MB
-autovacuum_naptime = 15s
-autovacuum_vacuum_scale_factor = 0.05
-autovacuum_vacuum_insert_scale_factor = 0.05
-autovacuum_analyze_scale_factor = 0.02
+autovacuum_naptime = 60s
+autovacuum_vacuum_scale_factor = 0.1
+# The storm's main driver: insert-only tables (every snapshot copy) were being
+# vacuumed after just 5% growth. Insert-vacuum only sets the visibility map /
+# freezes; Postgres' own default (0.2) is plenty, and these tables are often
+# short-lived anyway.
+autovacuum_vacuum_insert_scale_factor = 0.2
+autovacuum_analyze_scale_factor = 0.05
 
 # Persist server logs under PGDATA (= the data disk), so crash forensics
 # survive the reboot that follows a crash — stderr only reaches the serial
