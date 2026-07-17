@@ -42,7 +42,10 @@ async fn main() -> Result<()> {
     // registry so a bad cert fails startup fast.
     let tls = match (cfg.tls_cert.clone(), cfg.tls_key.clone()) {
         (Some(cert), Some(key)) => {
-            info!("TLS enabled (cert={}, hot-reload on change)", cert.display());
+            info!(
+                "TLS enabled (cert={}, hot-reload on change)",
+                cert.display()
+            );
             Some(Arc::new(TlsReloader::new(cert, key)?))
         }
         _ => {
@@ -87,6 +90,15 @@ async fn main() -> Result<()> {
 
     loop {
         let (sock, peer) = listener.accept().await?;
+        // Disable Nagle on the client->pooler leg (mirrors the pooler->VM leg in
+        // proxy::splice). The Postgres wire protocol is request/response, so
+        // Nagle + delayed-ACK adds per-round-trip latency on the many small
+        // statements a chatty client sends; a direct libpq connection sets
+        // TCP_NODELAY itself, so the pooler must too to match it. Best-effort:
+        // set on the raw socket before TLS wrapping (the option rides the fd).
+        if let Err(e) = sock.set_nodelay(true) {
+            warn!("could not set TCP_NODELAY on client connection {peer}: {e}");
+        }
         let registry = registry.clone();
         let tls = tls.clone();
         tokio::spawn(async move {
