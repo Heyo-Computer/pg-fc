@@ -131,6 +131,13 @@ pub struct DashboardConfig {
     /// How many trailing lines to show when tailing a log. Env
     /// `PG_VM_POOL_DASHBOARD_LOG_LINES` (default 200).
     pub log_lines: usize,
+    /// Where the monitoring page's webhook alert rules persist. Defaults to a
+    /// sibling of the schema registry under the heyo data dir. Env
+    /// `PG_VM_POOL_DASHBOARD_ALERTS_FILE`.
+    pub alerts_file: PathBuf,
+    /// How often the background evaluator samples host metrics and fires any
+    /// crossed alerts. Env `PG_VM_POOL_DASHBOARD_ALERT_INTERVAL_SECS` (default 60).
+    pub alert_interval: std::time::Duration,
 }
 
 impl Config {
@@ -166,6 +173,8 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_POOLER_LOG",
     "PG_VM_POOL_HEYVMD_LOG",
     "PG_VM_POOL_DASHBOARD_LOG_LINES",
+    "PG_VM_POOL_DASHBOARD_ALERTS_FILE",
+    "PG_VM_POOL_DASHBOARD_ALERT_INTERVAL_SECS",
     "PG_VM_POOL_ARCHIVE_AFTER_SECS",
     "PG_VM_POOL_ARCHIVE_SWEEP_SECS",
     "PG_VM_POOL_S3_BUCKET",
@@ -335,6 +344,18 @@ impl DashboardConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(200usize);
+        let alerts_file = std::env::var("PG_VM_POOL_DASHBOARD_ALERTS_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                PathBuf::from(home).join(".heyo/pg-vm-pool/alerts.tsv")
+            });
+        let alert_interval = std::env::var("PG_VM_POOL_DASHBOARD_ALERT_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_else(|| std::time::Duration::from_secs(60));
 
         Ok(Some(Self {
             listen,
@@ -342,6 +363,8 @@ impl DashboardConfig {
             pooler_log,
             heyvmd_log,
             log_lines,
+            alerts_file,
+            alert_interval,
         }))
     }
 }

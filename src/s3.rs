@@ -44,6 +44,18 @@ impl S3Config {
         format!("{}{}.dump", self.prefix, schema)
     }
 
+    /// The virtual-hosted S3 host (`{bucket}.s3.{region}.amazonaws.com`) that a
+    /// guest `curl` should be pinned to via `--resolve`, or `None` for a custom
+    /// endpoint (MinIO/R2) — there the endpoint is expected to be resolvable by
+    /// the guest itself, so we don't override its DNS. Mirrors the AWS branch of
+    /// [`Self::address`].
+    pub fn resolve_host(&self) -> Option<String> {
+        match &self.endpoint {
+            Some(_) => None,
+            None => Some(format!("{}.s3.{}.amazonaws.com", self.bucket, self.region)),
+        }
+    }
+
     /// Presign a `PUT` of `key`, valid for `expires`. Feed to `curl -T file`.
     pub fn presign_put(&self, key: &str, expires: std::time::Duration) -> String {
         self.presign("PUT", key, expires.as_secs(), now_unix())
@@ -323,6 +335,25 @@ mod tests {
         assert_eq!(scheme, "http");
         assert_eq!(host, "minio.internal:9000");
         assert_eq!(uri, "/wb/s.dump");
+    }
+
+    #[test]
+    fn resolve_host_only_for_aws_virtual_hosted() {
+        let aws = S3Config {
+            bucket: "wb".into(),
+            prefix: "".into(),
+            region: "us-east-2".into(),
+            endpoint: None,
+            access_key_id: "AK".into(),
+            secret_access_key: "sk".into(),
+        };
+        assert_eq!(aws.resolve_host().as_deref(), Some("wb.s3.us-east-2.amazonaws.com"));
+        // Custom endpoint: leave DNS to the guest, so no --resolve host.
+        let custom = S3Config {
+            endpoint: Some("http://minio.internal:9000".into()),
+            ..aws
+        };
+        assert_eq!(custom.resolve_host(), None);
     }
 
     #[test]

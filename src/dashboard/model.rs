@@ -212,7 +212,28 @@ struct UsageEnvelope {
 #[derive(Deserialize)]
 struct UsageSnapshot {
     #[serde(default)]
+    host: Option<HostUsage>,
+    #[serde(default)]
     sandboxes: Vec<SandboxUsage>,
+}
+
+/// Whole-machine CPU and memory as heyvmd's poller samples it (the `host` slice
+/// of `GET /system/usage`, serialized camelCase). Every field is optional so an
+/// older daemon or an unprimed poller degrades field-by-field on the monitoring
+/// page rather than failing it. Disk isn't in this snapshot — it's read
+/// directly from the host in [`super::host`].
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct HostUsage {
+    /// Whole-machine CPU utilization, 0–100 (not the per-core `top` convention).
+    #[serde(default)]
+    pub cpu_percent: Option<f32>,
+    #[serde(default)]
+    pub cpu_count: Option<u32>,
+    #[serde(default)]
+    pub memory_total_bytes: Option<u64>,
+    #[serde(default)]
+    pub memory_used_bytes: Option<u64>,
 }
 
 /// The slice of the daemon's per-sandbox usage sample we render (the snapshot
@@ -258,6 +279,43 @@ async fn fetch_usage(client: &HeyoClient) -> HashMap<String, f32> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Fetch the daemon's cached whole-host CPU/memory sample for the monitoring
+/// page. Bounded and best-effort, mirroring [`fetch_usage`]: an older daemon
+/// without the route, a timeout, or an unprimed poller all yield `None` so the
+/// page shows "unavailable" rather than erroring. Serves the poller's cache;
+/// never samples inline.
+pub async fn fetch_host_usage(st: &DashState) -> Option<HostUsage> {
+    let _ = st; // symmetry with the other model builders; the client is local.
+    let client = match HeyoClient::new(vm::local_opts()) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("building heyo client for host usage failed: {e:#}");
+            return None;
+        }
+    };
+    let resp = tokio::time::timeout(
+        LIST_TIMEOUT,
+        client.request::<UsageEnvelope>(
+            Method::GET,
+            "/system/usage",
+            None::<&()>,
+            RequestOptions::default(),
+        ),
+    )
+    .await;
+    match resp {
+        Ok(Ok(env)) => env.snapshot.and_then(|s| s.host),
+        Ok(Err(e)) => {
+            warn!("fetching host usage failed: {e:#}");
+            None
+        }
+        Err(_) => {
+            warn!("fetching host usage timed out");
+            None
+        }
+    }
 }
 
 const INACTIVE_PAGE_SIZE: usize = 200;
@@ -675,6 +733,12 @@ mod tests {
         assert_eq!(snap.sandboxes.len(), 1);
         assert_eq!(snap.sandboxes[0].sandbox_id, "sb-f88677f0");
         assert!((snap.sandboxes[0].cpu_percent - 137.2).abs() < 1e-3);
+        // The whole-host slice the monitoring page renders.
+        let host = snap.host.unwrap();
+        assert!((host.cpu_percent.unwrap() - 12.5).abs() < 1e-3);
+        assert_eq!(host.cpu_count, Some(16));
+        assert_eq!(host.memory_total_bytes, Some(68_719_476_736));
+        assert_eq!(host.memory_used_bytes, Some(8_589_934_592));
     }
 
     #[test]

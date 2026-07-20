@@ -117,6 +117,7 @@ const RESTORE_PATH: &str = "/workspace/_restore.dump";
 pub async fn dump_to_s3(cfg: &Config, sandbox: &Sandbox, schema: &str, s3: &S3Config) -> Result<()> {
     let key = s3.object_key(schema);
     let url = s3.presign_put(&key, PRESIGN_TTL);
+    let resolve = s3_resolve_flag(s3).await;
     let db = shell_squote(schema);
     let user = shell_squote(&cfg.pg_user);
     // `set -e`: any step failing aborts the script with a non-zero exit, which
@@ -125,7 +126,7 @@ pub async fn dump_to_s3(cfg: &Config, sandbox: &Sandbox, schema: &str, s3: &S3Co
     let cmd = format!(
         "set -e; \
          pg_dump -h 127.0.0.1 -U {user} -Fc -d {db} -f {DUMP_PATH}; \
-         curl -fsS -T {DUMP_PATH} '{url}'; \
+         curl -fsS {resolve} -T {DUMP_PATH} '{url}'; \
          rm -f {DUMP_PATH}"
     );
     run_guest(cfg, sandbox, &cmd, "pg_dump→S3 upload").await
@@ -136,15 +137,79 @@ pub async fn dump_to_s3(cfg: &Config, sandbox: &Sandbox, schema: &str, s3: &S3Co
 async fn restore_from_s3(cfg: &Config, sandbox: &Sandbox, schema: &str, s3: &S3Config) -> Result<()> {
     let key = s3.object_key(schema);
     let url = s3.presign_get(&key, PRESIGN_TTL);
+    let resolve = s3_resolve_flag(s3).await;
     let db = shell_squote(schema);
     let user = shell_squote(&cfg.pg_user);
     let cmd = format!(
         "set -e; \
-         curl -fsS '{url}' -o {RESTORE_PATH}; \
+         curl -fsS {resolve} '{url}' -o {RESTORE_PATH}; \
          pg_restore -h 127.0.0.1 -U {user} --no-owner --no-privileges -d {db} {RESTORE_PATH}; \
          rm -f {RESTORE_PATH}"
     );
     run_guest(cfg, sandbox, &cmd, "S3→pg_restore").await
+}
+
+/// Build a `curl --resolve host:443:IP[,IP…]` flag for the S3 host by resolving
+/// it **on the pooler's host**, because the guest microVM ships without a DNS
+/// resolver (`/etc/resolv.conf` is empty). Only applies to the AWS
+/// virtual-hosted path; a custom endpoint (MinIO/R2) is left to the guest to
+/// resolve. Returns an empty string when there's nothing to pin (custom
+/// endpoint, or resolution fails/times out) — curl then behaves exactly as
+/// before, falling back to the guest's own DNS, so this never makes a working
+/// setup worse.
+///
+/// ASSUMPTION: the guest reaches S3 through the host's NAT egress (it shares the
+/// host's outbound path), so a public IP the host resolves is reachable from the
+/// guest. True for a co-located host talking to public S3; it would misroute
+/// under split-horizon DNS — e.g. an S3 VPC endpoint that resolves to
+/// subnet-private IPs valid only from certain subnets. Revisit this if the guest
+/// ever gets a distinct egress path or S3 moves behind a VPC endpoint.
+async fn s3_resolve_flag(s3: &S3Config) -> String {
+    let Some(host) = s3.resolve_host() else {
+        return String::new();
+    };
+    const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+    // Cap the number of IPs pinned: enough for curl to fail over across a couple
+    // of front-ends at connect time without an unwieldy flag.
+    const MAX_IPS: usize = 4;
+    let lookup = tokio::net::lookup_host((host.as_str(), 443u16));
+    let addrs = match tokio::time::timeout(RESOLVE_TIMEOUT, lookup).await {
+        Ok(Ok(addrs)) => addrs,
+        Ok(Err(e)) => {
+            warn!("resolving {host} on host for guest curl failed ({e}); guest will use its own DNS");
+            return String::new();
+        }
+        Err(_) => {
+            warn!("resolving {host} on host for guest curl timed out; guest will use its own DNS");
+            return String::new();
+        }
+    };
+    // v4 only: the guest tap/NAT is IPv4 (a v6 address the host prefers would be
+    // unreachable from the guest).
+    let mut ips: Vec<String> = addrs
+        .filter_map(|sa| match sa.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4.to_string()),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .collect();
+    ips.sort();
+    ips.dedup();
+    ips.truncate(MAX_IPS);
+    build_resolve_flag(&host, &ips)
+}
+
+/// Assemble the `--resolve` flag from a host and already-resolved IPv4 strings.
+/// Pure (no I/O) so it's unit-testable. Empty when there are no IPs. The value
+/// is single-quoted; host is our own `{bucket}.s3.{region}.amazonaws.com` and
+/// the IPs are validated v4, so nothing here can break out of the guest shell.
+fn build_resolve_flag(host: &str, ips: &[String]) -> String {
+    if ips.is_empty() {
+        return String::new();
+    }
+    // curl takes a comma-separated address list in one --resolve entry and tries
+    // them in order at connect time (repeating the flag for the same host:port
+    // would NOT add addresses — curl keeps the first entry).
+    format!("--resolve '{host}:443:{}'", ips.join(","))
 }
 
 /// Run one guest shell command, passing the backend Postgres password (when
@@ -720,6 +785,23 @@ mod tests {
 
     fn pool_at(port: u16) -> Pool {
         build_pool("127.0.0.1", port, "postgres", "postgres", None).unwrap()
+    }
+
+    #[test]
+    fn resolve_flag_pins_ips_or_stays_empty() {
+        // No IPs → no flag, so curl falls back to the guest's own DNS unchanged.
+        assert_eq!(build_resolve_flag("wb.s3.us-east-2.amazonaws.com", &[]), "");
+        // One or more IPs → a single quoted, comma-joined --resolve entry.
+        let one = build_resolve_flag("wb.s3.us-east-2.amazonaws.com", &["3.5.130.160".into()]);
+        assert_eq!(one, "--resolve 'wb.s3.us-east-2.amazonaws.com:443:3.5.130.160'");
+        let many = build_resolve_flag(
+            "wb.s3.us-east-2.amazonaws.com",
+            &["3.5.130.160".into(), "52.219.0.1".into()],
+        );
+        assert_eq!(
+            many,
+            "--resolve 'wb.s3.us-east-2.amazonaws.com:443:3.5.130.160,52.219.0.1'"
+        );
     }
 
     /// The pooler's pool is housekeeping-only and must not scale with the

@@ -14,7 +14,7 @@ use crate::vm;
 
 use super::error::AppError;
 use super::state::DashState;
-use super::{logs, model, views};
+use super::{host, logs, model, views};
 
 /// Lifecycle actions can be slow (a cold boot re-runs init.sh), so give them a
 /// generous bound — but still bound them, so one wedged VM can't hang a request.
@@ -52,6 +52,61 @@ pub async fn databases(
     let state = p.state.as_deref().unwrap_or(model::DEFAULT_STATE);
     let pg = model::build_page(&st, &p.q, state, page, per).await?;
     Ok(views::databases_page(&st, &pg))
+}
+
+/// Host + fleet monitoring: whole-machine CPU/memory (heyvmd's sampler) and disk
+/// saturation (read from the host directly), plus pooler-fleet aggregates rolled
+/// up from the same VM inventory the Databases view uses. No guest access. Host
+/// CPU/mem and disk are each best-effort and degrade to an "unavailable" note
+/// independently, so a stale poller or a `df` hiccup never fails the page.
+pub async fn monitoring(
+    State(st): State<DashState>,
+    Query(banner): Query<Banner>,
+) -> Result<Markup, AppError> {
+    let (rows, host_usage, disks) = tokio::join!(
+        model::build_rows(&st),
+        model::fetch_host_usage(&st),
+        host::host_disks(),
+    );
+    let rows = rows?;
+    let disks = disks.unwrap_or_else(|e| {
+        tracing::warn!("reading host disks failed (hiding disk): {e:#}");
+        Vec::new()
+    });
+    Ok(views::monitoring_page(
+        &st,
+        &rows,
+        host_usage.as_ref(),
+        &disks,
+        &banner,
+    ))
+}
+
+/// Form for adding a webhook alert rule from the monitoring page.
+#[derive(Deserialize)]
+pub struct AlertForm {
+    pub metric: String,
+    pub threshold_pct: f64,
+    pub webhook_url: String,
+}
+
+pub async fn alert_add(State(st): State<DashState>, Form(form): Form<AlertForm>) -> Redirect {
+    match st
+        .alerts
+        .add(&form.metric, form.threshold_pct, &form.webhook_url)
+    {
+        Ok(()) => Redirect::to(&format!("/monitoring?msg={}", qenc("alert rule added"))),
+        Err(e) => Redirect::to(&format!("/monitoring?err={}", qenc(&e.to_string()))),
+    }
+}
+
+pub async fn alert_delete(State(st): State<DashState>, Path(id): Path<String>) -> Redirect {
+    let msg = if st.alerts.remove(&id) {
+        format!("?msg={}", qenc("alert rule removed"))
+    } else {
+        format!("?err={}", qenc("no such alert rule"))
+    };
+    Redirect::to(&format!("/monitoring{msg}"))
 }
 
 pub async fn vm_detail(

@@ -6,8 +6,10 @@ use maud::{DOCTYPE, Markup, html};
 
 use crate::registry::{DbStats, GuestStats};
 
+use super::alerts::{Metric, RuleView};
 use super::handlers::Banner;
-use super::model::{self, SandboxPage, VmRow};
+use super::host::HostDisk;
+use super::model::{self, HostUsage, SandboxPage, VmRow};
 use super::state::DashState;
 
 const SIZE_CLASSES: [&str; 5] = ["micro", "mini", "small", "medium", "large"];
@@ -28,6 +30,7 @@ fn shell(title: &str, body: Markup) -> Markup {
                     a.brand href="/" { "pg-vm-pool" }
                     nav {
                         a href="/" { "Databases" }
+                        a href="/monitoring" { "monitoring" }
                         a href="/logs/pooler" { "pooler log" }
                         a href="/logs/heyvmd" { "heyvmd log" }
                     }
@@ -91,6 +94,282 @@ pub fn databases_page(st: &DashState, p: &SandboxPage) -> Markup {
             }
         },
     )
+}
+
+/// The monitoring view: whole-host CPU/memory/disk saturation plus pooler-fleet
+/// aggregates rolled up from the VM inventory.
+pub fn monitoring_page(
+    st: &DashState,
+    rows: &[VmRow],
+    host: Option<&HostUsage>,
+    disks: &[HostDisk],
+    b: &Banner,
+) -> Markup {
+    let running: Vec<&VmRow> = rows.iter().filter(|r| r.is_running()).collect();
+    let sessions: usize = rows.iter().filter_map(|r| r.live_sessions).sum();
+    let warm = rows.iter().filter(|r| r.live_sessions.is_some()).count();
+    let queueing = rows
+        .iter()
+        .filter(|r| matches!(r.client_slots, Some((0, _))))
+        .count();
+    let alloc_vcpu: u64 = running.iter().filter_map(|r| r.cpus).map(u64::from).sum();
+    let alloc_mem: u64 = running.iter().filter_map(|r| r.memory_bytes).sum();
+    // Sum of per-VM guest CPU (heyvmd's `top`-convention sample: 100% = one
+    // core), i.e. how many cores' worth of work the fleet's guests are doing.
+    let guest_cpu: f32 = running.iter().filter_map(|r| r.cpu_percent).sum();
+    let archived = rows.iter().filter(|r| r.archived).count();
+
+    shell(
+        "Monitoring",
+        html! {
+            div.pagehead {
+                h1 { "Monitoring" }
+                a.button-link href="/monitoring" { "↻ refresh" }
+            }
+            (banner(b))
+            @if st.cfg.basic_auth.is_none() {
+                div.summary { span.warn { "auth: OFF" } }
+            }
+
+            h2 { "host" }
+            @match host {
+                Some(h) => {
+                    div.metrics {
+                        (host_cpu_metric(h))
+                        (host_mem_metric(h))
+                    }
+                }
+                None => {
+                    p.note {
+                        "Host CPU/memory unavailable — heyvmd's usage poller has not "
+                        "published a sample yet, or this daemon predates "
+                        code { "/system/usage" } "."
+                    }
+                }
+            }
+
+            h3.sub-head { "disk saturation" }
+            @if disks.is_empty() {
+                p.note { "No host filesystems reported (" code { "df" } " unavailable or timed out)." }
+            } @else {
+                div.metrics {
+                    @for d in disks {
+                        (disk_metric(d))
+                    }
+                }
+            }
+
+            h2 { "pooler fleet" }
+            div.stats {
+                (stat("running VMs", &running.len().to_string(), Some(&format!("{} total", rows.len()))))
+                (stat("warm in pooler", &warm.to_string(),
+                    if queueing > 0 { Some("clients queueing") } else { None }))
+                (stat("live sessions", &sessions.to_string(), None))
+                (stat("allocated vCPU", &alloc_vcpu.to_string(), Some("across running VMs")))
+                (stat("allocated RAM", &human_bytes(alloc_mem), Some("across running VMs")))
+                (stat("guest CPU", &format!("{guest_cpu:.0}%"), Some("cores busy, top-convention")))
+                @if st.registry.archive_enabled() {
+                    (stat("archived (S3)", &archived.to_string(), None))
+                }
+            }
+            p.note {
+                "Whole-host CPU and memory come from heyvmd's sampler (" code { "/system/usage" }
+                "); disk saturation is read on the host with " code { "df" }
+                ". Fleet figures are rolled up from the same inventory the "
+                a href="/" { "Databases" } " view shows — no guest access."
+            }
+
+            (alerts_section(st))
+        },
+    )
+}
+
+/// The webhook-alerts panel: existing rules with their live firing state and a
+/// delete control, plus a form to add a new rule.
+fn alerts_section(st: &DashState) -> Markup {
+    let rules = st.alerts.list();
+    let interval = st.cfg.alert_interval.as_secs();
+    html! {
+        section.controls {
+            h2 { "alerts" }
+            @if rules.is_empty() {
+                p.dim { "No alert rules configured." }
+            } @else {
+                table.alerts {
+                    thead {
+                        tr {
+                            th { "metric" }
+                            th { "threshold" }
+                            th { "webhook" }
+                            th { "state" }
+                            th {}
+                        }
+                    }
+                    tbody {
+                        @for r in &rules {
+                            tr {
+                                td { (r.metric.label()) }
+                                td { "≥ " (fmt_pct(r.threshold_pct)) "%" }
+                                td.dim { code { (r.webhook_url) } }
+                                td { (alert_state_badge(r)) }
+                                td.actions {
+                                    form method="post"
+                                        action={ "/monitoring/alerts/" (r.id) "/delete" } {
+                                        button.stop
+                                            onclick="return confirm('Delete this alert rule?')"
+                                            { "delete" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            h3.sub-head { "add rule" }
+            form.alert-add method="post" action="/monitoring/alerts" {
+                label {
+                    span { "metric" }
+                    select name="metric" {
+                        @for m in Metric::all() {
+                            option value=(m.slug()) { (m.label()) }
+                        }
+                    }
+                }
+                label {
+                    span { "fire at ≥ (%)" }
+                    input type="number" name="threshold_pct" min="0" max="100" step="1"
+                        value="90" required;
+                }
+                label.grow {
+                    span { "webhook URL" }
+                    input type="url" name="webhook_url" placeholder="https://hooks.example.com/…"
+                        required;
+                }
+                button type="submit" { "add alert" }
+            }
+            p.note {
+                "The evaluator samples host CPU, memory, and the fullest disk every "
+                (interval) "s and POSTs a JSON body (" code { "state" } " of "
+                code { "triggered" } "/" code { "resolved" }
+                ") to the URL when a rule crosses its threshold — once per crossing, "
+                "not every interval. The disk rule watches the fullest host filesystem."
+            }
+        }
+    }
+}
+
+fn alert_state_badge(r: &RuleView) -> Markup {
+    html! {
+        @if r.firing {
+            span.badge.s-failed { "firing" }
+        } @else {
+            span.badge.s-running { "ok" }
+        }
+    }
+}
+
+/// Format a threshold percent without a needless trailing `.0`.
+fn fmt_pct(v: f64) -> String {
+    if v.fract() == 0.0 {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.1}")
+    }
+}
+
+/// Host CPU meter. `cpu_percent` is whole-machine 0–100.
+fn host_cpu_metric(h: &HostUsage) -> Markup {
+    match h.cpu_percent {
+        Some(cpu) => {
+            let frac = (cpu as f64 / 100.0).clamp(0.0, 1.0);
+            let sub = h.cpu_count.map(|n| format!("{n} cores"));
+            metric("CPU", frac, &format!("{cpu:.1}%"), sub.as_deref())
+        }
+        None => metric_unavailable("CPU"),
+    }
+}
+
+/// Host memory meter, used / total.
+fn host_mem_metric(h: &HostUsage) -> Markup {
+    match (h.memory_used_bytes, h.memory_total_bytes) {
+        (Some(used), Some(total)) if total > 0 => {
+            let frac = (used as f64 / total as f64).clamp(0.0, 1.0);
+            let val = format!("{:.0}%", frac * 100.0);
+            let sub = format!("{} of {}", human_bytes(used), human_bytes(total));
+            metric("Memory", frac, &val, Some(&sub))
+        }
+        _ => metric_unavailable("Memory"),
+    }
+}
+
+fn disk_metric(d: &HostDisk) -> Markup {
+    let frac = d.saturation();
+    let val = format!("{:.0}%", frac * 100.0);
+    let sub = format!(
+        "{} of {} · {} free",
+        human_bytes(d.used),
+        human_bytes(d.total),
+        human_bytes(d.avail)
+    );
+    // Label by mount point; the device is the fine-print second line.
+    metric(&d.mount, frac, &val, Some(&format!("{} · {}", d.source, sub)))
+}
+
+/// A labeled saturation meter: a big percent, a colored bar, and a caption. The
+/// bar's color escalates ok→warn→crit as it fills so a hot resource reads at a
+/// glance.
+fn metric(label: &str, frac: f64, value: &str, sub: Option<&str>) -> Markup {
+    let pct = (frac * 100.0).clamp(0.0, 100.0);
+    let cls = meter_level(frac);
+    html! {
+        div.metric {
+            div.metric-head {
+                span.metric-label { (label) }
+                span.metric-val { (value) }
+            }
+            div.meter {
+                div class={ "meter-fill " (cls) } style=(format!("width:{pct:.1}%")) {}
+            }
+            @if let Some(s) = sub { div.metric-sub { (s) } }
+        }
+    }
+}
+
+fn metric_unavailable(label: &str) -> Markup {
+    html! {
+        div.metric {
+            div.metric-head {
+                span.metric-label { (label) }
+                span.metric-val.dim { "—" }
+            }
+            div.meter { div class="meter-fill ok" style="width:0%" {} }
+            div.metric-sub { "unavailable" }
+        }
+    }
+}
+
+/// Color band for a meter by fill fraction: calm below 70%, amber to 90%, red
+/// above — the usual "getting full" escalation.
+fn meter_level(frac: f64) -> &'static str {
+    if frac >= 0.90 {
+        "crit"
+    } else if frac >= 0.70 {
+        "warn"
+    } else {
+        "ok"
+    }
+}
+
+/// A compact aggregate stat card: a number, a label, and an optional caption.
+fn stat(label: &str, value: &str, sub: Option<&str>) -> Markup {
+    html! {
+        div.stat {
+            div.stat-val { (value) }
+            div.stat-label { (label) }
+            @if let Some(s) = sub { div.stat-sub { (s) } }
+        }
+    }
 }
 
 /// State filter pills: "all" plus every state with matches (and the selected
@@ -538,6 +817,57 @@ fn human_secs(s: u64) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meter_level_bands() {
+        assert_eq!(meter_level(0.0), "ok");
+        assert_eq!(meter_level(0.699), "ok");
+        assert_eq!(meter_level(0.70), "warn");
+        assert_eq!(meter_level(0.899), "warn");
+        assert_eq!(meter_level(0.90), "crit");
+        assert_eq!(meter_level(1.0), "crit");
+    }
+
+    #[test]
+    fn fmt_pct_trims_whole_numbers() {
+        assert_eq!(fmt_pct(90.0), "90");
+        assert_eq!(fmt_pct(85.5), "85.5");
+    }
+
+    #[test]
+    fn metric_renders_clamped_bar_and_band() {
+        // A hot disk: fill clamps to 100%, gets the crit color, shows the caption.
+        let html = metric("/data", 1.4, "140%", Some("/dev/sda1")).into_string();
+        assert!(html.contains("width:100.0%"), "bar should clamp: {html}");
+        assert!(html.contains("meter-fill crit"), "band should be crit: {html}");
+        assert!(html.contains("/data"));
+        assert!(html.contains("/dev/sda1"));
+
+        // A calm metric: partial fill, ok color.
+        let html = metric("CPU", 0.25, "25.0%", None).into_string();
+        assert!(html.contains("width:25.0%"));
+        assert!(html.contains("meter-fill ok"));
+    }
+
+    #[test]
+    fn disk_metric_shows_saturation_and_free() {
+        let d = HostDisk {
+            source: "/dev/sda1".into(),
+            mount: "/".into(),
+            total: 100 * 1024 * 1024 * 1024,
+            used: 88 * 1024 * 1024 * 1024,
+            avail: 12 * 1024 * 1024 * 1024,
+        };
+        let html = disk_metric(&d).into_string();
+        assert!(html.contains("meter-fill warn"), "88% → warn band: {html}");
+        assert!(html.contains("free"));
+        assert!(html.contains("/dev/sda1"));
+    }
+}
+
 // Light/dark via CSS custom properties; every color is defined for both schemes
 // so contrast holds up in dark mode (the earlier version left light badge/pre
 // colors on a dark page).
@@ -556,6 +886,7 @@ const STYLE: &str = r#"
   --prov-bg:#fef3c7; --prov-fg:#92600a;
   --fail-bg:#fee2e2; --fail-fg:#b00020;
   --sess-bg:#dbeafe; --sess-fg:#1e40af;
+  --meter-track:#e6e8ec; --meter-ok:#16a34a; --meter-warn:#d97706; --meter-crit:#dc2626;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -571,6 +902,7 @@ const STYLE: &str = r#"
     --prov-bg:#3a2f12; --prov-fg:#f2cd6b;
     --fail-bg:#3a1618; --fail-fg:#ff9ba0;
     --sess-bg:#16294a; --sess-fg:#9cc4ff;
+    --meter-track:#2f333c; --meter-ok:#3ec07a; --meter-warn:#e0a13a; --meter-crit:#f0685f;
   }
 }
 * { box-sizing: border-box; }
@@ -644,4 +976,30 @@ form.search input[type=search] { flex:1; max-width:420px; font:inherit; padding:
 code { background:var(--code-bg); padding:.1rem .3rem; border-radius:4px; font-size:.85em; }
 pre.log { background:var(--pre-bg); color:var(--pre-fg); padding:1rem; border-radius:8px; overflow-x:auto;
           font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre; max-height:70vh; }
+h3.sub-head { font-size:.82rem; text-transform:uppercase; letter-spacing:.04em; color:var(--dim);
+              margin:1.2rem 0 .5rem; }
+.metrics { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:.8rem; margin:.6rem 0; }
+.metric { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:.8rem .9rem; }
+.metric-head { display:flex; align-items:baseline; justify-content:space-between; gap:.5rem; }
+.metric-label { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.metric-val { font-variant-numeric:tabular-nums; font-weight:700; font-size:1.05rem; }
+.meter { height:8px; background:var(--meter-track); border-radius:999px; overflow:hidden; margin:.5rem 0 .4rem; }
+.meter-fill { height:100%; border-radius:999px; transition:width .2s ease; }
+.meter-fill.ok { background:var(--meter-ok); }
+.meter-fill.warn { background:var(--meter-warn); }
+.meter-fill.crit { background:var(--meter-crit); }
+.metric-sub { color:var(--muted); font-size:.8rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.stats { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:.8rem; margin:.6rem 0; }
+.stat { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:.8rem .9rem; }
+.stat-val { font-size:1.5rem; font-weight:700; font-variant-numeric:tabular-nums; }
+.stat-label { color:var(--dim); font-size:.82rem; margin-top:.15rem; }
+.stat-sub { color:var(--muted); font-size:.75rem; margin-top:.2rem; }
+table.alerts { margin:.4rem 0 .8rem; }
+table.alerts td code { white-space:normal; word-break:break-all; }
+form.alert-add { display:flex; flex-wrap:wrap; align-items:end; gap:.6rem 1rem; margin:.5rem 0; }
+form.alert-add label { display:flex; flex-direction:column; gap:.2rem; font-size:.82rem; color:var(--dim); }
+form.alert-add label.grow { flex:1; min-width:220px; }
+form.alert-add input, form.alert-add select { font:inherit; padding:.3rem .5rem; color:var(--fg);
+        background:var(--btn-bg); border:1px solid var(--btn-border); border-radius:6px; }
+form.alert-add input[type=number] { width:6rem; }
 "#;

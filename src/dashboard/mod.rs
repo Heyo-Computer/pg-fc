@@ -15,6 +15,14 @@
 //! stop/start/reboot/resize on any VM, and tails the pooler / heyvmd / per-VM
 //! Postgres logs.
 //!
+//! A `/monitoring` view adds whole-host health — total CPU % and memory % from
+//! heyvmd's `/system/usage` sampler, plus per-filesystem disk saturation read
+//! directly on the host with `df` (the pooler shares the host with heyvmd) — and
+//! pooler-fleet aggregates rolled up from the same inventory. It also configures
+//! webhook alerts on those host metrics: a background evaluator (see `alerts`)
+//! samples them on an interval and POSTs a webhook when a rule crosses its
+//! threshold.
+//!
 //! Guest-console access (SDK `commands()` exec) goes through the VM's PID-1
 //! serial-console shell on this image and can halt the VM, so the browsable
 //! pages (index + detail) perform **no** guest access — only daemon reads and
@@ -22,9 +30,11 @@
 //! confined to its own explicitly-navigated `/logs/vm/{id}` page. Every daemon
 //! and guest call is timeout-bounded so one wedged VM can't hang a request.
 
+mod alerts;
 mod auth;
 mod error;
 mod handlers;
+mod host;
 mod logs;
 mod model;
 mod router;
@@ -45,10 +55,16 @@ use state::DashState;
 /// the pooler's `Arc<SchemaRegistry>` for live session data.
 pub async fn serve(cfg: DashboardConfig, registry: Arc<SchemaRegistry>) -> Result<()> {
     let addr = cfg.listen;
+    let alert_interval = cfg.alert_interval;
+    let alerts = Arc::new(alerts::AlertStore::load(cfg.alerts_file.clone()));
     let state = DashState {
         registry,
         cfg: Arc::new(cfg),
+        alerts,
     };
+    // Background webhook-alert evaluator: samples host metrics on an interval and
+    // fires any crossed rules. Shares the same `AlertStore` the pages mutate.
+    alerts::spawn_evaluator(state.clone(), alert_interval);
     let app = router::build(state);
     let listener = TcpListener::bind(addr)
         .await

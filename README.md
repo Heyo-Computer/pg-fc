@@ -145,6 +145,8 @@ Config via env (all optional):
 | `PG_VM_POOL_POOLER_LOG` | `/var/log/pg-vm-pool/pg-vm-pool.log` | pooler log file the dashboard tails |
 | `PG_VM_POOL_HEYVMD_LOG` | `/var/log/heyvmd/heyvmd.log` | heyvmd log file the dashboard tails |
 | `PG_VM_POOL_DASHBOARD_LOG_LINES` | `200` | how many trailing lines the dashboard shows per log |
+| `PG_VM_POOL_DASHBOARD_ALERTS_FILE` | `~/.heyo/pg-vm-pool/alerts.tsv` | where the monitoring page's webhook alert rules persist |
+| `PG_VM_POOL_DASHBOARD_ALERT_INTERVAL_SECS` | `60` | how often the alert evaluator samples host metrics and fires crossed alerts |
 | `PG_VM_POOL_ARCHIVE_AFTER_SECS` | `0` (off) | S3 eviction: offload a schema untouched this long to S3 and kill its VM; e.g. `604800` = 1 week — see "S3 eviction tier" |
 | `PG_VM_POOL_ARCHIVE_SWEEP_SECS` | `3600` | how often the eviction sweep scans for candidates |
 | `PG_VM_POOL_S3_BUCKET` | unset | S3 bucket for dumps (required when eviction is on) |
@@ -323,6 +325,13 @@ What it gives you (browse to the listen address):
 - **VM/session overview** (`/`) — every heyvmd sandbox, with power state,
   allocated size (vCPU/RAM), uptime, and live pooler sessions. Pooler-managed
   `pg-<schema>` VMs are grouped first and link to a detail page.
+- **Monitoring** (`/monitoring`) — whole-**host** health: total CPU % and
+  memory % (from heyvmd's own `/system/usage` sampler) and **disk saturation**
+  per host filesystem (read directly on the host with `df`, since the pooler
+  runs alongside heyvmd), each shown as a color-banded meter. Below that,
+  pooler-fleet aggregates (running VMs, warm/queueing, live sessions, allocated
+  vCPU/RAM, guest CPU) rolled up from the same inventory the overview uses —
+  still no guest access. This page also configures **webhook alerts** (below).
 - **Detail page** — full daemon config (size class + resources, image, region,
   guest IP, TTL, status) plus live **database size and backend count**, read
   over the pooler's own warm Postgres connection (a normal query, not a guest
@@ -346,6 +355,29 @@ prefer a loopback/private `PG_VM_POOL_DASHBOARD_LISTEN`; binding it to a
 non-loopback address without Basic auth logs a startup warning. The two log
 paths default to the supervisord locations above and are overridable with
 `PG_VM_POOL_POOLER_LOG` / `PG_VM_POOL_HEYVMD_LOG`.
+
+#### Webhook alerts
+
+The monitoring page can watch the basic host metrics and POST a webhook when one
+crosses a threshold. Add a rule (metric = host CPU %, host memory %, or disk
+saturation %; a threshold; and a URL) from the page's **alerts** panel. A
+background task samples the same host metrics every
+`PG_VM_POOL_DASHBOARD_ALERT_INTERVAL_SECS` (default 60) and, on a crossing,
+`POST`s a small JSON body to the URL — **once** on the rising edge
+(`"state":"triggered"`) and once when it falls back (`"state":"resolved"`), not
+every interval while it stays over. The disk rule watches the fullest host
+filesystem. Example body:
+
+```json
+{"source":"pg-vm-pool","host":"pool-1","rule_id":"q7m2…","metric":"disk",
+ "state":"triggered","threshold_pct":90.0,"value_pct":93.4,"detail":"/"}
+```
+
+Delivery shells out to `curl` (no extra HTTP dependency); a failed or slow
+endpoint is logged and never blocks the pooler. Rules persist to
+`PG_VM_POOL_DASHBOARD_ALERTS_FILE` (default `~/.heyo/pg-vm-pool/alerts.tsv`, a
+sibling of the schema registry) and survive restarts; the firing state is
+in-memory, so a restart re-evaluates cleanly rather than replaying a stale edge.
 
 ### Testing
 
