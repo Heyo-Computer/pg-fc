@@ -145,6 +145,13 @@ Config via env (all optional):
 | `PG_VM_POOL_POOLER_LOG` | `/var/log/pg-vm-pool/pg-vm-pool.log` | pooler log file the dashboard tails |
 | `PG_VM_POOL_HEYVMD_LOG` | `/var/log/heyvmd/heyvmd.log` | heyvmd log file the dashboard tails |
 | `PG_VM_POOL_DASHBOARD_LOG_LINES` | `200` | how many trailing lines the dashboard shows per log |
+| `PG_VM_POOL_ARCHIVE_AFTER_SECS` | `0` (off) | S3 eviction: offload a schema untouched this long to S3 and kill its VM; e.g. `604800` = 1 week — see "S3 eviction tier" |
+| `PG_VM_POOL_ARCHIVE_SWEEP_SECS` | `3600` | how often the eviction sweep scans for candidates |
+| `PG_VM_POOL_S3_BUCKET` | unset | S3 bucket for dumps (required when eviction is on) |
+| `PG_VM_POOL_S3_PREFIX` | `pg-vm-pool/` | key prefix; the object per schema is `{prefix}{schema}.dump` |
+| `PG_VM_POOL_S3_REGION` | `us-east-1` | region for SigV4 signing |
+| `PG_VM_POOL_S3_ENDPOINT` | unset (AWS) | custom endpoint for an S3-compatible store (MinIO/R2); path-style addressing |
+| `PG_VM_POOL_S3_ACCESS_KEY_ID` / `PG_VM_POOL_S3_SECRET_ACCESS_KEY` | unset | S3 credentials (fall back to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) |
 
 Postgres inside each VM **tunes itself to the VM's resources at every boot**:
 `init.sh` reads live RAM/vCPUs/disk and regenerates
@@ -175,6 +182,45 @@ over the host tap and skips the iroh tunnel entirely — no relay dependency,
 lower latency, faster bring-up. It falls back to a tunnel automatically if the
 daemon reports no `guest_ip`. Set `PG_VM_POOL_DIRECT_CONNECT=0` to force the
 tunnel path (e.g. if the pooler ever runs on a different machine than the VMs).
+
+### S3 eviction tier
+
+The idle reaper (`PG_VM_POOL_IDLE_TIMEOUT_SECS`) only **stops** an idle VM — its
+data disk still occupies host storage forever. On a host accumulating thousands
+of rarely-touched workbooks, disk is the binding constraint. The **eviction
+tier** is a second, slower reclamation stage: a background sweep (hourly by
+default) finds any non-keepalive schema untouched for a long window (e.g. a
+week), dumps its database to S3, and **kills** the VM — freeing the disk. The
+next client connection restores the dump into a fresh VM transparently.
+
+Enable it by setting `PG_VM_POOL_ARCHIVE_AFTER_SECS` to a positive number and
+providing an S3 bucket + credentials (the pooler fails fast at startup if the
+threshold is set but the bucket/credentials are missing):
+
+```
+PG_VM_POOL_ARCHIVE_AFTER_SECS=604800        # 1 week
+PG_VM_POOL_S3_BUCKET=my-pg-vm-pool-dumps
+PG_VM_POOL_S3_REGION=us-west-2
+PG_VM_POOL_S3_ACCESS_KEY_ID=...
+PG_VM_POOL_S3_SECRET_ACCESS_KEY=...
+# optional, for MinIO/R2/other S3-compatible stores:
+# PG_VM_POOL_S3_ENDPOINT=https://minio.internal:9000
+```
+
+How it moves the data: the pooler never handles dump bytes itself. It generates
+a short-lived **SigV4 presigned URL** and the guest VM streams straight to/from
+S3 with its own `pg_dump`/`pg_restore` + `curl` (`pg_dump -Fc | curl -T` on the
+way out, `curl | pg_restore` on the way back). The dump bytes never transit the
+pooler and the S3 secret key never leaves it. This requires the guest VMs to
+have outbound network egress to the S3 endpoint. Each schema maps to one object,
+`s3://{bucket}/{prefix}{schema}.dump`; a single `PUT` caps at 5 GB, which is
+ample for one-workbook databases.
+
+Archived schemas show up in the dashboard with an **"archived (S3)"** status
+(filterable via the `archived` state pill) even though no VM backs them, and any
+idle running schema VM has a **reap → S3** button on its detail page to offload
+it on demand. `PG_VM_POOL_KEEPALIVE_SCHEMAS` are exempt from eviction, same as
+from idle reaping.
 
 ### Managing with supervisord
 

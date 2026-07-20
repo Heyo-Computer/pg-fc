@@ -24,6 +24,7 @@ use serde::Deserialize;
 use tracing::warn;
 
 use crate::registry::EntrySnapshot;
+use crate::store::StoreRecord;
 use crate::vm;
 
 use super::state::DashState;
@@ -39,7 +40,7 @@ pub const MAX_PER: usize = 200;
 /// sentinel [`STATE_ALL`] disables the filter. The view defaults to showing
 /// only running sandboxes — on a busy host the stopped tail dwarfs the live
 /// set.
-pub const STATE_FILTERS: [&str; 7] = [
+pub const STATE_FILTERS: [&str; 8] = [
     "running",
     "provisioning",
     "stopped",
@@ -47,6 +48,7 @@ pub const STATE_FILTERS: [&str; 7] = [
     "cold-stored",
     "failed",
     "unknown",
+    "archived",
 ];
 pub const DEFAULT_STATE: &str = "running";
 pub const STATE_ALL: &str = "all";
@@ -82,6 +84,58 @@ struct RawSandbox {
     memory: Option<u64>, // bytes
     #[serde(default)]
     disk_size_gb: Option<u32>,
+    // Not from the daemon (it never sees these — they were killed). Set on the
+    // synthetic rows we splice in for schemas whose data lives only in S3.
+    #[serde(default)]
+    archived: bool,
+}
+
+impl RawSandbox {
+    /// A synthetic record for a schema archived to S3: its VM was killed, so it
+    /// is absent from the daemon inventory. `status` is a placeholder — the
+    /// `archived` flag is what drives display and filtering.
+    fn archived(schema: &str, sandbox_id: &str) -> Self {
+        RawSandbox {
+            id: sandbox_id.to_string(),
+            name: format!("pg-{schema}"),
+            status: SandboxStatus::Stopped,
+            size_class: None,
+            uptime_secs: 0,
+            ttl_seconds: None,
+            guest_ip: None,
+            error_message: None,
+            status_changed_at: None,
+            image: None,
+            region: None,
+            cpus: None,
+            memory: None,
+            disk_size_gb: None,
+            archived: true,
+        }
+    }
+}
+
+/// State label for a raw record: `archived` for the S3-offloaded synthetic rows,
+/// otherwise the daemon status label. Shared by the state filter, pill counts,
+/// and search so all three agree on what "archived" matches.
+fn row_state_label(s: &RawSandbox) -> &'static str {
+    if s.archived {
+        "archived"
+    } else {
+        status_str(&s.status)
+    }
+}
+
+/// Append synthetic rows for every archived schema not already represented in
+/// the daemon inventory (deduped by sandbox id).
+fn append_archived(list: &mut Vec<RawSandbox>, records: &[(String, StoreRecord)]) {
+    let existing: std::collections::HashSet<&str> = list.iter().map(|s| s.id.as_str()).collect();
+    let mut extra: Vec<RawSandbox> = records
+        .iter()
+        .filter(|(_, r)| r.archived && !existing.contains(r.sandbox_id.as_str()))
+        .map(|(schema, r)| RawSandbox::archived(schema, &r.sandbox_id))
+        .collect();
+    list.append(&mut extra);
 }
 
 /// One VM as shown in the dashboard: daemon facts left-joined with pooler state.
@@ -121,6 +175,9 @@ pub struct VmRow {
     pub target: Option<std::net::SocketAddr>,
     /// True when reached over an iroh tunnel rather than a direct guest IP.
     pub tunneled: Option<bool>,
+    /// True when this schema's data lives only in S3 (VM killed by the eviction
+    /// tier). No live sandbox backs it; the next client connect restores it.
+    pub archived: bool,
 }
 
 impl VmRow {
@@ -280,10 +337,17 @@ async fn fetch_inventory(client: &HeyoClient) -> Result<Vec<RawSandbox>> {
     Ok(all)
 }
 
-/// The pooler-side join inputs, keyed by sandbox id: warm-entry snapshots and
-/// the durable schema↔VM map. Both are cheap in-process reads (one brief map
-/// lock, no I/O).
-async fn pooler_maps(st: &DashState) -> (HashMap<String, EntrySnapshot>, HashMap<String, String>) {
+/// The pooler-side join inputs: warm-entry snapshots keyed by sandbox id, the
+/// durable id→schema map, and the full durable records (which carry the
+/// `archived` flag used to splice in S3-only schemas). All cheap in-process
+/// reads (one brief map lock, no I/O).
+async fn pooler_maps(
+    st: &DashState,
+) -> (
+    HashMap<String, EntrySnapshot>,
+    HashMap<String, String>,
+    Vec<(String, StoreRecord)>,
+) {
     let snap = st
         .registry
         .snapshot()
@@ -291,13 +355,12 @@ async fn pooler_maps(st: &DashState) -> (HashMap<String, EntrySnapshot>, HashMap
         .into_iter()
         .map(|e| (e.sandbox_id.clone(), e))
         .collect();
-    let store = st
-        .registry
-        .store_entries()
-        .into_iter()
-        .map(|(schema, id)| (id, schema))
+    let records = st.registry.store_records();
+    let store = records
+        .iter()
+        .map(|(schema, r)| (r.sandbox_id.clone(), schema.clone()))
         .collect();
-    (snap, store)
+    (snap, store, records)
 }
 
 /// Left-join one raw daemon record with the pooler's state and the daemon's
@@ -339,6 +402,7 @@ fn join_row(
         keepalive: entry.map(|e| e.keepalive).unwrap_or(false),
         target: entry.map(|e| e.target),
         tunneled: entry.map(|e| e.tunneled),
+        archived: s.archived,
     }
 }
 
@@ -348,8 +412,9 @@ fn join_row(
 pub async fn build_rows(st: &DashState) -> Result<Vec<VmRow>> {
     let client = HeyoClient::new(vm::local_opts()).context("building heyo client")?;
     let (list, usage) = tokio::join!(fetch_inventory(&client), fetch_usage(&client));
-    let list = list?;
-    let (snap, store) = pooler_maps(st).await;
+    let mut list = list?;
+    let (snap, store, records) = pooler_maps(st).await;
+    append_archived(&mut list, &records);
 
     let mut rows: Vec<VmRow> = list
         .into_iter()
@@ -402,9 +467,10 @@ pub async fn build_page(
 ) -> Result<SandboxPage> {
     let client = HeyoClient::new(vm::local_opts()).context("building heyo client")?;
     let (list, usage) = tokio::join!(fetch_inventory(&client), fetch_usage(&client));
-    let list = list?;
+    let mut list = list?;
+    let (snap, store, records) = pooler_maps(st).await;
+    append_archived(&mut list, &records);
     let total = list.len();
-    let (snap, store) = pooler_maps(st).await;
 
     let needle = q.trim().to_lowercase();
     let state = {
@@ -437,7 +503,7 @@ pub async fn build_page(
     let mut state_counts: Vec<(&'static str, usize)> =
         STATE_FILTERS.iter().map(|l| (*l, 0)).collect();
     for s in &q_hits {
-        let label = status_str(&s.status);
+        let label = row_state_label(s);
         if let Some(c) = state_counts.iter_mut().find(|(l, _)| *l == label) {
             c.1 += 1;
         }
@@ -478,7 +544,7 @@ pub async fn build_page(
 /// matches nothing (an admin typo'd a URL — an empty page is clearer than a
 /// silently ignored filter).
 fn state_matches(s: &RawSandbox, state: &str) -> bool {
-    state == STATE_ALL || status_str(&s.status) == state
+    state == STATE_ALL || row_state_label(s) == state
 }
 
 /// Case-insensitive substring match against the fields an operator actually
@@ -488,7 +554,7 @@ fn matches_query(s: &RawSandbox, schema: Option<&str>, needle: &str) -> bool {
     hay(&s.id)
         || hay(&s.name)
         || schema.is_some_and(hay)
-        || hay(status_str(&s.status))
+        || hay(row_state_label(s))
         || s.image.as_deref().is_some_and(hay)
         || s.guest_ip.as_deref().is_some_and(hay)
 }

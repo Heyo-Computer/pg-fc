@@ -86,7 +86,7 @@ pub fn databases_page(st: &DashState, p: &SandboxPage) -> Markup {
                 }
             }
             @if p.matched > 0 {
-                (vm_table(&p.rows))
+                (vm_table(&p.rows, st.registry.archive_enabled()))
                 (pager(p))
             }
         },
@@ -180,7 +180,7 @@ pub fn vm_detail_page(
             p { a href="/" { "← Databases" } }
             (banner(b))
             div.pagehead {
-                h1 { (r.name) " " (status_badge(&r.status)) }
+                h1 { (r.name) " " (status_badge_row(r)) }
                 // A plain GET back to the canonical URL: re-reads daemon +
                 // pooler state and drops any one-shot ?msg/?err banner.
                 a.button-link href={ "/vm/" (r.id) } { "↻ refresh" }
@@ -291,7 +291,7 @@ pub fn vm_detail_page(
 
             section.controls {
                 h2 { "controls" }
-                div.actions { (action_buttons(&r.id, &r.status)) }
+                div.actions { (action_buttons(r, st.registry.archive_enabled())) }
                 form.resize method="post" action={ "/vm/" (r.id) "/resize" } {
                     label { "resize to " }
                     select name="size_class" {
@@ -304,6 +304,10 @@ pub fn vm_detail_page(
                 p.note {
                     "Pooler-managed VMs stopped here auto-restart on the next client "
                     "connection; a resize takes effect on the VM's next boot."
+                    @if st.registry.archive_enabled() {
+                        " Reaping to S3 dumps the database, deletes the VM and its disk, "
+                        "and restores the data into a fresh VM on the next connection."
+                    }
                 }
             }
 
@@ -360,7 +364,7 @@ pub fn error_page(err: &anyhow::Error) -> Markup {
 // ---- fragments -------------------------------------------------------------
 
 /// The VM list table, shared by the index and the paged all-sandboxes view.
-fn vm_table(rows: &[VmRow]) -> Markup {
+fn vm_table(rows: &[VmRow], archive_enabled: bool) -> Markup {
     html! {
         table {
             thead {
@@ -380,12 +384,12 @@ fn vm_table(rows: &[VmRow]) -> Markup {
                     tr {
                         td { a href={ "/vm/" (r.id) } { (r.name) } }
                         td.dim { (r.schema.as_deref().unwrap_or("—")) }
-                        td { (status_badge(&r.status)) }
+                        td { (status_badge_row(r)) }
                         td { (size_cell(r)) }
                         td { (cpu_cell(r)) }
                         td { (if r.is_running() { human_secs(r.uptime_secs) } else { "—".into() }) }
                         td { (sessions_cell(r)) }
-                        td.actions { (action_buttons(&r.id, &r.status)) }
+                        td.actions { (action_buttons(r, archive_enabled)) }
                     }
                 }
             }
@@ -393,14 +397,29 @@ fn vm_table(rows: &[VmRow]) -> Markup {
     }
 }
 
-fn action_buttons(id: &str, status: &SandboxStatus) -> Markup {
-    let running = *status == SandboxStatus::Running;
+fn action_buttons(r: &VmRow, archive_enabled: bool) -> Markup {
+    let running = r.status == SandboxStatus::Running;
+    // Offer manual reap only for an idle, pooler-managed, running schema VM —
+    // archiving one with live sessions is refused server-side, so don't tempt it.
+    let can_reap = archive_enabled
+        && running
+        && r.pool_managed
+        && !r.archived
+        && r.schema.is_some()
+        && r.live_sessions.unwrap_or(0) == 0;
     html! {
         @if running {
-            form method="post" action={ "/vm/" (id) "/stop" } { button.stop { "stop" } }
-            form method="post" action={ "/vm/" (id) "/reboot" } { button { "reboot" } }
+            form method="post" action={ "/vm/" (r.id) "/stop" } { button.stop { "stop" } }
+            form method="post" action={ "/vm/" (r.id) "/reboot" } { button { "reboot" } }
         } @else {
-            form method="post" action={ "/vm/" (id) "/start" } { button.start { "start" } }
+            form method="post" action={ "/vm/" (r.id) "/start" } { button.start { "start" } }
+        }
+        @if can_reap {
+            form method="post" action={ "/vm/" (r.id) "/reap" } {
+                button.reap
+                    onclick="return confirm('Reap this VM to S3? The VM and its data disk will be deleted; the data is restored from S3 on the next connection.')"
+                    { "reap → S3" }
+            }
         }
     }
 }
@@ -461,6 +480,15 @@ fn sessions_cell(r: &VmRow) -> Markup {
             None => span.dim { "—" },
         }
     }
+}
+
+/// Status badge that accounts for the S3 eviction tier: an archived schema has
+/// no live sandbox, so its daemon status is meaningless — show "archived (S3)".
+fn status_badge_row(r: &VmRow) -> Markup {
+    if r.archived {
+        return html! { span.badge class="s-archived" { "archived (S3)" } };
+    }
+    status_badge(&r.status)
 }
 
 fn status_badge(status: &SandboxStatus) -> Markup {
@@ -576,6 +604,7 @@ td.dim, .dim { color:var(--muted); }
 .s-prov { background:var(--prov-bg); color:var(--prov-fg); }
 .s-failed { background:var(--fail-bg); color:var(--fail-fg); }
 .s-unknown { background:var(--stop-bg); color:var(--stop-fg); }
+.s-archived { background:var(--sess-bg); color:var(--sess-fg); }
 .badge.active { background:var(--sess-bg); color:var(--sess-fg); }
 td.actions { display:flex; gap:.35rem; }
 .actions form { display:inline; margin:0; }
@@ -584,6 +613,7 @@ button, .button-link { font:inherit; padding:.25rem .6rem; border:1px solid var(
 button:hover, .button-link:hover { border-color:var(--btn-hover); text-decoration:none; }
 button.stop { color:var(--err-fg); border-color:var(--err-border); }
 button.start { color:var(--ok-fg); border-color:var(--ok-border); }
+button.reap { color:var(--sess-fg); border-color:var(--sess-fg); }
 .banner { padding:.55rem .8rem; border-radius:6px; margin-bottom:1rem; border:1px solid; }
 .banner.ok { background:var(--ok-bg); border-color:var(--ok-border); color:var(--ok-fg); }
 .banner.err { background:var(--err-bg); border-color:var(--err-border); color:var(--err-fg); }

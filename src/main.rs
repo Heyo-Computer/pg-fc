@@ -10,6 +10,7 @@ mod config;
 mod dashboard;
 mod proxy;
 mod registry;
+mod s3;
 mod startup;
 mod store;
 mod tls;
@@ -64,6 +65,9 @@ async fn main() -> Result<()> {
     let dashboard_cfg = cfg.dashboard.clone();
     let registry = Arc::new(SchemaRegistry::new(cfg));
     registry.spawn_reaper();
+    // Slow, disk-reclaiming eviction tier: offload week-idle schemas to S3 and
+    // kill their VMs. No-op unless PG_VM_POOL_ARCHIVE_AFTER_SECS is configured.
+    registry.spawn_archiver();
 
     // Optional admin dashboard: enabled only when PG_VM_POOL_DASHBOARD_LISTEN is
     // set. Runs in its own task sharing the registry, so it never blocks the PG

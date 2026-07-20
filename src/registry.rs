@@ -1,20 +1,20 @@
 //! Schema -> VM registry. One entry per schema, created once and reused.
 //! A background reaper stops VMs that go idle (no connections) for too long.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use deadpool_postgres::Pool;
 use heyo_sdk::{P2pTunnel, Sandbox};
 use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::store::Store;
+use crate::store::{Store, StoreRecord};
 use crate::vm;
 
 /// Bound on the pre-stop CHECKPOINT the reaper issues before killing an idle
@@ -234,6 +234,11 @@ pub struct SchemaRegistry {
     // restarts, so a reconnect after a stop/reap/restart reattaches to the same
     // VM (by id) rather than creating a duplicate with a fresh, empty data disk.
     store: Store,
+    // Schemas whose VM is mid-archive (dump + kill in flight). A checkout for a
+    // schema in this set waits until it clears, then cold-starts — which
+    // restores from S3. Guards against a client bringing a VM back up while the
+    // archiver is dumping and killing it. Held for the whole archive operation.
+    archiving: StdMutex<HashSet<String>>,
 }
 
 impl SchemaRegistry {
@@ -243,6 +248,7 @@ impl SchemaRegistry {
             cfg,
             entries: Mutex::new(HashMap::new()),
             store,
+            archiving: StdMutex::new(HashSet::new()),
         }
     }
 
@@ -258,10 +264,16 @@ impl SchemaRegistry {
         self.cfg.idle_timeout
     }
 
+    /// Whether the S3 eviction tier is configured — gates the dashboard's manual
+    /// "reap to S3" control.
+    pub fn archive_enabled(&self) -> bool {
+        self.cfg.archive.is_some()
+    }
+
     /// Point-in-time view of every *warm* schema entry (VMs the pooler currently
     /// holds). Takes the same map lock the reaper/checkout use, but holds it only
     /// for a fast, await-free read — no meaningful contention. Stopped/reaped
-    /// schemas aren't warm; pair with [`Self::store_entries`] for those.
+    /// schemas aren't warm; pair with [`Self::store_records`] for those.
     pub async fn snapshot(&self) -> Vec<EntrySnapshot> {
         let map = self.entries.lock().await;
         map.iter()
@@ -281,11 +293,12 @@ impl SchemaRegistry {
             .collect()
     }
 
-    /// The durable `schema → sandbox-id` pairs the pooler has ever backed,
-    /// surviving eviction and restarts — used to recover the schema name for a
-    /// VM that's currently stopped (not warm).
-    pub fn store_entries(&self) -> Vec<(String, String)> {
-        self.store.entries()
+    /// The durable per-schema records the pooler has ever backed, surviving
+    /// eviction and restarts — used to recover the schema name for a VM that's
+    /// currently stopped (not warm) and to surface archived (killed) schemas
+    /// that no longer appear in the daemon's inventory at all.
+    pub fn store_records(&self) -> Vec<(String, StoreRecord)> {
+        self.store.records()
     }
 
     /// Live database stats for a warm, pooler-managed VM, read over the pooler's
@@ -357,7 +370,19 @@ impl SchemaRegistry {
     /// The returned guard keeps the VM off the reaper's radar until dropped.
     /// Concurrent callers for the same schema share one bring-up.
     pub async fn checkout(&self, schema: &str) -> Result<ConnGuard> {
+        // Refresh durable activity up front so the S3 eviction sweep sees this
+        // schema as recently used even long after its VM leaves the warm map
+        // (the in-memory `SchemaEntry::last_active` doesn't survive that).
+        self.store.touch(schema);
         loop {
+            // If this schema is mid-archive (dump + kill in flight), don't race
+            // the archiver by bringing the VM back up. Wait for it to clear; the
+            // subsequent cold start restores from S3.
+            if self.is_archiving(schema) {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+
             // Warm path: claim the entry under the map lock, which the reaper
             // also takes — so it can't evict this entry between its idle-check
             // and our claim. `touch()` is what does the claiming: it makes the
@@ -406,15 +431,34 @@ impl SchemaRegistry {
             let started = Instant::now();
             info!("schema {schema}: cold start, bringing up VM (or awaiting in-progress bring-up)");
             // Reattach to the VM we last used for this schema (survives eviction
-            // and process restarts), else find-or-create by name.
-            let known_id = self.store.get(schema);
+            // and process restarts), else find-or-create by name. If the schema
+            // was archived to S3 (VM killed), bring up a fresh VM and restore the
+            // dump into it before serving — the stored id is dead so we don't
+            // reattach.
+            let record = self.store.record(schema);
+            let known_id = record.as_ref().map(|r| r.sandbox_id.clone());
+            let restore = match record.as_ref() {
+                Some(r) if r.archived => match self.cfg.archive.as_ref() {
+                    Some(a) => Some(a.s3.clone()),
+                    None => bail!(
+                        "schema {schema} is archived to S3, but the eviction tier is not \
+                         configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_*) — \
+                         cannot restore it"
+                    ),
+                },
+                _ => None,
+            };
             match cell
-                .get_or_try_init(|| vm::ensure_vm(&self.cfg, schema, known_id.as_deref()))
+                .get_or_try_init(|| {
+                    vm::ensure_vm(&self.cfg, schema, known_id.as_deref(), restore.as_ref())
+                })
                 .await
             {
                 Ok(entry) => {
                     // Remember which VM now backs this schema so a later restart
-                    // reattaches to it instead of creating a duplicate.
+                    // reattaches to it instead of creating a duplicate. `put`
+                    // also clears any `archived` flag (this is a fresh VM id), so
+                    // a just-restored schema is durably marked live again.
                     self.store.put(schema, entry.sandbox.sandbox_id());
                     info!("schema {schema}: VM ready in {:?}", started.elapsed());
                     let Some(guard) =
@@ -531,6 +575,270 @@ impl SchemaRegistry {
             // Dropping the last Arc here tears down the tunnel + pool. Data on
             // the VM's /dev/vdb persists; a later connect restarts the VM.
         }
+    }
+
+    // ---- S3 eviction tier ---------------------------------------------------
+
+    /// Spawn the background archive sweep if the S3 eviction tier is configured.
+    /// This is the slow, disk-reclaiming counterpart to the idle reaper: it
+    /// offloads a long-idle schema's data to S3 and *kills* the VM (freeing its
+    /// data disk), where the reaper only stops it.
+    pub fn spawn_archiver(self: &Arc<Self>) {
+        let Some(archive) = self.cfg.archive.clone() else {
+            info!("S3 eviction disabled (PG_VM_POOL_ARCHIVE_AFTER_SECS unset/0)");
+            return;
+        };
+        info!(
+            "S3 eviction: offloading VMs idle >= {:?} to s3://{}/{} (sweep every {:?})",
+            archive.archive_after, archive.s3.bucket, archive.s3.prefix, archive.sweep_interval
+        );
+        let registry = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(archive.sweep_interval).await;
+                registry.sweep_archive(archive.archive_after).await;
+            }
+        });
+    }
+
+    /// One eviction pass: archive every non-keepalive schema untouched for at
+    /// least `threshold`, skipping any that is currently warm-and-busy.
+    async fn sweep_archive(&self, threshold: Duration) {
+        let now = now_unix();
+        let threshold_secs = threshold.as_secs();
+
+        // Live cross-check: a schema warm with active connections, or one whose
+        // in-memory idle clock is younger than the threshold, is not really cold
+        // even if its durable `last_active` drifted stale (one long-lived
+        // connection with no new checkouts). Refresh those and skip them.
+        let live: HashMap<String, (usize, u64)> = self
+            .snapshot()
+            .await
+            .into_iter()
+            .map(|e| (e.schema, (e.active, e.idle_secs)))
+            .collect();
+
+        let mut candidates: Vec<String> = Vec::new();
+        for (schema, rec) in self.store_records() {
+            match classify_candidate(
+                &rec,
+                self.cfg.is_keepalive(&schema),
+                now,
+                threshold_secs,
+                live.get(&schema).copied(),
+            ) {
+                SweepAction::Skip => {}
+                // Warm-and-busy but durably stale: keep its clock honest so it
+                // isn't re-flagged every sweep.
+                SweepAction::Refresh => self.store.touch(&schema),
+                SweepAction::Archive => candidates.push(schema),
+            }
+        }
+
+        if candidates.is_empty() {
+            return;
+        }
+        info!("S3 eviction sweep: {} candidate schema(s)", candidates.len());
+        for schema in candidates {
+            if let Err(e) = self.archive_schema(&schema).await {
+                warn!("archiving schema {schema} to S3 failed (will retry next sweep): {e:#}");
+            }
+        }
+    }
+
+    /// Offload one schema's database to S3 and kill its VM to reclaim the disk.
+    /// Also the target of the dashboard's manual "reap" button. Refuses if the
+    /// VM has live client sessions. Serializes against [`Self::checkout`] via the
+    /// `archiving` set so a client can't bring the VM back up mid-operation.
+    pub async fn archive_schema(&self, schema: &str) -> Result<()> {
+        let Some(archive) = self.cfg.archive.clone() else {
+            bail!("S3 eviction tier is not configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_*)");
+        };
+        if self.store.record(schema).map(|r| r.archived).unwrap_or(false) {
+            bail!("schema {schema} is already archived to S3");
+        }
+
+        // Claim the archiving slot; a Drop guard clears it on every exit path so
+        // checkouts stuck waiting are released even on error/panic.
+        let _guard = match ArchivingGuard::claim(&self.archiving, schema) {
+            Some(g) => g,
+            None => bail!("schema {schema} is already being archived"),
+        };
+
+        // Evict the warm entry under the map lock, refusing if it has live
+        // sessions. Because the `archiving` set was inserted *before* this lock,
+        // a checkout that slips in either grabbed the entry first (active > 0 →
+        // we refuse) or will see the set and wait.
+        {
+            let mut map = self.entries.lock().await;
+            if let Some(entry) = map.get(schema).and_then(|c| c.get()) {
+                let active = entry.active_count();
+                if active > 0 {
+                    bail!("schema {schema} has {active} live session(s); refusing to archive");
+                }
+            }
+            map.remove(schema);
+        }
+
+        // Bring the VM up ready for pg_dump (starts it if idle-stopped, reattaches
+        // by id if it's still the same VM), dump to S3, then mark archived and
+        // kill. Mark before kill: if we crash between them the data is safely in
+        // S3 and the store says "archived", so the next connect restores — the
+        // reverse order could lose the mapping to a killed VM.
+        let known_id = self.store.record(schema).map(|r| r.sandbox_id);
+        let entry = vm::ensure_vm(&self.cfg, schema, known_id.as_deref(), None)
+            .await
+            .with_context(|| format!("bringing up VM for schema {schema} to archive it"))?;
+
+        vm::dump_to_s3(&self.cfg, &entry.sandbox, schema, &archive.s3)
+            .await
+            .with_context(|| format!("dumping schema {schema} to S3"))?;
+
+        self.store.mark_archived(schema);
+        info!("schema {schema}: dumped to s3://{}/{}", archive.s3.bucket, archive.s3.object_key(schema));
+
+        if let Err(e) = entry.sandbox.kill().await {
+            // The dump is safe in S3 and the store is marked archived, so this
+            // only orphans a (stopped) VM + disk — undesirable but not data loss.
+            warn!("schema {schema}: archived to S3 but killing the VM failed (orphaned): {e:#}");
+        } else {
+            info!("schema {schema}: VM killed, disk reclaimed");
+        }
+        // Dropping `entry` tears down its pool/tunnel.
+        Ok(())
+    }
+
+    fn is_archiving(&self, schema: &str) -> bool {
+        self.archiving.lock().unwrap().contains(schema)
+    }
+}
+
+/// RAII claim on the `archiving` set: inserts on `claim`, removes on `Drop`, so
+/// a schema is never left stuck "archiving" if the operation errors or panics.
+struct ArchivingGuard<'a> {
+    set: &'a StdMutex<HashSet<String>>,
+    schema: String,
+}
+
+impl<'a> ArchivingGuard<'a> {
+    /// `Some` if this call inserted the schema; `None` if it was already present
+    /// (another archive is in flight).
+    fn claim(set: &'a StdMutex<HashSet<String>>, schema: &str) -> Option<Self> {
+        if set.lock().unwrap().insert(schema.to_string()) {
+            Some(Self {
+                set,
+                schema: schema.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for ArchivingGuard<'_> {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.schema);
+    }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// What the archive sweep should do with one schema.
+#[derive(Debug, PartialEq)]
+enum SweepAction {
+    /// Not a candidate (keepalive, already archived, or not idle long enough).
+    Skip,
+    /// Durably stale but actually live (warm with sessions, or a young in-memory
+    /// idle clock) — refresh its `last_active` and leave it running.
+    Refresh,
+    /// Genuinely cold: offload to S3 and kill the VM.
+    Archive,
+}
+
+/// Pure decision for one schema, factored out of [`SchemaRegistry::sweep_archive`]
+/// so the cross-check between durable and live state is testable. `live` is the
+/// schema's warm `(active_sessions, in_memory_idle_secs)` if it's in the map.
+fn classify_candidate(
+    rec: &StoreRecord,
+    keepalive: bool,
+    now: u64,
+    threshold_secs: u64,
+    live: Option<(usize, u64)>,
+) -> SweepAction {
+    if rec.archived || keepalive {
+        return SweepAction::Skip;
+    }
+    if now.saturating_sub(rec.last_active) < threshold_secs {
+        return SweepAction::Skip;
+    }
+    if let Some((active, idle_secs)) = live
+        && (active > 0 || idle_secs < threshold_secs)
+    {
+        return SweepAction::Refresh;
+    }
+    SweepAction::Archive
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+
+    fn rec(last_active: u64, archived: bool) -> StoreRecord {
+        StoreRecord {
+            sandbox_id: "sb-x".into(),
+            last_active,
+            archived,
+        }
+    }
+
+    #[test]
+    fn classify_candidate_covers_the_cross_check() {
+        let now = 1_000_000;
+        let week = 604_800;
+
+        // Cold and stopped (not in the warm map) → archive.
+        assert_eq!(
+            classify_candidate(&rec(now - week - 1, false), false, now, week, None),
+            SweepAction::Archive
+        );
+        // Not idle long enough → skip.
+        assert_eq!(
+            classify_candidate(&rec(now - 10, false), false, now, week, None),
+            SweepAction::Skip
+        );
+        // Already archived → skip (don't re-archive).
+        assert_eq!(
+            classify_candidate(&rec(now - week - 1, true), false, now, week, None),
+            SweepAction::Skip
+        );
+        // Keepalive schema → never archived, however stale.
+        assert_eq!(
+            classify_candidate(&rec(0, false), true, now, week, None),
+            SweepAction::Skip
+        );
+        // Durably stale but warm with a live session → refresh, don't archive
+        // (a long-lived single connection with no new checkouts).
+        assert_eq!(
+            classify_candidate(&rec(now - week - 1, false), false, now, week, Some((1, week + 5))),
+            SweepAction::Refresh
+        );
+        // Durably stale, warm, no sessions, but in-memory idle clock is young →
+        // refresh (it's genuinely been used recently).
+        assert_eq!(
+            classify_candidate(&rec(now - week - 1, false), false, now, week, Some((0, 30))),
+            SweepAction::Refresh
+        );
+        // Durably stale, warm, no sessions, and in-memory idle also past the
+        // threshold → archive.
+        assert_eq!(
+            classify_candidate(&rec(now - week - 1, false), false, now, week, Some((0, week + 5))),
+            SweepAction::Archive
+        );
     }
 }
 

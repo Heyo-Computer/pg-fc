@@ -25,6 +25,12 @@ axum = "0.8"
 maud = { version = "0.27", features = ["axum"] }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
+# S3 cold-storage tier: hand-rolled SigV4 query-string presigning so the guest
+# can stream pg_dump/pg_restore straight to/from S3 via curl, with the secret
+# key never leaving the pooler. Pure-Rust, tiny; avoids the aws-sdk-s3 tree.
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
 
 [dev-dependencies]
 serde_json = "1"

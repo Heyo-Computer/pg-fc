@@ -85,6 +85,30 @@ pub struct Config {
     /// Admin dashboard settings. `dashboard.is_none()` (the default) means the
     /// dashboard is disabled — it's enabled by setting `PG_VM_POOL_DASHBOARD_LISTEN`.
     pub dashboard: Option<DashboardConfig>,
+    /// S3 cold-storage (eviction) tier. `None` (the default) disables it. When
+    /// `Some`, a background sweep offloads any schema untouched for
+    /// [`ArchiveConfig::archive_after`] to S3 and kills its VM to reclaim disk;
+    /// the next connect restores it. Enabled by `PG_VM_POOL_ARCHIVE_AFTER_SECS`.
+    pub archive: Option<ArchiveConfig>,
+}
+
+/// Settings for the optional S3 eviction tier. Present (`Some`) only when
+/// `PG_VM_POOL_ARCHIVE_AFTER_SECS` is a positive number — that env var is the
+/// on/off switch. When on, the S3 bucket and credentials are required (a
+/// half-configured tier fails fast, mirroring the TLS/dashboard pairings).
+#[derive(Clone)]
+pub struct ArchiveConfig {
+    /// A non-keepalive schema untouched (no client connections) for at least
+    /// this long is dumped to S3 and its VM killed. This is the slow, disk-
+    /// reclaiming tier that sits *below* [`Config::idle_timeout`] (which only
+    /// stops the VM). Env `PG_VM_POOL_ARCHIVE_AFTER_SECS`.
+    pub archive_after: Duration,
+    /// How often the archive sweep scans for eviction candidates. Env
+    /// `PG_VM_POOL_ARCHIVE_SWEEP_SECS` (default 3600).
+    pub sweep_interval: Duration,
+    /// S3 addressing + credentials the pooler uses to presign the guest's
+    /// dump upload / restore download.
+    pub s3: crate::s3::S3Config,
 }
 
 /// Settings for the optional server-side-rendered admin dashboard. Present
@@ -142,6 +166,14 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_POOLER_LOG",
     "PG_VM_POOL_HEYVMD_LOG",
     "PG_VM_POOL_DASHBOARD_LOG_LINES",
+    "PG_VM_POOL_ARCHIVE_AFTER_SECS",
+    "PG_VM_POOL_ARCHIVE_SWEEP_SECS",
+    "PG_VM_POOL_S3_BUCKET",
+    "PG_VM_POOL_S3_PREFIX",
+    "PG_VM_POOL_S3_REGION",
+    "PG_VM_POOL_S3_ENDPOINT",
+    "PG_VM_POOL_S3_ACCESS_KEY_ID",
+    "PG_VM_POOL_S3_SECRET_ACCESS_KEY",
 ];
 
 impl Config {
@@ -236,6 +268,7 @@ impl Config {
             .collect();
 
         let dashboard = DashboardConfig::from_env()?;
+        let archive = ArchiveConfig::from_env()?;
 
         Ok(Self {
             listen_addr,
@@ -254,6 +287,7 @@ impl Config {
             tls_cert,
             tls_key,
             dashboard,
+            archive,
         })
     }
 }
@@ -308,6 +342,67 @@ impl DashboardConfig {
             pooler_log,
             heyvmd_log,
             log_lines,
+        }))
+    }
+}
+
+impl ArchiveConfig {
+    /// Build the S3 eviction config from the environment. `Ok(None)` when
+    /// `PG_VM_POOL_ARCHIVE_AFTER_SECS` is unset or `0` (tier disabled). When the
+    /// tier is on, the bucket and both credentials are required — a partial
+    /// config is a mistake, so it fails fast rather than silently never
+    /// archiving. Credentials fall back to the standard `AWS_ACCESS_KEY_ID` /
+    /// `AWS_SECRET_ACCESS_KEY` when the namespaced vars are unset.
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        let archive_after = match std::env::var("PG_VM_POOL_ARCHIVE_AFTER_SECS") {
+            Ok(v) => match v.trim().parse::<u64>() {
+                Ok(0) | Err(_) => return Ok(None),
+                Ok(secs) => Duration::from_secs(secs),
+            },
+            Err(_) => return Ok(None),
+        };
+        let sweep_interval = std::env::var("PG_VM_POOL_ARCHIVE_SWEEP_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(3600));
+
+        let nonempty = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
+        let Some(bucket) = nonempty("PG_VM_POOL_S3_BUCKET") else {
+            anyhow::bail!(
+                "PG_VM_POOL_ARCHIVE_AFTER_SECS is set but PG_VM_POOL_S3_BUCKET is not — \
+                 the S3 eviction tier needs a bucket"
+            );
+        };
+        let access_key_id = nonempty("PG_VM_POOL_S3_ACCESS_KEY_ID")
+            .or_else(|| nonempty("AWS_ACCESS_KEY_ID"));
+        let secret_access_key = nonempty("PG_VM_POOL_S3_SECRET_ACCESS_KEY")
+            .or_else(|| nonempty("AWS_SECRET_ACCESS_KEY"));
+        let (Some(access_key_id), Some(secret_access_key)) = (access_key_id, secret_access_key)
+        else {
+            anyhow::bail!(
+                "PG_VM_POOL_ARCHIVE_AFTER_SECS is set but S3 credentials are missing — \
+                 set PG_VM_POOL_S3_ACCESS_KEY_ID/PG_VM_POOL_S3_SECRET_ACCESS_KEY (or the \
+                 standard AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)"
+            );
+        };
+        let region = nonempty("PG_VM_POOL_S3_REGION").unwrap_or_else(|| "us-east-1".to_string());
+        let prefix = std::env::var("PG_VM_POOL_S3_PREFIX")
+            .unwrap_or_else(|_| "pg-vm-pool/".to_string());
+        let endpoint = nonempty("PG_VM_POOL_S3_ENDPOINT");
+
+        Ok(Some(Self {
+            archive_after,
+            sweep_interval,
+            s3: crate::s3::S3Config {
+                bucket,
+                prefix,
+                region,
+                endpoint,
+                access_key_id,
+                secret_access_key,
+            },
         }))
     }
 }

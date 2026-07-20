@@ -5,17 +5,20 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result, bail};
 use deadpool_postgres::{Config as PgConfig, Pool, Runtime};
 use heyo_sdk::{
-    DEFAULT_LOCAL_BASE_URL, HeyoClientOptions, HeyoError, P2pTunnel, Sandbox, SandboxCreateOptions,
-    SandboxDriver,
+    CommandRunOptions, DEFAULT_LOCAL_BASE_URL, HeyoClientOptions, HeyoError, P2pTunnel, Sandbox,
+    SandboxCreateOptions, SandboxDriver,
 };
 use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::registry::SchemaEntry;
+use crate::s3::S3Config;
 
 const VM_PG_PORT: u16 = 5432;
 
@@ -50,10 +53,15 @@ pub async fn ensure_vm(
     cfg: &Config,
     schema: &str,
     known_id: Option<&str>,
+    restore: Option<&S3Config>,
 ) -> Result<Arc<SchemaEntry>> {
     let name = format!("pg-{schema}");
     let keepalive = cfg.is_keepalive(schema);
 
+    // An archived schema's VM was killed, so its stored id is dead — never try
+    // to reattach; force the create-fresh path so the restore lands on a clean
+    // data disk rather than (racily) on top of a stale one.
+    let known_id = if restore.is_some() { None } else { known_id };
     let sandbox = resolve_sandbox(cfg, &name, keepalive, known_id).await?;
 
     // Pin keep-alive schemas idempotently: TTL 0 = never auto-stopped. This
@@ -69,11 +77,129 @@ pub async fn ensure_vm(
 
     let (target, tunnel, pool) = ready_pg(cfg, &sandbox, &name).await?;
     ensure_database(&pool, schema).await?;
+
+    // Restore from S3 into the freshly-created, empty database before the entry
+    // is handed to any client. A failure here must abort the bring-up: serving
+    // an empty DB in place of a restored one would look like silent data loss.
+    if let Some(s3) = restore {
+        restore_from_s3(cfg, &sandbox, schema, s3)
+            .await
+            .with_context(|| format!("restoring schema {schema} from S3"))?;
+    }
+
     let slots = client_slot_budget(&pool, &name).await;
 
     Ok(Arc::new(SchemaEntry::new(
         sandbox, target, tunnel, pool, keepalive, slots,
     )))
+}
+
+/// Validity window for a presigned S3 URL handed to the guest. Generous enough
+/// to cover a slow upload/download of a large dump, short enough that a URL that
+/// leaks (e.g. into a guest shell-history) expires quickly.
+const PRESIGN_TTL: Duration = Duration::from_secs(3600);
+
+/// Cap on the guest-side dump/restore exec. A one-workbook database dumps and
+/// uploads in seconds-to-minutes; this bound only stops a wedged transfer from
+/// hanging the sweep forever.
+const ARCHIVE_EXEC_TIMEOUT: Duration = Duration::from_secs(1800);
+
+/// Fixed in-guest scratch paths for the dump. One VM backs exactly one schema,
+/// so a constant name is unambiguous — and unlike a schema-derived name it can't
+/// be broken by a schema containing `/` or a quote.
+const DUMP_PATH: &str = "/workspace/_archive.dump";
+const RESTORE_PATH: &str = "/workspace/_restore.dump";
+
+/// Dump `schema`'s database to S3 using the guest's own `pg_dump` + `curl`
+/// against a pooler-presigned PUT URL. The dump bytes stream straight from the
+/// guest to S3 and never transit the pooler. Dumps to a file first (not a pipe)
+/// so `curl -T` sends a `Content-Length` — S3 rejects a chunked PUT.
+pub async fn dump_to_s3(cfg: &Config, sandbox: &Sandbox, schema: &str, s3: &S3Config) -> Result<()> {
+    let key = s3.object_key(schema);
+    let url = s3.presign_put(&key, PRESIGN_TTL);
+    let db = shell_squote(schema);
+    let user = shell_squote(&cfg.pg_user);
+    // `set -e`: any step failing aborts the script with a non-zero exit, which
+    // `run_guest` turns into an error — so a failed pg_dump never uploads a
+    // truncated object and reports success.
+    let cmd = format!(
+        "set -e; \
+         pg_dump -h 127.0.0.1 -U {user} -Fc -d {db} -f {DUMP_PATH}; \
+         curl -fsS -T {DUMP_PATH} '{url}'; \
+         rm -f {DUMP_PATH}"
+    );
+    run_guest(cfg, sandbox, &cmd, "pg_dump→S3 upload").await
+}
+
+/// Restore `schema`'s database from S3 into the (already-created, empty) target
+/// database, using the guest's `curl` + `pg_restore` against a presigned GET.
+async fn restore_from_s3(cfg: &Config, sandbox: &Sandbox, schema: &str, s3: &S3Config) -> Result<()> {
+    let key = s3.object_key(schema);
+    let url = s3.presign_get(&key, PRESIGN_TTL);
+    let db = shell_squote(schema);
+    let user = shell_squote(&cfg.pg_user);
+    let cmd = format!(
+        "set -e; \
+         curl -fsS '{url}' -o {RESTORE_PATH}; \
+         pg_restore -h 127.0.0.1 -U {user} --no-owner --no-privileges -d {db} {RESTORE_PATH}; \
+         rm -f {RESTORE_PATH}"
+    );
+    run_guest(cfg, sandbox, &cmd, "S3→pg_restore").await
+}
+
+/// Run one guest shell command, passing the backend Postgres password (when
+/// configured) via `PGPASSWORD` in the exec environment rather than on the
+/// command line — so it never lands in the guest's process list. Fails on a
+/// non-zero exit, surfacing a bounded slice of the guest's output.
+async fn run_guest(cfg: &Config, sandbox: &Sandbox, command: &str, what: &str) -> Result<()> {
+    let env = cfg.pg_password.as_ref().map(|pw| {
+        let mut m = HashMap::new();
+        m.insert("PGPASSWORD".to_string(), pw.clone());
+        m
+    });
+    let opts = CommandRunOptions {
+        timeout: Some(ARCHIVE_EXEC_TIMEOUT),
+        env,
+        ..Default::default()
+    };
+    let res = sandbox
+        .commands()
+        .run(command, opts)
+        .await
+        .with_context(|| format!("{what}: guest exec failed"))?;
+    if res.exit_code != 0 {
+        let detail = if res.output.trim().is_empty() {
+            res.stderr.trim()
+        } else {
+            res.output.trim()
+        };
+        bail!(
+            "{what} failed in guest (exit {}): {}",
+            res.exit_code,
+            truncate(detail, 800)
+        );
+    }
+    Ok(())
+}
+
+/// Single-quote a string for POSIX `sh`, escaping embedded single quotes as
+/// `'\''`. Schema/user names are already validated (no control chars) upstream;
+/// this is defense in depth so a name with a space or quote can't break out.
+fn shell_squote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Trim guest output to `max` bytes (on a char boundary) so an error log can't
+/// dump a whole dump-tool backtrace.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 /// How many client connections this VM's Postgres can actually take, read from

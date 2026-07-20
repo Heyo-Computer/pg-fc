@@ -168,6 +168,41 @@ pub async fn action_resize(Path(id): Path<String>, Form(form): Form<ResizeForm>)
     redirect(&id, result, &format!("resized to {}", size.as_str()))
 }
 
+/// Manually reap a pool-managed VM to S3: dump its database and kill the VM to
+/// reclaim its disk. The next client connection restores it transparently. The
+/// dump+kill can take minutes for a large database, so it runs in the background
+/// and this redirects immediately — watch the pooler log (and the VM's status,
+/// which flips to "Archived (S3)") for the outcome.
+pub async fn action_reap(State(st): State<DashState>, Path(id): Path<String>) -> Redirect {
+    if !st.registry.archive_enabled() {
+        return Redirect::to(&format!(
+            "/vm/{id}?err={}",
+            qenc("S3 eviction tier is not configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_*)")
+        ));
+    }
+    let schema = match model::find_row(&st, &id).await {
+        Ok(Some(row)) => row.schema,
+        Ok(None) => None,
+        Err(e) => return Redirect::to(&format!("/vm/{id}?err={}", qenc(&e.to_string()))),
+    };
+    let Some(schema) = schema else {
+        return Redirect::to(&format!(
+            "/vm/{id}?err={}",
+            qenc("not a pooler-managed schema VM — nothing to archive")
+        ));
+    };
+    let registry = st.registry.clone();
+    tokio::spawn(async move {
+        if let Err(e) = registry.archive_schema(&schema).await {
+            tracing::warn!("manual reap of schema {schema} to S3 failed: {e:#}");
+        }
+    });
+    Redirect::to(&format!(
+        "/vm/{id}?msg={}",
+        qenc("reap to S3 started; watch the pooler log")
+    ))
+}
+
 /// Minimal query-value encoder: keep readable chars, map space→`+`, drop the
 /// rest, and cap length. `+` decodes back to a space via `Query`/serde_urlencoded.
 fn qenc(s: &str) -> String {
