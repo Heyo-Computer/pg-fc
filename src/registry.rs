@@ -678,26 +678,47 @@ impl SchemaRegistry {
             .collect();
 
         let mut candidates: Vec<String> = Vec::new();
+        let mut total = 0usize;
+        let (mut refreshed, mut keepalive, mut already, mut not_idle) = (0usize, 0usize, 0usize, 0usize);
         for (schema, rec) in self.store_records() {
-            match classify_candidate(
-                &rec,
-                self.cfg.is_keepalive(&schema),
-                now,
-                threshold_secs,
-                live.get(&schema).copied(),
-            ) {
-                SweepAction::Skip => {}
+            total += 1;
+            let ka = self.cfg.is_keepalive(&schema);
+            match classify_candidate(&rec, ka, now, threshold_secs, live.get(&schema).copied()) {
+                SweepAction::Skip => {
+                    // classify_candidate skips for exactly these reasons; tally
+                    // them so a sweep that archives nothing still says why.
+                    if rec.archived {
+                        already += 1;
+                    } else if ka {
+                        keepalive += 1;
+                    } else {
+                        not_idle += 1;
+                    }
+                }
                 // Warm-and-busy but durably stale: keep its clock honest so it
                 // isn't re-flagged every sweep.
-                SweepAction::Refresh => self.store.touch(&schema),
+                SweepAction::Refresh => {
+                    refreshed += 1;
+                    self.store.touch(&schema);
+                }
                 SweepAction::Archive => candidates.push(schema),
             }
         }
 
+        // Always log the evaluation, so a sweep that archives nothing is
+        // explained ("all skipped as not-idle") rather than silent — the manual
+        // "sweep now" button and the periodic pass both surface here.
+        info!(
+            "S3 eviction sweep: evaluated {total} schema(s) — {} candidate(s), \
+             {refreshed} refreshed (warm), skipped {} ({keepalive} keepalive, \
+             {already} already archived, {not_idle} idle < {threshold_secs}s)",
+            candidates.len(),
+            keepalive + already + not_idle,
+        );
+
         if candidates.is_empty() {
             return 0;
         }
-        info!("S3 eviction sweep: {} candidate schema(s)", candidates.len());
         let mut archived = 0usize;
         for schema in candidates {
             match self.archive_schema(&schema).await {

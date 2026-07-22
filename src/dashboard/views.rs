@@ -279,16 +279,19 @@ fn vm_history_chart(samples: &[Sample], current: usize) -> Markup {
                 // Horizontal gridlines + y-axis labels.
                 @for t in &ticks {
                     @let gy = y(*t);
-                    line.chart-grid x1=(fmt(PAD_L)) y1=(fmt(gy)) x2=(fmt(W - PAD_R)) y2=(fmt(gy));
+                    // Empty `{}` (not `;`) so maud emits a closing tag: an SVG
+                    // `<line>` is not an HTML void element, and a bare `<line>`
+                    // would swallow every following shape as an unrendered child.
+                    line.chart-grid x1=(fmt(PAD_L)) y1=(fmt(gy)) x2=(fmt(W - PAD_R)) y2=(fmt(gy)) {}
                     text.chart-ylabel x=(fmt(PAD_L - 5.0)) y=(fmt(gy + 3.0)) text-anchor="end" {
                         (t)
                     }
                 }
                 // Filled area under the line, then the line itself.
-                polygon.chart-area points=(area_pts);
-                polyline.chart-line points=(line_pts);
+                polygon.chart-area points=(area_pts) {}
+                polyline.chart-line points=(line_pts) {}
                 // Marker + value at the latest sample.
-                circle.chart-dot cx=(fmt(lx)) cy=(fmt(ly)) r="3";
+                circle.chart-dot cx=(fmt(lx)) cy=(fmt(ly)) r="3" {}
                 text.chart-now x=(fmt(lx)) y=(fmt((ly - 6.0).max(10.0))) text-anchor="end" {
                     (last.live)
                 }
@@ -1088,6 +1091,12 @@ mod tests {
         assert!(many.matches(',').count() >= 5, "one point per sample");
         assert!(many.contains("5 samples"));
         assert!(many.contains("now 4 running"));
+        // SVG shapes must be explicitly closed. A bare `<line>`/`<polyline>`
+        // (maud void syntax) nests every following shape inside it as an
+        // unrendered child, so the chart draws nothing — regression guard.
+        assert!(many.contains("</polyline>"), "polyline must be closed: {many}");
+        assert!(many.contains("</line>"), "gridlines must be closed");
+        assert!(many.contains("</polygon>"), "area must be closed");
     }
 
     #[test]
