@@ -41,32 +41,40 @@ if [ "$(id -u)" != 0 ]; then
     echo "warning: not root — dry-run in-use detection may be incomplete" >&2
 fi
 [ -d "$RUN_DIR" ] || die "run dir not found: $RUN_DIR"
-for tool in losetup mount umount fstrim e2fsck readlink find du numfmt; do
+for tool in losetup mount umount fstrim e2fsck find stat du numfmt; do
     command -v "$tool" >/dev/null || die "missing required tool: $tool"
 done
 
-# Point-in-time set of every file currently held open by any process. A live
-# Firecracker keeps its data disk open as a plain fd, so it appears under
-# /proc/<pid>/fd — no fuser/lsof needed. Built once (a single `find` over all
-# fds) instead of re-scanning /proc per disk, which is O(disks x fds) and does
-# not finish on a busy host. Root sees every process's fds; without it some are
-# unreadable and silently skipped (hence the not-root warning above).
+# Point-in-time set of every file held open by any process, keyed by
+# device:inode. A live Firecracker keeps its data disk open as a plain fd under
+# /proc/<pid>/fd — but Firecracker usually runs under *jailer*, which chroots the
+# VM, so the fd's path is relative to that chroot and will NOT equal the host
+# path. Matching by path therefore silently misses running VMs and trims them
+# (corrupting a disk the guest has mounted RW). device:inode is the same file
+# object regardless of chroot, bind mount, or mount namespace, so it is the
+# safe identity to compare.
 #
-# It's a snapshot, so a VM that *starts* mid-run won't be seen — run during low
-# traffic. The blast radius of a miss is one disk, and the loop mount would still
-# have to win a race with a booting guest for it to matter.
-declare -A OPEN_FILES=()
+# Built once (a single `find | stat` over all fds) rather than re-scanning /proc
+# per disk, which is O(disks x fds) and does not finish on a busy host. Root sees
+# every process's fds; without it some are unreadable and silently skipped (hence
+# the not-root warning above).
+#
+# Still a snapshot: a VM that *starts* mid-run won't be seen — run during low
+# traffic. The blast radius of a miss is one disk.
+declare -A OPEN_INODES=()
 snapshot_open_files() {
-    local target
-    while IFS= read -r target; do
-        [ -n "$target" ] && OPEN_FILES["$target"]=1
-    done < <(find /proc/[0-9]*/fd -maxdepth 1 -type l -printf '%l\n' 2>/dev/null)
+    local key
+    while IFS= read -r key; do
+        [ -n "$key" ] && OPEN_INODES["$key"]=1
+    done < <(find /proc/[0-9]*/fd -maxdepth 1 -type l -exec stat -L -c '%d:%i' {} + 2>/dev/null)
 }
 
+# In use if some process holds this exact file (device:inode) open. Fails closed:
+# if the disk can't be stat'd we treat it as in use and skip it.
 disk_in_use() {
-    local real
-    real=$(readlink -f "$1" 2>/dev/null) || real="$1"
-    [ -n "${OPEN_FILES[$real]:-}" ]
+    local key
+    key=$(stat -c '%d:%i' "$1" 2>/dev/null) || return 0
+    [ -n "${OPEN_INODES[$key]:-}" ]
 }
 
 shopt -s nullglob
