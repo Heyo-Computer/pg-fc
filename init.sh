@@ -38,6 +38,25 @@ mount -t devtmpfs devtmpfs /dev       2>/dev/null || true
 mount -t tmpfs    tmpfs    /run       2>/dev/null || true
 mount -t tmpfs    tmpfs    /tmp       2>/dev/null || true
 
+# --- temp-file scratch on tmpfs (RAM) ----------------------------------------
+# Postgres spills large sorts/hashes/CTEs/index-builds to temp files. On the
+# persistent data disk those blocks are stranded forever — the guest issues no
+# discard on that volume — so one big query permanently bloats the sparse host
+# disk toward its cap, and only an offline fstrim/reap gets it back. Put temp
+# files on a RAM tmpfs instead (linked in below, once PGDATA exists): they never
+# touch the persistent disk, and spill I/O is faster. `size=` is a hard cap and a
+# *ceiling, not a reservation* — an empty tmpfs uses no RAM, it only grows with
+# actual spill — so a runaway query hits ENOSPC (or temp_file_limit first) and
+# errors, rather than swapping or OOMing the VM. Sized as a share of RAM; ample
+# on a large VM, and temp_file_limit (below) bounds per-session use under it.
+PGTMP=/run/pgsql_tmp
+mkdir -p "$PGTMP"
+if mount -t tmpfs -o size=50%,mode=0700,nosuid,nodev tmpfs "$PGTMP" 2>/dev/null; then
+    chown postgres:postgres "$PGTMP"
+else
+    echo "[init] WARNING: tmpfs mount for $PGTMP failed; temp files will use the data disk"
+fi
+
 # Pull cmdline overrides (pgdata_dev=...) into the environment if Firecracker
 # passed them as boot args. /proc must be mounted first (done above).
 for arg in $(cat /proc/cmdline); do
@@ -54,7 +73,13 @@ if [ -b "$DATA_DEV" ]; then
         mkfs.ext4 -q -L pgdata "$DATA_DEV"
     fi
     echo "[init] mounting $DATA_DEV at $WORKSPACE"
-    mount "$DATA_DEV" "$WORKSPACE"
+    # `discard`: issue TRIM inline as ext4 frees blocks (recycled WAL, dropped
+    # relations, vacuumed pages) so they're returned to the sparse host file
+    # instead of ratcheting the on-disk footprint toward the provisioned cap. A
+    # no-op if the virtio-blk device doesn't advertise discard (harmless), so
+    # it's safe to set unconditionally; where the drive *does* pass TRIM through,
+    # the data disk now self-reclaims live instead of only via offline fstrim.
+    mount -o discard "$DATA_DEV" "$WORKSPACE"
 else
     # No dedicated volume attached — fall back to the rootfs so the VM still
     # boots (useful for smoke tests). Data won't persist across reboots.
@@ -256,11 +281,21 @@ if [ -b "$DATA_DEV" ]; then
     max_wal_mb=$((disk_mb / 8))
     [ "$max_wal_mb" -lt 512 ] && max_wal_mb=512
     [ "$max_wal_mb" -gt 4096 ] && max_wal_mb=4096
-    # Cap per-process spill files: a runaway sort filling the disk is a PANIC
-    # (whole-cluster crash), while hitting this limit only errors that query.
-    # Temp *tables* don't count against this limit — they're ordinary relation
-    # files, budgeted in the arithmetic above.
+    # Cap per-session spill: a runaway sort exhausting temp space only errors
+    # that query, never the whole cluster. Temp *tables* don't count against this
+    # — they're ordinary relation files, budgeted in the arithmetic above.
+    #
+    # Temp files now live on the tmpfs scratch (see the top of this script), so
+    # this ceiling bounds per-session *RAM* rather than persistent disk; it must
+    # stay under the tmpfs size cap so one session can't fill the tmpfs and starve
+    # others. Clamp like max_wal_size: an unbounded disk/4 (12.5GB on a 50GB
+    # volume) is far too much RAM to let a single query pin. 4GB still allows big
+    # spills; the 1GB floor keeps small VMs usable. (If the tmpfs mount ever fails
+    # and temp falls back to the data disk, this same bound also caps the on-disk
+    # strand, so it's the right guard either way.)
     temp_limit_mb=$((disk_mb / 4))
+    [ "$temp_limit_mb" -lt 1024 ] && temp_limit_mb=1024
+    [ "$temp_limit_mb" -gt 4096 ] && temp_limit_mb=4096
 fi
 
 cat > "$PGDATA/heyvm-tuning.conf" <<EOF
@@ -378,6 +413,23 @@ sync
 # ships is gone and must be recreated each boot, owned by postgres.
 mkdir -p /var/run/postgresql
 chown postgres:postgres /var/run/postgresql
+
+# Route Postgres's default temp-file directory (base/pgsql_tmp) at the tmpfs
+# scratch, so spills never land on the persistent disk. The tmpfs is volatile,
+# so this is recreated every boot; Postgres only ever writes throwaway spill
+# files here and clears it on startup, so no data is at risk. Only act when the
+# tmpfs actually mounted and the target is a plain dir / stale link / absent —
+# never clobber anything unexpected. Falls back silently to on-disk temp files.
+if mountpoint -q "$PGTMP" 2>/dev/null && [ -d "$PGDATA/base" ]; then
+    TMPLINK="$PGDATA/base/pgsql_tmp"
+    if [ -L "$TMPLINK" ] || [ -d "$TMPLINK" ] || [ ! -e "$TMPLINK" ]; then
+        rm -rf "$TMPLINK"
+        if ln -s "$PGTMP" "$TMPLINK"; then
+            chown -h postgres:postgres "$TMPLINK"
+            echo "[init] temp files -> tmpfs ($PGTMP)"
+        fi
+    fi
+fi
 
 echo "[init] starting postgres"
 # Run Postgres as a background child rather than `exec`-ing it as PID 1. The
