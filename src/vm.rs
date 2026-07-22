@@ -138,6 +138,18 @@ const ARCHIVE_MAX_PROBE_FAILURES: u32 = 3;
 /// a brief stall — before we conclude the guest is gone.
 const UNWITNESSED_MAX_PROBE_FAILURES: u32 = 10;
 
+/// How long the pooler keeps trying to see the object after the guest says it
+/// finished uploading. A completed PUT is visible immediately (S3 is
+/// read-after-write consistent for new objects), so this only covers a HEAD or
+/// two of transient trouble; past it, the disagreement is structural and waiting
+/// out [`ARCHIVE_DEADLINE`] would only delay the same error.
+const ARCHIVE_CONFIRM_GRACE: Duration = Duration::from_secs(60);
+
+/// Attempts at the pre-dump HEAD. It has to succeed for the dump to be
+/// verifiable at all, so a transient blip shouldn't cost a reap — but a
+/// persistent failure must, and loudly.
+const BASELINE_HEAD_ATTEMPTS: u32 = 3;
+
 /// Fixed in-guest scratch paths for the dump. One VM backs exactly one schema,
 /// so a constant name is unambiguous — and unlike a schema-derived name it can't
 /// be broken by a schema containing `/` or a quote.
@@ -233,8 +245,6 @@ pub async fn dump_to_s3(
     s3: &S3Config,
 ) -> Result<()> {
     let key = s3.object_key(schema);
-    let url = s3.presign_put(&key, PRESIGN_TTL);
-    let resolve = s3_resolve_flag(s3).await;
     let db = shell_squote(schema);
     let user = shell_squote(&cfg.pg_user);
 
@@ -242,22 +252,20 @@ pub async fn dump_to_s3(
         .build()
         .context("building HTTP client for S3 HEAD")?;
 
-    // What's at this key *before* the dump. A schema's archive key is stable, so
-    // the previous archive already sits there — presence alone is no evidence,
+    // What's at this key *before* the dump — the reference point that makes
+    // "the object is there" mean something. A schema's archive key is stable, so
+    // the previous archive already sits there; presence alone is no evidence,
     // and mistaking it for this run's upload would report success for a dump
     // that never happened and then reclaim the live disk.
-    let baseline = match s3.head_object(&http, &key, ARCHIVE_HEAD_TIMEOUT).await {
-        Ok(id) => Baseline::Known(id),
-        Err(e) => {
-            warn!(
-                "schema {schema}: pre-dump HEAD of s3://{}/{key} failed ({e:#}); \
-                 cannot tell a fresh archive from the previous one, so this dump \
-                 must be confirmed by the guest instead",
-                s3.bucket
-            );
-            Baseline::Unknown
-        }
-    };
+    //
+    // This runs before anything is presigned, because it is also where a
+    // wrong-region bucket gets discovered and corrected — see
+    // `S3Config::head_object`. Signing the guest's PUT first would hand it a URL
+    // for the wrong host.
+    let baseline = baseline_head(&http, s3, &key, schema).await?;
+
+    let url = s3.presign_put(&key, PRESIGN_TTL);
+    let resolve = s3_resolve_flag(s3).await;
 
     ARCHIVE_JOB
         .launch(
@@ -268,19 +276,47 @@ pub async fn dump_to_s3(
         )
         .await?;
 
-    await_archive(cfg, sandbox, schema, s3, &http, &key, &baseline).await
+    await_archive(cfg, sandbox, schema, s3, &http, &key, baseline.as_ref()).await
 }
 
-/// What was stored at the archive key before this dump started — the reference
-/// point that makes "the object is there" mean something.
-enum Baseline {
-    /// The pre-dump HEAD succeeded: this is what was there (`None` = nothing).
-    /// An object differing from this is proof that *this* dump landed.
-    Known(Option<crate::s3::ObjectId>),
-    /// The pre-dump HEAD failed, so a leftover archive from a previous run is
-    /// indistinguishable from a fresh one. S3 presence must not be read as
-    /// success here — only the guest can confirm this dump.
-    Unknown,
+/// Read what is at the archive key before dumping, retrying a few times.
+///
+/// Failing here aborts the dump before any work is done, which is the point: the
+/// caller reclaims the source disk when we report success, and success is only
+/// meaningful against this baseline. A pooler that cannot read the bucket cannot
+/// establish that any dump landed, so it must not archive into it — the VM
+/// simply stays up and the next reap tries again.
+async fn baseline_head(
+    http: &reqwest::Client,
+    s3: &S3Config,
+    key: &str,
+    schema: &str,
+) -> Result<Option<crate::s3::ObjectId>> {
+    let mut last = None;
+    for attempt in 1..=BASELINE_HEAD_ATTEMPTS {
+        match s3.head_object(http, key, ARCHIVE_HEAD_TIMEOUT).await {
+            Ok(id) => return Ok(id),
+            Err(e) => {
+                warn!(
+                    "schema {schema}: pre-dump HEAD of s3://{}/{key} failed \
+                     (attempt {attempt}/{BASELINE_HEAD_ATTEMPTS}): {e:#}",
+                    s3.bucket
+                );
+                last = Some(e);
+            }
+        }
+        if attempt < BASELINE_HEAD_ATTEMPTS {
+            sleep(ARCHIVE_POLL_INTERVAL).await;
+        }
+    }
+    Err(last.expect("at least one attempt ran")).with_context(|| {
+        format!(
+            "schema {schema}: cannot read s3://{}/{key}, so no dump into it could be \
+             verified; refusing to archive (the source VM is reclaimed on success, \
+             so an unverifiable archive is a lost workbook)",
+            s3.bucket
+        )
+    })
 }
 
 /// The dump job body, planted as a *file* rather than run as `sh -c '…'`, so
@@ -293,12 +329,36 @@ fn archive_job_body(user: &str, db: &str, resolve: &str, url: &str) -> String {
     format!(
         "ec=0\n\
          if pg_dump -h 127.0.0.1 -U {user} -Fc -d {db} -f {DUMP_PATH}; then\n\
-         \tcurl -fsS {resolve} -T {DUMP_PATH} \"{url}\" || ec=$?\n\
+         \tcode=$(curl -sS {resolve} -T {DUMP_PATH} -o /dev/null -w '%{{http_code}}' \"{url}\") || ec=$?\n\
+         {}\
          else\n\
          \tec=$?\n\
          fi\n\
          rm -f {DUMP_PATH}\n\
-         printf %s \"$ec\" > {done}.tmp && mv {done}.tmp {done}\n"
+         printf %s \"$ec\" > {done}.tmp && mv {done}.tmp {done}\n",
+        require_2xx("upload")
+    )
+}
+
+/// Fail the job unless S3 answered the transfer with a 2xx.
+///
+/// `curl -f` is not enough on its own: `--fail` only trips on 4xx/5xx, so a
+/// **3xx** — notably the `301 Moved Permanently` S3 returns for a bucket in
+/// another region — exits 0 with nothing transferred. That made a dump that
+/// uploaded no bytes report success, and the caller then reclaimed the disk it
+/// had just "archived". So the status code is checked explicitly, and anything
+/// that is not 2xx is a failed job.
+///
+/// A curl-level failure (`ec` already non-zero) keeps its own exit code; only an
+/// otherwise-clean run with a bad status is attributed to 22, curl's own
+/// "HTTP error returned". `$code` is empty when curl died before a response.
+fn require_2xx(what: &str) -> String {
+    format!(
+        "\tcase \"$code\" in\n\
+         \t2??) ;;\n\
+         \t*) echo \"{what} rejected by S3: HTTP $code\" >&2; \
+         if [ \"$ec\" = 0 ]; then ec=22; fi ;;\n\
+         \tesac\n"
     )
 }
 
@@ -310,13 +370,14 @@ fn restore_job_body(user: &str, db: &str, resolve: &str, url: &str) -> String {
     let done = RESTORE_JOB.done;
     format!(
         "ec=0\n\
-         if curl -fsS {resolve} -o {RESTORE_PATH} \"{url}\"; then\n\
+         code=$(curl -sS {resolve} -o {RESTORE_PATH} -w '%{{http_code}}' \"{url}\") || ec=$?\n\
+         {}\
+         if [ \"$ec\" = 0 ]; then\n\
          \tpg_restore -h 127.0.0.1 -U {user} --no-owner --no-privileges -d {db} {RESTORE_PATH} || ec=$?\n\
-         else\n\
-         \tec=$?\n\
          fi\n\
          rm -f {RESTORE_PATH}\n\
-         printf %s \"$ec\" > {done}.tmp && mv {done}.tmp {done}\n"
+         printf %s \"$ec\" > {done}.tmp && mv {done}.tmp {done}\n",
+        require_2xx("download")
     )
 }
 
@@ -431,11 +492,16 @@ async fn await_archive(
     s3: &S3Config,
     http: &reqwest::Client,
     key: &str,
-    baseline: &Baseline,
+    baseline: Option<&crate::s3::ObjectId>,
 ) -> Result<()> {
     let deadline = Instant::now() + ARCHIVE_DEADLINE;
     let mut probe_failures: u32 = 0;
     let mut probes_muted = false;
+    // When the guest first claimed the upload was done. Once it has, waiting the
+    // full deadline out is pointless — either the object shows up within a few
+    // polls or it is not coming — and a prompt, specific error beats a generic
+    // half-hour timeout.
+    let mut claimed_done: Option<Instant> = None;
     loop {
         sleep(ARCHIVE_POLL_INTERVAL).await;
 
@@ -449,8 +515,8 @@ async fn await_archive(
         //    claims success below.
         let head_unavailable = match s3.head_object(http, key, ARCHIVE_HEAD_TIMEOUT).await {
             Ok(now) => {
-                if let (Baseline::Known(before), Some(now)) = (baseline, &now)
-                    && Some(now) != before.as_ref()
+                if let Some(now) = &now
+                    && Some(now) != baseline
                 {
                     info!(
                         "schema {schema}: archive present in s3://{}/{key} ({} bytes)",
@@ -479,46 +545,40 @@ async fn await_archive(
                         truncate(log.trim(), 800)
                     );
                 }
-                // The job says it uploaded successfully.
+                // The job says it uploaded successfully — which is a claim, not
+                // proof, and never sufficient on its own. Keep looping and let a
+                // HEAD confirm it.
                 //
-                // If S3 is answering us, don't take its word for it — loop and
-                // let the next HEAD confirm, because the caller reclaims the
-                // disk on our `Ok`. A HEAD that says "still the old object"
-                // genuinely contradicts the guest, and waiting the deadline out
-                // is the safe way to lose that argument.
+                // This deliberately does *not* fall back to trusting the guest
+                // when the pooler can't reach S3. It used to, on the reasoning
+                // that a clean `curl` exit meant S3 had accepted the PUT; that
+                // reasoning was wrong twice over. `curl -f` also exits 0 on a
+                // 3xx, so a `301` for a wrong-region bucket read as success —
+                // and when the pooler cannot HEAD the object, the most likely
+                // cause is the very same misconfiguration that is breaking the
+                // guest's upload, so the two "independent" signals fail
+                // together. Accepting the guest's word there archived nothing
+                // and then reclaimed the disk.
                 //
-                // If S3 is *not* answering us, there is nothing further to
-                // confirm with and the guest's report is the best evidence
-                // available — `curl -f` exiting 0 means S3 itself accepted the
-                // PUT. Refusing that would strand every archive behind the
-                // pooler's own connectivity, so accept it and say so.
+                // A dump that cannot be confirmed therefore fails. The cost is
+                // an unreaped VM and a retry; the cost of the other choice is
+                // the workbook.
                 Ok(JobState::Succeeded) => {
-                    if head_unavailable || matches!(baseline, Baseline::Unknown) {
-                        warn!(
-                            "schema {schema}: dump job reported success and the pooler \
-                             cannot independently confirm the object; accepting the \
-                             guest's report (its upload was acknowledged by S3)"
-                        );
-                        return Ok(());
-                    }
                     probe_failures = 0;
+                    claimed_done.get_or_insert_with(Instant::now);
                 }
                 Ok(JobState::Running) => probe_failures = 0,
                 Err(e) => {
-                    // Give up on the guest only when S3 can still decide for
-                    // us. Without a baseline the sentinel is the *only* signal,
-                    // so muting it would guarantee a timeout — keep asking, on
-                    // the more patient budget, and let the deadline end it.
-                    let budget = match baseline {
-                        Baseline::Known(_) => ARCHIVE_MAX_PROBE_FAILURES,
-                        Baseline::Unknown => UNWITNESSED_MAX_PROBE_FAILURES,
-                    };
+                    // Safe to give up on the guest: S3 decides this one, and the
+                    // probe is only here to turn a failed dump into a prompt
+                    // error rather than a deadline-long wait.
+                    let budget = ARCHIVE_MAX_PROBE_FAILURES;
                     probe_failures += 1;
                     warn!(
                         "schema {schema}: dump-job probe {probe_failures}/{budget} failed \
                          (the dump itself is unaffected — it does not use this channel): {e:#}"
                     );
-                    if probe_failures >= budget && matches!(baseline, Baseline::Known(_)) {
+                    if probe_failures >= budget {
                         probes_muted = true;
                         warn!(
                             "schema {schema}: guest exec channel is not answering; \
@@ -527,6 +587,28 @@ async fn await_archive(
                     }
                 }
             }
+        }
+
+        // The guest finished and S3 still doesn't show the object. Something
+        // between the two is lying — a wrong-region redirect the guest read as
+        // success, a bucket policy, a key mismatch — and none of it will resolve
+        // by waiting. Fail now, naming both halves, rather than at the deadline.
+        if let Some(at) = claimed_done
+            && at.elapsed() >= ARCHIVE_CONFIRM_GRACE
+        {
+            bail!(
+                "dump job for schema {schema} reported success but s3://{}/{key} \
+                 {} {ARCHIVE_CONFIRM_GRACE:?} later — refusing to report this \
+                 archive as durable while the source VM is about to be reclaimed. \
+                 Guest log: {}",
+                s3.bucket,
+                if head_unavailable {
+                    "could not be checked"
+                } else {
+                    "still holds no new object"
+                },
+                truncate(ARCHIVE_JOB.log_tail(cfg, sandbox).await.trim(), 800)
+            );
         }
 
         if Instant::now() >= deadline {
@@ -1359,8 +1441,11 @@ mod tests {
         let job = body.to_string();
         let script = job_desc.launch_script(&job, scratch);
 
-        let dir = std::env::temp_dir()
-            .join(format!("pgfc-launch-{}-{}", std::process::id(), job_desc.what));
+        let dir = std::env::temp_dir().join(format!(
+            "pgfc-launch-{}-{}",
+            std::process::id(),
+            job_desc.what
+        ));
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         // Redirect the guest's absolute /workspace paths into the temp dir, and
         // stub every command the script calls so nothing actually runs. The same
@@ -1404,6 +1489,86 @@ mod tests {
             "presigned URL was altered in transit"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dump whose upload S3 *redirected* must record failure, not success.
+    ///
+    /// This is the bug that cost a workbook: the bucket lived in a region other
+    /// than the configured one, S3 answered the PUT `301 Moved Permanently`, and
+    /// `curl -fsS` exited 0 — `--fail` only trips on 4xx/5xx. The job wrote a `0`
+    /// sentinel, the pooler reported the archive durable, and the caller killed
+    /// the VM and reclaimed the disk. Nothing had been uploaded.
+    #[test]
+    fn a_redirected_upload_is_a_failed_dump() {
+        // Every status a misrouted or rejected transfer can come back as, plus
+        // the ones that must still count as success.
+        for (code, want_ok) in [
+            ("200", true),
+            ("204", true),
+            ("301", false), // the production failure
+            ("307", false),
+            ("403", false),
+            ("500", false),
+            ("000", false), // curl never got a response
+        ] {
+            let ec = run_archive_job_with_curl_status(code);
+            assert_eq!(
+                ec == "0",
+                want_ok,
+                "HTTP {code} upload recorded exit code {ec:?}; \
+                 a non-2xx must never write a zero sentinel"
+            );
+        }
+    }
+
+    /// Run the real archive job body under a real `sh`, with `curl` stubbed to
+    /// report `code` the way curl's `-w '%{http_code}'` does, and return the exit
+    /// code the job wrote to its sentinel.
+    fn run_archive_job_with_curl_status(code: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("pgfc-status-{}-{code}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let root = format!("{}/", dir.display());
+
+        let body = archive_job_body(
+            &shell_squote("postgres"),
+            &shell_squote("s"),
+            "",
+            "https://x/y",
+        )
+        .replace("/workspace/", &root);
+
+        // pg_dump succeeds; curl prints the status to stdout and — as curl does
+        // for a redirect it isn't following — exits 0 regardless.
+        let stubs = [
+            ("pg_dump", "#!/bin/sh\nexit 0\n".to_string()),
+            ("curl", format!("#!/bin/sh\nprintf %s '{code}'\nexit 0\n")),
+        ];
+        for (cmd, script) in stubs {
+            let p = dir.join("bin").join(cmd);
+            std::fs::write(&p, script).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&body)
+            .env("PATH", format!("{}/bin:/usr/bin:/bin", dir.display()))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "job body itself must not error: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let sentinel =
+            std::fs::read_to_string(dir.join(ARCHIVE_JOB.done.trim_start_matches("/workspace/")))
+                .expect("job must always write a sentinel");
+        let _ = std::fs::remove_dir_all(&dir);
+        sentinel
     }
 
     /// The probe shares a serial console with kernel logs and with the leftover
@@ -1458,7 +1623,11 @@ mod tests {
             RESTORE_PATH,
         ];
         let unique: std::collections::HashSet<_> = paths.iter().collect();
-        assert_eq!(unique.len(), paths.len(), "scratch paths collide: {paths:?}");
+        assert_eq!(
+            unique.len(),
+            paths.len(),
+            "scratch paths collide: {paths:?}"
+        );
     }
 
     /// The probe runs on a VM whose single vCPU is saturated by `pg_dump`, so it

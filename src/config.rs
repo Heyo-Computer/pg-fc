@@ -422,6 +422,9 @@ impl ArchiveConfig {
                 bucket,
                 prefix,
                 region,
+                // Filled in on the first HEAD if S3 says the bucket lives
+                // somewhere other than `region`.
+                discovered_region: Default::default(),
                 endpoint,
                 access_key_id,
                 secret_access_key,

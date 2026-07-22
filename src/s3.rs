@@ -15,10 +15,12 @@
 //! (MinIO/R2). The signing math is checked against AWS's own documented example
 //! vector in the tests.
 
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use tracing::warn;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -29,7 +31,21 @@ pub struct S3Config {
     pub bucket: String,
     /// Key prefix (e.g. `pg-vm-pool/`); joined with `{schema}.dump`.
     pub prefix: String,
+    /// Region as *configured* (`PG_VM_POOL_S3_REGION`, default `us-east-1`).
+    /// Read [`Self::region`] instead of this field — the configured value can be
+    /// wrong, and where it is, S3 tells us so and we follow S3.
     pub region: String,
+    /// The region S3 reported the bucket actually lives in, learned from an
+    /// `x-amz-bucket-region` header on a redirect/auth failure and latched for
+    /// the process lifetime. Shared across clones so one discovery fixes every
+    /// holder of this config.
+    ///
+    /// A bucket outside the configured region answers `301 Moved Permanently`
+    /// rather than serving the request — and SigV4 binds the signature to both
+    /// the region and the host, so a URL signed for the wrong one cannot work no
+    /// matter who sends it. Self-correcting here fixes the pooler's own HEADs
+    /// and the guest's presigned PUT/GET in one place.
+    pub discovered_region: Arc<OnceLock<String>>,
     /// Custom endpoint for an S3-compatible store (MinIO/R2), e.g.
     /// `https://minio.internal:9000`. `None` → AWS virtual-hosted addressing.
     /// When set, path-style addressing is used (`{endpoint}/{bucket}/{key}`).
@@ -39,6 +55,15 @@ pub struct S3Config {
 }
 
 impl S3Config {
+    /// The region to sign and address for: whatever S3 has told us the bucket
+    /// really lives in, else the configured value.
+    pub fn region(&self) -> &str {
+        self.discovered_region
+            .get()
+            .map(String::as_str)
+            .unwrap_or(&self.region)
+    }
+
     /// The object key for a schema's dump: `{prefix}{schema}.dump`.
     pub fn object_key(&self, schema: &str) -> String {
         format!("{}{}.dump", self.prefix, schema)
@@ -52,7 +77,11 @@ impl S3Config {
     pub fn resolve_host(&self) -> Option<String> {
         match &self.endpoint {
             Some(_) => None,
-            None => Some(format!("{}.s3.{}.amazonaws.com", self.bucket, self.region)),
+            None => Some(format!(
+                "{}.s3.{}.amazonaws.com",
+                self.bucket,
+                self.region()
+            )),
         }
     }
 
@@ -85,6 +114,42 @@ impl S3Config {
         key: &str,
         timeout: std::time::Duration,
     ) -> anyhow::Result<Option<ObjectId>> {
+        match self.head_once(http, key, timeout).await? {
+            Head::Found(id) => Ok(id),
+            // S3 named the bucket's real region. Latch it and ask again — every
+            // URL this config produces from here on, the guest's included, is
+            // signed and addressed for that region.
+            Head::WrongRegion(actual) => {
+                warn!(
+                    "s3://{}: bucket is in region {actual}, not the configured {} — \
+                     using {actual} from now on. Set PG_VM_POOL_S3_REGION={actual} to \
+                     avoid this lookup on every start.",
+                    self.bucket,
+                    self.region(),
+                );
+                // First writer wins; a racing dump may have set it already.
+                let _ = self.discovered_region.set(actual.clone());
+                match self.head_once(http, key, timeout).await? {
+                    Head::Found(id) => Ok(id),
+                    Head::WrongRegion(again) => anyhow::bail!(
+                        "s3://{}/{key}: still redirected after adopting region {actual} \
+                         (now pointing at {again})",
+                        self.bucket
+                    ),
+                }
+            }
+        }
+    }
+
+    /// One HEAD, distinguishing "the bucket is elsewhere" from every other
+    /// outcome. A redirect is not an error to report upward — it is a fact about
+    /// our configuration that we can act on.
+    async fn head_once(
+        &self,
+        http: &reqwest::Client,
+        key: &str,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Head> {
         use anyhow::Context;
         let url = self.presign_head(key, HEAD_PRESIGN_TTL);
         let resp = http
@@ -93,8 +158,23 @@ impl S3Config {
             .send()
             .await
             .with_context(|| format!("HEAD s3://{}/{key}", self.bucket))?;
+
+        // A HEAD carries no body, so `x-amz-bucket-region` is the only place the
+        // real region appears — S3 sets it on the redirect *and* on a 403 from a
+        // region-mismatched signature.
+        let bucket_region = resp
+            .headers()
+            .get("x-amz-bucket-region")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if let Some(actual) = bucket_region
+            && actual != self.region()
+        {
+            return Ok(Head::WrongRegion(actual));
+        }
+
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
+            return Ok(Head::Found(None));
         }
         if !resp.status().is_success() {
             anyhow::bail!("HEAD s3://{}/{key} returned {}", self.bucket, resp.status());
@@ -106,11 +186,11 @@ impl S3Config {
                 .unwrap_or_default()
                 .to_string()
         };
-        Ok(Some(ObjectId {
+        Ok(Head::Found(Some(ObjectId {
             etag: header("etag"),
             last_modified: header("last-modified"),
             content_length: resp.content_length().unwrap_or_default(),
-        }))
+        })))
     }
 
     /// Resolve `(scheme://host, canonical_uri)` for `key`. Virtual-hosted by
@@ -126,7 +206,7 @@ impl S3Config {
                 (scheme.to_string(), host.to_string(), uri)
             }
             None => {
-                let host = format!("{}.s3.{}.amazonaws.com", self.bucket, self.region);
+                let host = format!("{}.s3.{}.amazonaws.com", self.bucket, self.region());
                 let uri = format!("/{}", encode_uri_path(key));
                 ("https".to_string(), host, uri)
             }
@@ -142,7 +222,7 @@ impl S3Config {
             scheme: &scheme,
             host: &host,
             canonical_uri: &canonical_uri,
-            region: &self.region,
+            region: self.region(),
             access_key: &self.access_key_id,
             secret_key: &self.secret_access_key,
             unix_secs,
@@ -164,6 +244,12 @@ const HEAD_PRESIGN_TTL: std::time::Duration = std::time::Duration::from_secs(60)
 /// alone has 1-second resolution. Together they are decisive in practice — and a
 /// `pg_dump -Fc` archive embeds its own creation timestamp, so byte-identical
 /// consecutive dumps do not really occur.
+/// The outcome of a single HEAD: what's at the key, or where the bucket really is.
+enum Head {
+    Found(Option<ObjectId>),
+    WrongRegion(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectId {
     pub etag: String,
@@ -348,7 +434,9 @@ mod tests {
         );
         // Sanity on the non-signature portions.
         assert!(url.starts_with("https://examplebucket.s3.amazonaws.com/test.txt?"));
-        assert!(url.contains("X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request"));
+        assert!(url.contains(
+            "X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request"
+        ));
         assert!(url.contains("X-Amz-Date=20130524T000000Z"));
         assert!(url.contains("X-Amz-Expires=86400"));
         assert!(url.contains("X-Amz-SignedHeaders=host"));
@@ -407,6 +495,7 @@ mod tests {
             bucket: "wb".into(),
             prefix: "pg-vm-pool/".into(),
             region: "us-west-2".into(),
+            discovered_region: Default::default(),
             endpoint: None,
             access_key_id: "AK".into(),
             secret_access_key: "sk".into(),
@@ -423,6 +512,7 @@ mod tests {
             bucket: "wb".into(),
             prefix: "".into(),
             region: "us-east-1".into(),
+            discovered_region: Default::default(),
             endpoint: Some("http://minio.internal:9000/".into()),
             access_key_id: "AK".into(),
             secret_access_key: "sk".into(),
@@ -439,11 +529,15 @@ mod tests {
             bucket: "wb".into(),
             prefix: "".into(),
             region: "us-east-2".into(),
+            discovered_region: Default::default(),
             endpoint: None,
             access_key_id: "AK".into(),
             secret_access_key: "sk".into(),
         };
-        assert_eq!(aws.resolve_host().as_deref(), Some("wb.s3.us-east-2.amazonaws.com"));
+        assert_eq!(
+            aws.resolve_host().as_deref(),
+            Some("wb.s3.us-east-2.amazonaws.com")
+        );
         // Custom endpoint: leave DNS to the guest, so no --resolve host.
         let custom = S3Config {
             endpoint: Some("http://minio.internal:9000".into()),
