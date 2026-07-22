@@ -13,6 +13,7 @@ pub fn build(state: DashState) -> Router {
         .route("/monitoring", get(handlers::monitoring))
         .route("/monitoring/alerts", post(handlers::alert_add))
         .route("/monitoring/alerts/{id}/delete", post(handlers::alert_delete))
+        .route("/monitoring/sweep", post(handlers::action_sweep_now))
         .route("/vm/{id}", get(handlers::vm_detail))
         .route("/logs/pooler", get(handlers::logs_pooler))
         .route("/logs/heyvmd", get(handlers::logs_heyvmd))

@@ -73,11 +73,13 @@ pub async fn monitoring(
         tracing::warn!("reading host disks failed (hiding disk): {e:#}");
         Vec::new()
     });
+    let history = st.history.snapshot();
     Ok(views::monitoring_page(
         &st,
         &rows,
         host_usage.as_ref(),
         &disks,
+        &history,
         &banner,
     ))
 }
@@ -96,6 +98,19 @@ pub async fn alert_add(State(st): State<DashState>, Form(form): Form<AlertForm>)
         .add(&form.metric, form.threshold_pct, &form.webhook_url)
     {
         Ok(()) => Redirect::to(&format!("/monitoring?msg={}", qenc("alert rule added"))),
+        Err(e) => Redirect::to(&format!("/monitoring?err={}", qenc(&e.to_string()))),
+    }
+}
+
+/// Force an S3 eviction sweep now instead of waiting for the periodic timer.
+/// Runs in the background (a big backlog can take a while) and redirects
+/// immediately — watch the pooler log and the VMs' status for progress.
+pub async fn action_sweep_now(State(st): State<DashState>) -> Redirect {
+    match st.registry.spawn_sweep_now() {
+        Ok(()) => Redirect::to(&format!(
+            "/monitoring?msg={}",
+            qenc("eviction sweep started; watch the pooler log")
+        )),
         Err(e) => Redirect::to(&format!("/monitoring?err={}", qenc(&e.to_string()))),
     }
 }

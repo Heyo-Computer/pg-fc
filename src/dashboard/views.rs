@@ -8,6 +8,7 @@ use crate::registry::{DbStats, GuestStats};
 
 use super::alerts::{Metric, RuleView};
 use super::handlers::Banner;
+use super::history::Sample;
 use super::host::HostDisk;
 use super::model::{self, HostUsage, SandboxPage, VmRow};
 use super::state::DashState;
@@ -110,6 +111,7 @@ pub fn monitoring_page(
     rows: &[VmRow],
     host: Option<&HostUsage>,
     disks: &[HostDisk],
+    history: &[Sample],
     b: &Banner,
 ) -> Markup {
     let running: Vec<&VmRow> = rows.iter().filter(|r| r.is_running()).collect();
@@ -131,7 +133,17 @@ pub fn monitoring_page(
         html! {
             div.pagehead {
                 h1 { "Monitoring" }
-                a.button-link href="/monitoring" { "↻ refresh" }
+                div.pagehead-actions {
+                    a.button-link href="/monitoring" { "↻ refresh" }
+                    @if st.registry.archive_enabled() {
+                        form method="post" action="/monitoring/sweep" class="inline-form" {
+                            button.reap type="submit"
+                                title="Run an S3 eviction sweep now: archive every long-idle schema and free its disk, instead of waiting for the periodic timer." {
+                                "sweep idle → S3 now"
+                            }
+                        }
+                    }
+                }
             }
             (banner(b))
             @if st.cfg.basic_auth.is_none() {
@@ -186,9 +198,124 @@ pub fn monitoring_page(
                 a href="/" { "Databases" } " view shows — no guest access."
             }
 
+            h3.sub-head { "live VMs over time" }
+            (vm_history_chart(history, running.len()))
+
             (alerts_section(st))
         },
     )
+}
+
+/// A self-contained inline-SVG line chart of the live-VM count over the sampler's
+/// retained history — no client JS, no external libs, so it renders under the
+/// dashboard's strict-by-default CSP. `current` is the running count right now,
+/// shown in the caption. The SVG uses a fixed internal coordinate system and is
+/// scaled to the container by CSS, so it stays crisp at any width.
+fn vm_history_chart(samples: &[Sample], current: usize) -> Markup {
+    // Internal coordinate system (CSS scales the whole thing to fit).
+    const W: f64 = 640.0;
+    const H: f64 = 160.0;
+    const PAD_L: f64 = 32.0;
+    const PAD_R: f64 = 12.0;
+    const PAD_T: f64 = 12.0;
+    const PAD_B: f64 = 20.0;
+    let plot_w = W - PAD_L - PAD_R;
+    let plot_h = H - PAD_T - PAD_B;
+    let baseline = PAD_T + plot_h;
+
+    if samples.is_empty() {
+        return html! {
+            div.chart-wrap {
+                p.note.chart-empty {
+                    "Collecting live-VM history — the first sample lands within a minute."
+                }
+            }
+        };
+    }
+
+    let n = samples.len();
+    let max_live = samples.iter().map(|s| s.live).max().unwrap_or(0);
+    let axis_max = f64::from(max_live.max(1));
+
+    let x = |i: usize| -> f64 {
+        if n > 1 {
+            PAD_L + (i as f64 / (n - 1) as f64) * plot_w
+        } else {
+            PAD_L + plot_w
+        }
+    };
+    let y = |v: u32| -> f64 { PAD_T + (1.0 - f64::from(v) / axis_max) * plot_h };
+
+    let line_pts: String = samples
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{:.1},{:.1}", x(i), y(s.live)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Close the area down to the baseline under the first and last points.
+    let area_pts = format!(
+        "{:.1},{:.1} {line_pts} {:.1},{:.1}",
+        x(0),
+        baseline,
+        x(n - 1),
+        baseline
+    );
+
+    let last = samples[n - 1];
+    let (lx, ly) = (x(n - 1), y(last.live));
+    let span = last.t.saturating_sub(samples[0].t);
+
+    // Y gridline values: 0, max, and a midpoint when the range is tall enough.
+    let ticks: Vec<u32> = if max_live >= 2 {
+        vec![0, max_live / 2, max_live]
+    } else {
+        vec![0, 1]
+    };
+
+    html! {
+        div.chart-wrap {
+            svg.chart-svg viewBox="0 0 640 160" role="img"
+                aria-label=(format!("Live VM count over the last {}", fmt_span(span))) {
+                // Horizontal gridlines + y-axis labels.
+                @for t in &ticks {
+                    @let gy = y(*t);
+                    line.chart-grid x1=(fmt(PAD_L)) y1=(fmt(gy)) x2=(fmt(W - PAD_R)) y2=(fmt(gy));
+                    text.chart-ylabel x=(fmt(PAD_L - 5.0)) y=(fmt(gy + 3.0)) text-anchor="end" {
+                        (t)
+                    }
+                }
+                // Filled area under the line, then the line itself.
+                polygon.chart-area points=(area_pts);
+                polyline.chart-line points=(line_pts);
+                // Marker + value at the latest sample.
+                circle.chart-dot cx=(fmt(lx)) cy=(fmt(ly)) r="3";
+                text.chart-now x=(fmt(lx)) y=(fmt((ly - 6.0).max(10.0))) text-anchor="end" {
+                    (last.live)
+                }
+            }
+            p.chart-caption.dim {
+                (n) " sample" (if n == 1 { "" } else { "s" })
+                " · spanning " (fmt_span(span))
+                " · now " (current) " running"
+            }
+        }
+    }
+}
+
+/// Format an SVG coordinate to one decimal place.
+fn fmt(v: f64) -> String {
+    format!("{v:.1}")
+}
+
+/// Compact human duration for the chart caption: `3h 12m`, `42m`, `30s`.
+fn fmt_span(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 /// The webhook-alerts panel: existing rules with their live firing state and a
@@ -619,8 +746,8 @@ pub fn vm_detail_page(
 ///
 /// Refresh is a plain `meta http-equiv="refresh"`: the browser reloads the whole
 /// URL — query string included — so `?refresh=N` survives each reload without any
-/// client state. The only script is a one-liner that jumps to the newest lines
-/// after each load.
+/// client state. A small script filters lines client-side (no server round-trip,
+/// so it costs the pooler nothing) and jumps to the newest lines after each load.
 pub fn log_page(
     title: &str,
     href_base: &str,
@@ -642,12 +769,45 @@ pub fn log_page(
             h1 { "log · " (title) }
             p.dim { code { (source) } }
             (refresh_controls(href_base, secs))
+            div.log-search {
+                input #logfilter type="text" placeholder="filter lines (client-side)…"
+                    autocomplete="off" spellcheck="false";
+                span.dim #logcount {}
+            }
             pre.log #logbody { (text) }
-            // Land on the newest lines after every (auto-)reload.
-            script { (PreEscaped("window.scrollTo(0, document.body.scrollHeight);")) }
+            script { (PreEscaped(LOG_SCRIPT)) }
         },
     )
 }
+
+/// Client-side log filter + scroll-to-newest. Captures the rendered lines once,
+/// then on each keystroke shows only lines containing the query (case-insensitive)
+/// — all in the browser, so the pooler is never queried. The filter text is kept
+/// in `sessionStorage` keyed by path, so it survives the `meta` auto-refresh
+/// reload and per-log tabs don't share a query.
+const LOG_SCRIPT: &str = r#"
+(function () {
+  var pre = document.getElementById('logbody');
+  var input = document.getElementById('logfilter');
+  var count = document.getElementById('logcount');
+  if (!pre || !input) return;
+  var lines = pre.textContent.split('\n');
+  var key = 'logfilter:' + location.pathname;
+  function apply(scroll) {
+    var q = input.value.toLowerCase();
+    var shown = q ? lines.filter(function (l) { return l.toLowerCase().indexOf(q) !== -1; }) : lines;
+    pre.textContent = shown.join('\n');
+    if (count) count.textContent = q ? (shown.length + ' / ' + lines.length + ' lines') : '';
+    if (scroll) window.scrollTo(0, document.body.scrollHeight);
+  }
+  try { input.value = sessionStorage.getItem(key) || ''; } catch (e) {}
+  input.addEventListener('input', function () {
+    try { sessionStorage.setItem(key, input.value); } catch (e) {}
+    apply(false);
+  });
+  apply(true);
+})();
+"#;
 
 /// Bounds on the honored auto-refresh interval, so a hand-edited `?refresh=`
 /// can't ask for a hammering 0.1s reload or an effectively-off multi-hour one.
@@ -902,6 +1062,35 @@ mod tests {
     }
 
     #[test]
+    fn fmt_span_scales_units() {
+        assert_eq!(fmt_span(45), "45s");
+        assert_eq!(fmt_span(600), "10m");
+        assert_eq!(fmt_span(3 * 3600 + 12 * 60), "3h 12m");
+    }
+
+    #[test]
+    fn vm_history_chart_handles_empty_single_and_many() {
+        // Empty: no SVG, just the collecting note.
+        let empty = vm_history_chart(&[], 0).into_string();
+        assert!(!empty.contains("<svg"), "empty history should not draw a chart");
+        assert!(empty.contains("Collecting"));
+
+        // A single sample must not divide by zero (n-1 == 0) and still renders.
+        let one = vm_history_chart(&[Sample { t: 100, live: 3 }], 3).into_string();
+        assert!(one.contains("<svg"));
+        assert!(one.contains("1 sample "), "singular caption: {one}");
+
+        // Many samples: polyline with one point per sample, caption pluralized,
+        // and the y-axis labelled up to the max.
+        let samples: Vec<Sample> = (0..5).map(|i| Sample { t: 100 + i * 60, live: i as u32 }).collect();
+        let many = vm_history_chart(&samples, 4).into_string();
+        assert!(many.contains("polyline"));
+        assert!(many.matches(',').count() >= 5, "one point per sample");
+        assert!(many.contains("5 samples"));
+        assert!(many.contains("now 4 running"));
+    }
+
+    #[test]
     fn metric_renders_clamped_bar_and_band() {
         // A hot disk: fill clamps to 100%, gets the crit color, shows the caption.
         let html = metric("/data", 1.4, "140%", Some("/dev/sda1")).into_string();
@@ -982,6 +1171,19 @@ main { padding:1.2rem; max-width:1200px; margin:0 auto; }
 h1 { font-size:1.3rem; }
 .pagehead { display:flex; align-items:center; justify-content:space-between; gap:1rem; }
 .pagehead h1 { margin:.6rem 0; }
+.pagehead-actions { display:flex; align-items:center; gap:.6rem; }
+.inline-form { display:inline; margin:0; }
+.chart-wrap { background:var(--card); border:1px solid var(--border); border-radius:8px;
+         padding:.6rem .6rem .2rem; margin:.25rem 0 1rem; max-width:680px; }
+.chart-svg { display:block; width:100%; height:auto; }
+.chart-empty { margin:.4rem .2rem .6rem; }
+.chart-grid { stroke:var(--border); stroke-width:1; }
+.chart-ylabel, .chart-now { fill:var(--muted); font-size:11px; }
+.chart-now { fill:var(--link); font-weight:600; }
+.chart-area { fill:var(--link); fill-opacity:.12; stroke:none; }
+.chart-line { fill:none; stroke:var(--link); stroke-width:2; stroke-linejoin:round; stroke-linecap:round; }
+.chart-dot { fill:var(--link); stroke:var(--card); stroke-width:1.5; }
+.chart-caption { margin:.2rem .2rem .5rem; font-size:.8rem; }
 h2 { font-size:1rem; margin:1.4rem 0 .5rem; }
 .summary { display:flex; gap:1.5rem; margin:.5rem 0 1rem; color:var(--dim); }
 .summary b { color:var(--fg); }
@@ -1011,6 +1213,9 @@ button.stop { color:var(--err-fg); border-color:var(--err-border); }
 button.start { color:var(--ok-fg); border-color:var(--ok-border); }
 button.reap { color:var(--sess-fg); border-color:var(--sess-fg); }
 .log-controls { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; margin:.5rem 0 1rem; }
+.log-search { display:flex; align-items:center; gap:.6rem; margin:.25rem 0 .75rem; }
+.log-search input { flex:1; max-width:32rem; padding:.35rem .55rem; font:inherit;
+         border:1px solid var(--btn-border); border-radius:6px; background:var(--btn-bg); color:var(--fg); }
 .refresh-opt { padding:.15rem .5rem; border-radius:6px; border:1px solid transparent; }
 a.refresh-opt:hover { border-color:var(--btn-hover); text-decoration:none; }
 .refresh-opt.active { background:var(--btn-bg); border:1px solid var(--btn-border); color:var(--fg); }

@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,6 +28,11 @@ const PRE_STOP_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(30);
 /// also logs at debug; this throttles the visible-at-info line so a healthy,
 /// idle loop proves liveness roughly this often without spamming the log.
 const SUPERVISOR_HEARTBEAT: Duration = Duration::from_secs(900);
+
+/// Delay before the S3-eviction loop's first sweep after startup. Short enough
+/// that redeploys don't starve eviction (see [`supervise`]), long enough to let
+/// the pooler finish coming up first.
+const ARCHIVE_FIRST_SWEEP_DELAY: Duration = Duration::from_secs(120);
 
 /// A ready, warm VM for one schema. `target` is where client bytes are spliced
 /// — either the VM's guest IP directly (same-host, no tunnel) or the local end
@@ -245,6 +250,10 @@ pub struct SchemaRegistry {
     // restores from S3. Guards against a client bringing a VM back up while the
     // archiver is dumping and killing it. Held for the whole archive operation.
     archiving: StdMutex<HashSet<String>>,
+    // True while an eviction sweep is running. Single-flights the sweep so the
+    // periodic timer and a manual "sweep now" can't stack overlapping passes over
+    // the same candidates.
+    sweeping: AtomicBool,
 }
 
 impl SchemaRegistry {
@@ -255,6 +264,7 @@ impl SchemaRegistry {
             entries: Mutex::new(HashMap::new()),
             store,
             archiving: StdMutex::new(HashSet::new()),
+            sweeping: AtomicBool::new(false),
         }
     }
 
@@ -528,7 +538,8 @@ impl SchemaRegistry {
         // Check a few times per timeout window so shutdown lands close to the
         // deadline, but not so often it busies the daemon.
         let tick = (timeout / 4).max(Duration::from_secs(5));
-        tokio::spawn(supervise("idle-reaper", tick, move || {
+        // Reaper `tick` is already short, so first pass and steady state match.
+        tokio::spawn(supervise("idle-reaper", tick, tick, move || {
             let registry = registry.clone();
             async move { registry.reap_idle(timeout).await }
         }));
@@ -602,10 +613,38 @@ impl SchemaRegistry {
         );
         let registry = self.clone();
         let (interval, after) = (archive.sweep_interval, archive.archive_after);
-        tokio::spawn(supervise("s3-eviction", interval, move || {
+        // Run the first sweep soon after startup — never a full `interval` later —
+        // so frequent redeploys can't indefinitely postpone eviction. Capped by
+        // the interval itself in case someone configures a very short sweep.
+        let first = ARCHIVE_FIRST_SWEEP_DELAY.min(interval);
+        tokio::spawn(supervise("s3-eviction", first, interval, move || {
             let registry = registry.clone();
             async move { registry.sweep_archive(after).await }
         }));
+    }
+
+    /// Kick off one eviction sweep now, in the background, instead of waiting for
+    /// the periodic timer — the dashboard's "sweep now" control. Returns as soon
+    /// as the sweep is launched (it can take a long time for a big backlog); the
+    /// outcome shows up in the pooler log and the VMs' "Archived (S3)" status.
+    /// Errors if the eviction tier isn't configured, or if a sweep is already
+    /// running (the sweep itself is single-flighted, so this only reports it).
+    pub fn spawn_sweep_now(self: &Arc<Self>) -> Result<()> {
+        let Some(archive) = self.cfg.archive.clone() else {
+            bail!(
+                "S3 eviction tier is not configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_*)"
+            );
+        };
+        if self.sweeping.load(Ordering::SeqCst) {
+            bail!("an eviction sweep is already running");
+        }
+        let registry = self.clone();
+        let after = archive.archive_after;
+        tokio::spawn(async move {
+            let n = registry.sweep_archive(after).await;
+            info!("manual eviction sweep finished: archived {n} schema(s)");
+        });
+        Ok(())
     }
 
     /// One eviction pass: archive every non-keepalive schema untouched for at
@@ -613,7 +652,17 @@ impl SchemaRegistry {
     ///
     /// Returns how many schemas were successfully archived this pass, for the
     /// supervisor's heartbeat.
+    ///
+    /// Single-flighted: if a sweep (periodic or manual) is already in progress
+    /// this returns immediately having done nothing, so triggers can't stack
+    /// overlapping passes racing over the same candidates.
     async fn sweep_archive(&self, threshold: Duration) -> usize {
+        if self.sweeping.swap(true, Ordering::SeqCst) {
+            info!("S3 eviction: a sweep is already running; skipping this one");
+            return 0;
+        }
+        let _sweeping = SweepGuard(&self.sweeping);
+
         let now = now_unix();
         let threshold_secs = threshold.as_secs();
 
@@ -746,8 +795,20 @@ impl SchemaRegistry {
 ///
 /// `make_pass` returns the future for one pass; its `usize` output is a count of
 /// work done (VMs stopped / schemas archived), surfaced in the heartbeat.
-async fn supervise<F, Fut>(name: &'static str, tick: Duration, mut make_pass: F)
-where
+///
+/// `first_delay` is how long to wait before the *first* pass; `tick` is the gap
+/// between every pass after that. They differ because a long `tick` (the hourly
+/// eviction sweep) combined with restarts would otherwise starve the loop: every
+/// restart resets the timer, so a pooler redeployed more often than `tick` never
+/// runs a single pass. A short `first_delay` makes the first pass land soon after
+/// startup regardless. The reaper, whose `tick` is already short, just passes
+/// `tick` for both.
+async fn supervise<F, Fut>(
+    name: &'static str,
+    first_delay: Duration,
+    tick: Duration,
+    mut make_pass: F,
+) where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = usize> + Send + 'static,
 {
@@ -755,7 +816,7 @@ where
     let mut actions: u64 = 0;
     let mut last_beat: Option<Instant> = None;
     loop {
-        tokio::time::sleep(tick).await;
+        tokio::time::sleep(if passes == 0 { first_delay } else { tick }).await;
         passes += 1;
         let started = Instant::now();
         match tokio::spawn(make_pass()).await {
@@ -797,6 +858,16 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         s.clone()
     } else {
         "<non-string panic payload>".to_string()
+    }
+}
+
+/// Clears the `sweeping` flag on drop, so a panic or early return in the middle
+/// of a sweep can't leave the registry permanently believing a sweep is running.
+struct SweepGuard<'a>(&'a AtomicBool);
+
+impl Drop for SweepGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1041,16 +1112,21 @@ mod tests {
     async fn supervisor_survives_a_panicking_pass() {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
-        let task = tokio::spawn(supervise("test", Duration::from_millis(10), move || {
-            let c = c.clone();
-            async move {
-                // Panic on the first pass only; succeed forever after.
-                if c.fetch_add(1, Ordering::SeqCst) == 0 {
-                    panic!("boom on the first pass");
+        let task = tokio::spawn(supervise(
+            "test",
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            move || {
+                let c = c.clone();
+                async move {
+                    // Panic on the first pass only; succeed forever after.
+                    if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                        panic!("boom on the first pass");
+                    }
+                    0usize
                 }
-                0usize
-            }
-        }));
+            },
+        ));
         // Paused clock: advancing time drives the ticks deterministically without
         // real waiting. Several ticks should elapse past the initial panic.
         for _ in 0..5 {

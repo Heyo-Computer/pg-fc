@@ -34,6 +34,7 @@ mod alerts;
 mod auth;
 mod error;
 mod handlers;
+mod history;
 mod host;
 mod logs;
 mod model;
@@ -61,10 +62,14 @@ pub async fn serve(cfg: DashboardConfig, registry: Arc<SchemaRegistry>) -> Resul
         registry,
         cfg: Arc::new(cfg),
         alerts,
+        history: Arc::new(history::VmHistory::new(history::CAPACITY)),
     };
     // Background webhook-alert evaluator: samples host metrics on an interval and
     // fires any crossed rules. Shares the same `AlertStore` the pages mutate.
     alerts::spawn_evaluator(state.clone(), alert_interval);
+    // Background sampler: records the live-VM count on an interval for the
+    // monitoring page's chart.
+    history::spawn_sampler(state.clone());
     let app = router::build(state);
     let listener = TcpListener::bind(addr)
         .await
