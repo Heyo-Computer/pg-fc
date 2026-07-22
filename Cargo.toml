@@ -31,6 +31,11 @@ serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
+# HEAD the archived object from the pooler to confirm a dump really landed in S3
+# before the source VM's disk is reclaimed. Same version/features heyo-sdk
+# already resolves (rustls + ring + webpki roots), so this adds no new
+# compilation — it just makes the existing dependency direct.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 serde_json = "1"

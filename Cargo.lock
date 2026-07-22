@@ -2567,6 +2567,7 @@ dependencies = [
  "heyo-sdk",
  "hmac",
  "maud",
+ "reqwest 0.12.28",
  "rustls-pki-types",
  "serde",
  "serde_json",

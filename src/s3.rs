@@ -66,6 +66,53 @@ impl S3Config {
         self.presign("GET", key, expires.as_secs(), now_unix())
     }
 
+    /// Presign a `HEAD` of `key`. SigV4 signs the method, so this cannot be a
+    /// GET URL used with a HEAD request — it needs its own signature.
+    pub fn presign_head(&self, key: &str, expires: std::time::Duration) -> String {
+        self.presign("HEAD", key, expires.as_secs(), now_unix())
+    }
+
+    /// What the object at `key` currently is, as far as S3 is concerned:
+    /// `Ok(None)` for "no such object", `Ok(Some(id))` for one that exists.
+    ///
+    /// Used to confirm an archive actually landed before its source VM's disk is
+    /// reclaimed. Unlike the guest's own report, this asks the system of record —
+    /// and it travels the pooler's network, not the guest's serial console, so it
+    /// still answers when the guest exec channel is wedged.
+    pub async fn head_object(
+        &self,
+        http: &reqwest::Client,
+        key: &str,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Option<ObjectId>> {
+        use anyhow::Context;
+        let url = self.presign_head(key, HEAD_PRESIGN_TTL);
+        let resp = http
+            .head(&url)
+            .timeout(timeout)
+            .send()
+            .await
+            .with_context(|| format!("HEAD s3://{}/{key}", self.bucket))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            anyhow::bail!("HEAD s3://{}/{key} returned {}", self.bucket, resp.status());
+        }
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        };
+        Ok(Some(ObjectId {
+            etag: header("etag"),
+            last_modified: header("last-modified"),
+            content_length: resp.content_length().unwrap_or_default(),
+        }))
+    }
+
     /// Resolve `(scheme://host, canonical_uri)` for `key`. Virtual-hosted by
     /// default; path-style when a custom endpoint is configured. `canonical_uri`
     /// is the URI-encoded object path with `/` preserved — exactly what goes
@@ -102,6 +149,26 @@ impl S3Config {
             expires,
         })
     }
+}
+
+/// Short-lived: a HEAD the pooler issues immediately, unlike the guest URLs that
+/// must outlive a long transfer.
+const HEAD_PRESIGN_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Identity of a stored object, enough to tell "the archive I just asked for"
+/// from "the one left by the previous archive of this schema" — the keys are the
+/// same, so presence alone proves nothing.
+///
+/// `etag` alone would be ambiguous for a dump whose bytes are identical to the
+/// previous one (ETag is the content MD5 for a single-part PUT); `last_modified`
+/// alone has 1-second resolution. Together they are decisive in practice — and a
+/// `pg_dump -Fc` archive embeds its own creation timestamp, so byte-identical
+/// consecutive dumps do not really occur.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectId {
+    pub etag: String,
+    pub last_modified: String,
+    pub content_length: u64,
 }
 
 struct PresignParams<'a> {
@@ -285,6 +352,35 @@ mod tests {
         assert!(url.contains("X-Amz-Date=20130524T000000Z"));
         assert!(url.contains("X-Amz-Expires=86400"));
         assert!(url.contains("X-Amz-SignedHeaders=host"));
+    }
+
+    /// SigV4 signs the HTTP method, so the archive-confirmation HEAD needs its
+    /// own signature — reusing the GET URL would 403 and make every dump look
+    /// like it never landed.
+    #[test]
+    fn head_is_signed_as_its_own_method() {
+        let unix = 1_369_353_600;
+        let params = |method| PresignParams {
+            method,
+            scheme: "https",
+            host: "examplebucket.s3.amazonaws.com",
+            canonical_uri: "/test.txt",
+            region: "us-east-1",
+            access_key: "AKIAIOSFODNN7EXAMPLE",
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            unix_secs: unix,
+            expires: 60,
+        };
+        let head = presign_core(params("HEAD"));
+        let get = presign_core(params("GET"));
+        assert_ne!(
+            head, get,
+            "HEAD and GET must not share a signature — the method is signed"
+        );
+        // Everything but the signature is identical, so the difference is the
+        // signature itself rather than some incidental URL change.
+        let strip = |u: &str| u.split("&X-Amz-Signature=").next().unwrap().to_string();
+        assert_eq!(strip(&head), strip(&get));
     }
 
     #[test]

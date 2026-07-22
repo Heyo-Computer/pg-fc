@@ -113,29 +113,76 @@ const GUEST_EXEC_HTTP_TIMEOUT: Duration = Duration::from_secs(45);
 /// cap. The sweep retries a timed-out schema next pass.
 const ARCHIVE_DEADLINE: Duration = Duration::from_secs(1800);
 
-/// How often we poll the guest for the detached dump job's completion sentinel.
-/// Each poll is a trivial `test`/`cat`, so it finishes far inside the exec cap.
-const ARCHIVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// How often we check on a running dump job. Each pass is one S3 HEAD from the
+/// pooler plus (at most) one trivial guest exec. Deliberately not tighter: every
+/// guest exec contends for the VM's single serial console against a `pg_dump`
+/// that is saturating the same one-vCPU guest, and polling harder makes the
+/// starvation it is trying to observe worse.
+const ARCHIVE_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Per-request timeout for the pooler's own S3 HEAD.
+const ARCHIVE_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many *consecutive* failed guest probes we tolerate before we stop asking
+/// the guest and let S3 alone decide. The guest exec channel failing says
+/// nothing about the detached job (which does not use that channel), so giving
+/// up on it must not give up on the archive — it only costs us the fast,
+/// detailed error path.
+const ARCHIVE_MAX_PROBE_FAILURES: u32 = 3;
+
+/// The same tolerance for a job with *no* out-of-band signal (the restore),
+/// where losing the guest means losing the only way to ever confirm it. Much
+/// more generous, because here running out means failing the operation: probes
+/// fail exactly when the guest is busiest, and each failure already costs up to
+/// a full [`GUEST_EXEC_HTTP_TIMEOUT`], so this is many minutes of silence — not
+/// a brief stall — before we conclude the guest is gone.
+const UNWITNESSED_MAX_PROBE_FAILURES: u32 = 10;
 
 /// Fixed in-guest scratch paths for the dump. One VM backs exactly one schema,
 /// so a constant name is unambiguous — and unlike a schema-derived name it can't
 /// be broken by a schema containing `/` or a quote.
 const DUMP_PATH: &str = "/workspace/_archive.dump";
 const RESTORE_PATH: &str = "/workspace/_restore.dump";
-/// Scratch paths for the detached dump job: the shell script we launch, the
-/// sentinel holding its exit code once done, and its combined log (read back
-/// only to surface an error). All addressed by absolute path from inside the
-/// guest shell — the SDK's `files()` API cannot reach them (see
-/// [`dump_to_s3`]).
-const ARCHIVE_JOB_PATH: &str = "/workspace/_archive.job.sh";
-const ARCHIVE_DONE_PATH: &str = "/workspace/_archive.done";
-const ARCHIVE_LOG_PATH: &str = "/workspace/_archive.log";
 
-/// Heredoc delimiter used to plant the job script from the launch exec. Quoted
-/// at the use site (`<<'…'`) so the body — which contains `$ec`, `$?` and a
+/// Heredoc delimiter used to plant a job script from its launch exec. Quoted at
+/// the use site (`<<'…'`) so the body — which contains `$ec`, `$?` and a
 /// presigned URL full of `&`/`=`/`%` — is written through verbatim, with no
 /// expansion and no shell-quoting layer to survive.
-const ARCHIVE_JOB_EOF: &str = "HEYO_ARCHIVE_JOB_EOF";
+const JOB_HEREDOC_EOF: &str = "HEYO_JOB_EOF";
+
+/// Framing token for a probe reply. Distinctive enough that no kernel log line
+/// or shell echo can be mistaken for one.
+const PROBE_TAG: &str = "HEYOJOB:";
+
+/// A long-running guest job that must outlive the exec that starts it, plus the
+/// in-guest scratch paths it is watched through: the shell script we plant, the
+/// sentinel holding its exit code once done, and its combined log (read back
+/// only to surface an error).
+///
+/// Both transfers need this shape for the same reason — see [`dump_to_s3`] for
+/// why a foreground exec cannot carry either one.
+#[derive(Clone, Copy)]
+struct DetachedJob {
+    /// Human name for logs and error messages ("dump", "restore").
+    what: &'static str,
+    script: &'static str,
+    done: &'static str,
+    log: &'static str,
+}
+
+const ARCHIVE_JOB: DetachedJob = DetachedJob {
+    what: "dump",
+    script: "/workspace/_archive.job.sh",
+    done: "/workspace/_archive.done",
+    log: "/workspace/_archive.log",
+};
+
+const RESTORE_JOB: DetachedJob = DetachedJob {
+    what: "restore",
+    script: "/workspace/_restore.job.sh",
+    done: "/workspace/_restore.done",
+    log: "/workspace/_restore.log",
+};
 
 /// Dump `schema`'s database to S3 using the guest's own `pg_dump` + `curl`
 /// against a pooler-presigned PUT URL. The dump bytes stream straight from the
@@ -143,19 +190,42 @@ const ARCHIVE_JOB_EOF: &str = "HEYO_ARCHIVE_JOB_EOF";
 /// so `curl -T` sends a `Content-Length` — S3 rejects a chunked PUT.
 ///
 /// The transfer runs **detached** in the guest, not as one foreground exec: the
-/// guest exec API hard-caps a single command at ~30s server-side, far too short
+/// guest exec API hard-caps a single command at 30s server-side, far too short
 /// for a multi-workbook dump+upload, and the SDK can't raise it. So we launch
 /// the dump under `setsid` (a new session with stdio fully redirected, so it
-/// outlives the launch exec) and poll a sentinel file for its exit code. Each
-/// exec we issue — the launch and every poll — is trivially short and stays well
-/// inside the cap; only the pooler-side [`ARCHIVE_DEADLINE`] bounds the wait.
+/// outlives the launch exec) and watch for its completion out-of-band. Each exec
+/// we issue — the launch and every probe — is trivially short; only the
+/// pooler-side [`ARCHIVE_DEADLINE`] bounds the wait.
 ///
-/// Everything here goes through `exec` rather than the SDK's `files()` API,
-/// which is **not usable on these VMs**: `write-file`/`read-file` resolve a path
-/// against a *host-side bind mount* declared at create time, so on a Firecracker
-/// sandbox whose `/workspace` is a guest block device (`/dev/vdb`) there is no
-/// matching mount and the daemon answers `Mount not found: /workspace (available
-/// mounts: [])`. The guest's own shell is the only way in.
+/// Everything guest-side goes through `exec` rather than the SDK's `files()`
+/// API, which is **not usable on these VMs**: `write-file`/`read-file` resolve a
+/// path against a *host-side bind mount* declared at create time, so on a
+/// Firecracker sandbox whose `/workspace` is a guest block device (`/dev/vdb`)
+/// there is no matching mount and the daemon answers `Mount not found:
+/// /workspace (available mounts: [])`.
+///
+/// # Why success is decided in S3, not in the guest
+///
+/// On these VMs `exec` is not a reliable channel. The daemon drives a **single
+/// shared shell on the guest's serial console**, writing a marker-delimited
+/// command and reading until the end marker, under a fixed 30s timeout
+/// (`execute_via_serial` in mvm-ctrl's Firecracker driver). While `pg_dump` and
+/// `curl` saturate the one-vCPU guest and its single virtio disk, even `[ -f x ]`
+/// can miss that window — so a probe times out and the daemon answers `500
+/// Command timed out after 30 seconds`.
+///
+/// That failure is about the *channel*, not the job: the detached dump neither
+/// uses nor cares about the serial console. Treating it as a dump failure — as
+/// this did — aborted archives that were running fine, precisely when the VM was
+/// busiest, i.e. for the largest workbooks.
+///
+/// So the authoritative completion signal is an S3 `HEAD` issued **by the
+/// pooler**: it answers over the pooler's own network, needs nothing from the
+/// guest, and checks the thing actually at stake — that the object exists —
+/// rather than a guest's claim about it. That matters because the caller kills
+/// the VM and reclaims its disk on our `Ok`, destroying the only other copy.
+/// The guest sentinel is kept as a best-effort fast path: it turns a failed dump
+/// into an immediate, explained error instead of a 30-minute timeout.
 pub async fn dump_to_s3(
     cfg: &Config,
     sandbox: &Sandbox,
@@ -168,17 +238,49 @@ pub async fn dump_to_s3(
     let db = shell_squote(schema);
     let user = shell_squote(&cfg.pg_user);
 
-    let launch = archive_launch_script(&archive_job_body(&user, &db, &resolve, &url));
-    let res = exec_guest(cfg, sandbox, &launch, true, "pg_dump→S3 upload (launch)").await?;
-    if res.exit_code != 0 {
-        bail!(
-            "launching detached dump failed (exit {}): {}",
-            res.exit_code,
-            truncate(exec_detail(&res), 800)
-        );
-    }
+    let http = reqwest::Client::builder()
+        .build()
+        .context("building HTTP client for S3 HEAD")?;
 
-    poll_archive_job(cfg, sandbox, schema).await
+    // What's at this key *before* the dump. A schema's archive key is stable, so
+    // the previous archive already sits there — presence alone is no evidence,
+    // and mistaking it for this run's upload would report success for a dump
+    // that never happened and then reclaim the live disk.
+    let baseline = match s3.head_object(&http, &key, ARCHIVE_HEAD_TIMEOUT).await {
+        Ok(id) => Baseline::Known(id),
+        Err(e) => {
+            warn!(
+                "schema {schema}: pre-dump HEAD of s3://{}/{key} failed ({e:#}); \
+                 cannot tell a fresh archive from the previous one, so this dump \
+                 must be confirmed by the guest instead",
+                s3.bucket
+            );
+            Baseline::Unknown
+        }
+    };
+
+    ARCHIVE_JOB
+        .launch(
+            cfg,
+            sandbox,
+            &archive_job_body(&user, &db, &resolve, &url),
+            DUMP_PATH,
+        )
+        .await?;
+
+    await_archive(cfg, sandbox, schema, s3, &http, &key, &baseline).await
+}
+
+/// What was stored at the archive key before this dump started — the reference
+/// point that makes "the object is there" mean something.
+enum Baseline {
+    /// The pre-dump HEAD succeeded: this is what was there (`None` = nothing).
+    /// An object differing from this is proof that *this* dump landed.
+    Known(Option<crate::s3::ObjectId>),
+    /// The pre-dump HEAD failed, so a leftover archive from a previous run is
+    /// indistinguishable from a fresh one. S3 presence must not be read as
+    /// success here — only the guest can confirm this dump.
+    Unknown,
 }
 
 /// The dump job body, planted as a *file* rather than run as `sh -c '…'`, so
@@ -187,6 +289,7 @@ pub async fn dump_to_s3(
 /// pg_dump never uploads a truncated object, and the sentinel records it.
 /// `user`/`db` arrive already shell-quoted.
 fn archive_job_body(user: &str, db: &str, resolve: &str, url: &str) -> String {
+    let done = ARCHIVE_JOB.done;
     format!(
         "ec=0\n\
          if pg_dump -h 127.0.0.1 -U {user} -Fc -d {db} -f {DUMP_PATH}; then\n\
@@ -195,73 +298,300 @@ fn archive_job_body(user: &str, db: &str, resolve: &str, url: &str) -> String {
          \tec=$?\n\
          fi\n\
          rm -f {DUMP_PATH}\n\
-         printf %s \"$ec\" > {ARCHIVE_DONE_PATH}.tmp && mv {ARCHIVE_DONE_PATH}.tmp {ARCHIVE_DONE_PATH}\n"
+         printf %s \"$ec\" > {done}.tmp && mv {done}.tmp {done}\n"
     )
 }
 
-/// One exec that plants `job` and launches it: clear any prior run's
-/// sentinel/scratch, write the body through a quoted heredoc (verbatim — no
-/// expansion, so `$ec`/`$?` and the URL land intact), then background the job in
-/// a fresh session so it survives the exec returning. `echo` keeps the exec
-/// itself instant. PGPASSWORD is set on the launch exec and inherited by the
-/// detached job's pg_dump.
-///
-/// `job` must end in a newline — the heredoc delimiter has to start its own line
-/// or `sh` never closes the redirect.
-fn archive_launch_script(job: &str) -> String {
+/// The restore job body: fetch the archive from S3, load it into the
+/// already-created empty database, drop the scratch copy. Same `ec`/sentinel
+/// discipline as the dump, so a failed download never looks like a successful
+/// restore of nothing.
+fn restore_job_body(user: &str, db: &str, resolve: &str, url: &str) -> String {
+    let done = RESTORE_JOB.done;
     format!(
-        "rm -f {ARCHIVE_DONE_PATH} {DUMP_PATH} {ARCHIVE_LOG_PATH}\n\
-         cat > {ARCHIVE_JOB_PATH} <<'{ARCHIVE_JOB_EOF}'\n\
-         {job}{ARCHIVE_JOB_EOF}\n\
-         setsid sh {ARCHIVE_JOB_PATH} </dev/null >{ARCHIVE_LOG_PATH} 2>&1 &\n\
-         echo launched\n"
+        "ec=0\n\
+         if curl -fsS {resolve} -o {RESTORE_PATH} \"{url}\"; then\n\
+         \tpg_restore -h 127.0.0.1 -U {user} --no-owner --no-privileges -d {db} {RESTORE_PATH} || ec=$?\n\
+         else\n\
+         \tec=$?\n\
+         fi\n\
+         rm -f {RESTORE_PATH}\n\
+         printf %s \"$ec\" > {done}.tmp && mv {done}.tmp {done}\n"
     )
 }
 
-/// Poll the detached dump job's sentinel until it reports an exit code or
-/// [`ARCHIVE_DEADLINE`] elapses. On a non-zero job exit, pulls the guest log tail
-/// into the error so the failure (bad credentials, S3 4xx, disk-full) is visible
-/// in the sweep warning rather than lost in the VM we're about to kill.
-async fn poll_archive_job(cfg: &Config, sandbox: &Sandbox, schema: &str) -> Result<()> {
-    // One exec that both proves the guest is still answering and reports status:
-    // "P" while pending, "D<code>" once the sentinel exists. Always exits 0.
-    let probe = format!(
-        "if [ -f {ARCHIVE_DONE_PATH} ]; then printf D; cat {ARCHIVE_DONE_PATH}; else printf P; fi"
-    );
-    let deadline = Instant::now() + ARCHIVE_DEADLINE;
-    loop {
-        sleep(ARCHIVE_POLL_INTERVAL).await;
-        let res = exec_guest(cfg, sandbox, &probe, false, "polling dump job").await?;
-        let out = res.stdout.trim();
-        if let Some(code) = out.strip_prefix('D') {
-            let code: i32 = code.trim().parse().unwrap_or(-1);
-            if code == 0 {
-                return Ok(());
-            }
-            // Read the log back through the guest shell, not `files()` (see
-            // `dump_to_s3`). Best-effort: an unreadable log must not mask the
-            // job's own failure, so a failed read degrades to an empty tail.
-            let tail = format!("tail -c 2000 {ARCHIVE_LOG_PATH} 2>/dev/null || true");
-            let log = exec_guest(cfg, sandbox, &tail, false, "reading dump job log")
-                .await
-                .map(|r| r.stdout)
-                .unwrap_or_default();
+impl DetachedJob {
+    /// One exec that plants `job` and launches it: clear any prior run's
+    /// sentinel/scratch (`scratch` is the job's own transfer file), write the
+    /// body through a quoted heredoc (verbatim — no expansion, so `$ec`/`$?` and
+    /// the URL land intact), then background it in a fresh session so it
+    /// survives the exec returning. `echo` keeps the exec itself instant.
+    /// PGPASSWORD is set on the launch exec and inherited by the detached job.
+    ///
+    /// `job` must end in a newline — the heredoc delimiter has to start its own
+    /// line or `sh` never closes the redirect.
+    fn launch_script(&self, job: &str, scratch: &str) -> String {
+        let (script, done, log) = (self.script, self.done, self.log);
+        format!(
+            "rm -f {done} {scratch} {log}\n\
+             cat > {script} <<'{JOB_HEREDOC_EOF}'\n\
+             {job}{JOB_HEREDOC_EOF}\n\
+             setsid sh {script} </dev/null >{log} 2>&1 &\n\
+             echo launched\n"
+        )
+    }
+
+    async fn launch(
+        &self,
+        cfg: &Config,
+        sandbox: &Sandbox,
+        job: &str,
+        scratch: &str,
+    ) -> Result<()> {
+        let what = self.what;
+        let res = exec_guest(
+            cfg,
+            sandbox,
+            &self.launch_script(job, scratch),
+            true,
+            &format!("{what} job (launch)"),
+        )
+        .await?;
+        if res.exit_code != 0 {
             bail!(
-                "detached dump job for schema {schema} failed (exit {code}): {}",
-                truncate(log.trim(), 800)
+                "launching detached {what} failed (exit {}): {}",
+                res.exit_code,
+                truncate(exec_detail(&res), 800)
             );
         }
-        // Anything else ("P", or a transient empty read) is "still running".
+        Ok(())
+    }
+
+    /// The status probe. Built to be as cheap as a guest command can be, because
+    /// it competes for the serial console with a `pg_dump`/`pg_restore`
+    /// saturating the VM: `[`, `printf` and `read` are shell builtins, so this
+    /// forks nothing.
+    fn probe_command(&self) -> String {
+        let done = self.done;
+        format!(
+            "if [ -f {done} ]; then read c < {done}; \
+             printf '{PROBE_TAG}D%s\\n' \"$c\"; \
+             else printf '{PROBE_TAG}P\\n'; fi"
+        )
+    }
+
+    async fn probe(&self, cfg: &Config, sandbox: &Sandbox) -> Result<JobState> {
+        let what = self.what;
+        let res = exec_guest(
+            cfg,
+            sandbox,
+            &self.probe_command(),
+            false,
+            &format!("probing {what} job"),
+        )
+        .await?;
+        Ok(parse_probe(&res.stdout))
+    }
+
+    /// Best-effort tail of the job's guest-side log, so a failure (bad
+    /// credentials, S3 4xx, disk-full) is visible in the error instead of dying
+    /// with the VM. Read through the guest shell, not `files()` (see
+    /// [`dump_to_s3`]); an unreadable log must not mask the job's own failure,
+    /// so this degrades to an empty tail.
+    async fn log_tail(&self, cfg: &Config, sandbox: &Sandbox) -> String {
+        let tail = format!("tail -c 2000 {} 2>/dev/null || true", self.log);
+        exec_guest(cfg, sandbox, &tail, false, "reading job log")
+            .await
+            .map(|r| r.stdout)
+            .unwrap_or_default()
+    }
+}
+
+/// Wait for the detached dump to land, on two independent signals:
+///
+/// * **S3 `HEAD`** (authoritative, when there is a [`Baseline::Known`]). An
+///   object at `key` differing from the baseline means this run's upload
+///   completed. Costs nothing from the guest, so it survives a wedged exec
+///   channel — and it is the only signal that proves the archive exists before
+///   the caller reclaims the source disk.
+/// * **the guest sentinel** (best-effort). Turns a *failed* dump into an
+///   immediate, explained error rather than a [`ARCHIVE_DEADLINE`]-long wait.
+///   Every failure mode of this signal — timeout, garbled read, VM too busy to
+///   answer — is treated as "no information", never as a failed dump.
+///
+/// Neither signal alone can be dropped: with a [`Baseline::Unknown`] the S3 side
+/// cannot distinguish this archive from the previous one at the same key, so the
+/// sentinel becomes load-bearing and is never muted.
+///
+/// Only [`ARCHIVE_DEADLINE`] ends the wait unsuccessfully.
+async fn await_archive(
+    cfg: &Config,
+    sandbox: &Sandbox,
+    schema: &str,
+    s3: &S3Config,
+    http: &reqwest::Client,
+    key: &str,
+    baseline: &Baseline,
+) -> Result<()> {
+    let deadline = Instant::now() + ARCHIVE_DEADLINE;
+    let mut probe_failures: u32 = 0;
+    let mut probes_muted = false;
+    loop {
+        sleep(ARCHIVE_POLL_INTERVAL).await;
+
+        // 1. Did the object land? Strongly-consistent for a fresh PUT, so an
+        //    object that differs from the baseline is proof, not a hint — but
+        //    only where there *is* a baseline to differ from.
+        //
+        //    The binding records whether this HEAD could not be completed at
+        //    all, as opposed to completing and reporting the object
+        //    absent/unchanged — the two mean opposite things when the guest
+        //    claims success below.
+        let head_unavailable = match s3.head_object(http, key, ARCHIVE_HEAD_TIMEOUT).await {
+            Ok(now) => {
+                if let (Baseline::Known(before), Some(now)) = (baseline, &now)
+                    && Some(now) != before.as_ref()
+                {
+                    info!(
+                        "schema {schema}: archive present in s3://{}/{key} ({} bytes)",
+                        s3.bucket, now.content_length
+                    );
+                    return Ok(());
+                }
+                false
+            }
+            // A HEAD failure is about our S3 path, not the dump. Keep waiting;
+            // the deadline still bounds us.
+            Err(e) => {
+                warn!("schema {schema}: HEAD while waiting for archive failed: {e:#}");
+                true
+            }
+        };
+
+        // 2. Ask the guest, unless it has stopped answering — see
+        //    `ARCHIVE_MAX_PROBE_FAILURES`. Never fatal on its own.
+        if !probes_muted {
+            match ARCHIVE_JOB.probe(cfg, sandbox).await {
+                Ok(JobState::Failed(code)) => {
+                    let log = ARCHIVE_JOB.log_tail(cfg, sandbox).await;
+                    bail!(
+                        "detached dump job for schema {schema} failed (exit {code}): {}",
+                        truncate(log.trim(), 800)
+                    );
+                }
+                // The job says it uploaded successfully.
+                //
+                // If S3 is answering us, don't take its word for it — loop and
+                // let the next HEAD confirm, because the caller reclaims the
+                // disk on our `Ok`. A HEAD that says "still the old object"
+                // genuinely contradicts the guest, and waiting the deadline out
+                // is the safe way to lose that argument.
+                //
+                // If S3 is *not* answering us, there is nothing further to
+                // confirm with and the guest's report is the best evidence
+                // available — `curl -f` exiting 0 means S3 itself accepted the
+                // PUT. Refusing that would strand every archive behind the
+                // pooler's own connectivity, so accept it and say so.
+                Ok(JobState::Succeeded) => {
+                    if head_unavailable || matches!(baseline, Baseline::Unknown) {
+                        warn!(
+                            "schema {schema}: dump job reported success and the pooler \
+                             cannot independently confirm the object; accepting the \
+                             guest's report (its upload was acknowledged by S3)"
+                        );
+                        return Ok(());
+                    }
+                    probe_failures = 0;
+                }
+                Ok(JobState::Running) => probe_failures = 0,
+                Err(e) => {
+                    // Give up on the guest only when S3 can still decide for
+                    // us. Without a baseline the sentinel is the *only* signal,
+                    // so muting it would guarantee a timeout — keep asking, on
+                    // the more patient budget, and let the deadline end it.
+                    let budget = match baseline {
+                        Baseline::Known(_) => ARCHIVE_MAX_PROBE_FAILURES,
+                        Baseline::Unknown => UNWITNESSED_MAX_PROBE_FAILURES,
+                    };
+                    probe_failures += 1;
+                    warn!(
+                        "schema {schema}: dump-job probe {probe_failures}/{budget} failed \
+                         (the dump itself is unaffected — it does not use this channel): {e:#}"
+                    );
+                    if probe_failures >= budget && matches!(baseline, Baseline::Known(_)) {
+                        probes_muted = true;
+                        warn!(
+                            "schema {schema}: guest exec channel is not answering; \
+                             waiting on S3 alone until {ARCHIVE_DEADLINE:?} elapses"
+                        );
+                    }
+                }
+            }
+        }
+
         if Instant::now() >= deadline {
             bail!(
-                "detached dump job for schema {schema} did not finish within {ARCHIVE_DEADLINE:?}"
+                "dump of schema {schema} did not appear at s3://{}/{key} within \
+                 {ARCHIVE_DEADLINE:?}",
+                s3.bucket
             );
         }
     }
 }
 
+/// What the guest says about a detached job.
+enum JobState {
+    Running,
+    Succeeded,
+    Failed(i32),
+}
+
+/// Locate and read a probe reply in whatever the shared console handed back.
+///
+/// The reply is framed with a distinctive token and located *anywhere* in the
+/// output rather than at its start: the console is shared, so a line of kernel
+/// log or the tail of a previously timed-out command can precede ours. An
+/// unparseable reply is `Running` — the safe reading, since the sentinel's own
+/// zero grants success and its non-zero declares failure; neither should be
+/// inferred from noise.
+fn parse_probe(stdout: &str) -> JobState {
+    // Last match wins: stale framing from an earlier, abandoned command sits
+    // ahead of this reply in the stream.
+    let Some(reply) = stdout
+        .lines()
+        .filter_map(|l| l.trim().rsplit_once(PROBE_TAG).map(|(_, r)| r))
+        .rfind(|r| r.starts_with('D') || r.starts_with('P'))
+    else {
+        return JobState::Running;
+    };
+    match reply.strip_prefix('D') {
+        // A sentinel we can't parse is a real completion with an unreadable
+        // code — treat it as failed rather than spin until the deadline.
+        Some(code) => match code.trim().parse::<i32>() {
+            Ok(0) => JobState::Succeeded,
+            Ok(c) => JobState::Failed(c),
+            Err(_) => JobState::Failed(-1),
+        },
+        None => JobState::Running,
+    }
+}
+
 /// Restore `schema`'s database from S3 into the (already-created, empty) target
 /// database, using the guest's `curl` + `pg_restore` against a presigned GET.
+///
+/// Detached and polled, exactly like [`dump_to_s3`] and for the same reason: as
+/// one foreground exec this could only ever restore a database small enough to
+/// download *and* load inside the guest exec channel's hard 30s cap. Every real
+/// workbook exceeds that, so the restore would be killed mid-`pg_restore` and
+/// the bring-up would fail — leaving a schema that archives fine and then cannot
+/// come back.
+///
+/// Unlike the dump there is no out-of-band signal to fall back on: S3 can attest
+/// that the *source* object exists, not that this guest finished loading it. So
+/// the sentinel decides, and a guest that stops answering long enough eventually
+/// fails the restore. The asymmetry is deliberate — an unconfirmed restore
+/// aborts a bring-up and costs a retry, whereas an unconfirmed dump would have
+/// cost the disk it was dumping.
 async fn restore_from_s3(
     cfg: &Config,
     sandbox: &Sandbox,
@@ -273,13 +603,66 @@ async fn restore_from_s3(
     let resolve = s3_resolve_flag(s3).await;
     let db = shell_squote(schema);
     let user = shell_squote(&cfg.pg_user);
-    let cmd = format!(
-        "set -e; \
-         curl -fsS {resolve} '{url}' -o {RESTORE_PATH}; \
-         pg_restore -h 127.0.0.1 -U {user} --no-owner --no-privileges -d {db} {RESTORE_PATH}; \
-         rm -f {RESTORE_PATH}"
-    );
-    run_guest(cfg, sandbox, &cmd, "S3→pg_restore").await
+
+    RESTORE_JOB
+        .launch(
+            cfg,
+            sandbox,
+            &restore_job_body(&user, &db, &resolve, &url),
+            RESTORE_PATH,
+        )
+        .await?;
+    await_detached_job(cfg, sandbox, schema, RESTORE_JOB).await
+}
+
+/// Wait for a detached job whose only completion signal is its own sentinel.
+///
+/// Probe failures are tolerated — they describe the exec channel, not the job —
+/// but not indefinitely: with nothing else to ask, a channel that never comes
+/// back means we can never confirm the job, and reporting failure is the honest
+/// answer. Bounded by [`ARCHIVE_DEADLINE`] either way.
+async fn await_detached_job(
+    cfg: &Config,
+    sandbox: &Sandbox,
+    schema: &str,
+    job: DetachedJob,
+) -> Result<()> {
+    let what = job.what;
+    let deadline = Instant::now() + ARCHIVE_DEADLINE;
+    let mut probe_failures: u32 = 0;
+    loop {
+        sleep(ARCHIVE_POLL_INTERVAL).await;
+        match job.probe(cfg, sandbox).await {
+            Ok(JobState::Succeeded) => return Ok(()),
+            Ok(JobState::Failed(code)) => {
+                let log = job.log_tail(cfg, sandbox).await;
+                bail!(
+                    "detached {what} job for schema {schema} failed (exit {code}): {}",
+                    truncate(log.trim(), 800)
+                );
+            }
+            Ok(JobState::Running) => probe_failures = 0,
+            Err(e) => {
+                probe_failures += 1;
+                warn!(
+                    "schema {schema}: {what}-job probe {probe_failures}/{UNWITNESSED_MAX_PROBE_FAILURES} \
+                     failed (the {what} itself does not use this channel): {e:#}"
+                );
+                if probe_failures >= UNWITNESSED_MAX_PROBE_FAILURES {
+                    bail!(
+                        "lost contact with the guest while waiting for the {what} of \
+                         schema {schema} ({probe_failures} consecutive probe failures); \
+                         last error: {e:#}"
+                    );
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "detached {what} job for schema {schema} did not finish within {ARCHIVE_DEADLINE:?}"
+            );
+        }
+    }
 }
 
 /// Build a `curl --resolve host:443:IP[,IP…]` flag for the S3 host by resolving
@@ -345,22 +728,6 @@ fn build_resolve_flag(host: &str, ips: &[String]) -> String {
     // them in order at connect time (repeating the flag for the same host:port
     // would NOT add addresses — curl keeps the first entry).
     format!("--resolve '{host}:443:{}'", ips.join(","))
-}
-
-/// Run one guest shell command, passing the backend Postgres password (when
-/// configured) via `PGPASSWORD` in the exec environment rather than on the
-/// command line — so it never lands in the guest's process list. Fails on a
-/// non-zero exit, surfacing a bounded slice of the guest's output.
-async fn run_guest(cfg: &Config, sandbox: &Sandbox, command: &str, what: &str) -> Result<()> {
-    let res = exec_guest(cfg, sandbox, command, true, what).await?;
-    if res.exit_code != 0 {
-        bail!(
-            "{what} failed in guest (exit {}): {}",
-            res.exit_code,
-            truncate(exec_detail(&res), 800)
-        );
-    }
-    Ok(())
 }
 
 /// Issue one guest exec and hand back its raw result without judging the exit
@@ -957,15 +1324,43 @@ mod tests {
         let url = "https://wb.s3.us-east-2.amazonaws.com/x.dump?X-Amz-Algorithm=AWS4-HMAC-SHA256\
                    &X-Amz-Credential=AK%2F20260721%2Fus-east-2%2Fs3%2Faws4_request\
                    &X-Amz-Signature=deadbeef&x=`whoami`&y=$(id)";
-        let job = archive_job_body(
-            &shell_squote("postgres"),
-            &shell_squote("Kb0s7KwS"),
-            &build_resolve_flag("wb.s3.us-east-2.amazonaws.com", &["3.5.130.160".into()]),
-            url,
-        );
-        let script = archive_launch_script(&job);
+        let user = shell_squote("postgres");
+        let db = shell_squote("Kb0s7KwS");
+        let resolve = build_resolve_flag("wb.s3.us-east-2.amazonaws.com", &["3.5.130.160".into()]);
 
-        let dir = std::env::temp_dir().join(format!("pgfc-launch-{}", std::process::id()));
+        for (job_desc, body, scratch, planted_as) in [
+            (
+                ARCHIVE_JOB,
+                archive_job_body(&user, &db, &resolve, url),
+                DUMP_PATH,
+                "_archive.job.sh",
+            ),
+            (
+                RESTORE_JOB,
+                restore_job_body(&user, &db, &resolve, url),
+                RESTORE_PATH,
+                "_restore.job.sh",
+            ),
+        ] {
+            plants_verbatim(job_desc, &body, scratch, planted_as, url);
+        }
+    }
+
+    /// Run one job's real launch script through a real `sh` — with every command
+    /// it calls shadowed by stubs — and assert the file that lands is
+    /// byte-identical to the job we asked for.
+    fn plants_verbatim(
+        job_desc: DetachedJob,
+        body: &str,
+        scratch: &str,
+        planted_as: &str,
+        url: &str,
+    ) {
+        let job = body.to_string();
+        let script = job_desc.launch_script(&job, scratch);
+
+        let dir = std::env::temp_dir()
+            .join(format!("pgfc-launch-{}-{}", std::process::id(), job_desc.what));
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         // Redirect the guest's absolute /workspace paths into the temp dir, and
         // stub every command the script calls so nothing actually runs. The same
@@ -974,7 +1369,7 @@ mod tests {
         let root = format!("{}/", dir.display());
         let script = script.replace("/workspace/", &root);
         let job = job.replace("/workspace/", &root);
-        for cmd in ["setsid", "pg_dump", "curl"] {
+        for cmd in ["setsid", "pg_dump", "pg_restore", "curl"] {
             let p = dir.join("bin").join(cmd);
             std::fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
             #[cfg(unix)]
@@ -996,10 +1391,11 @@ mod tests {
         );
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "launched");
 
-        let planted = std::fs::read_to_string(dir.join("_archive.job.sh")).unwrap();
+        let planted = std::fs::read_to_string(dir.join(planted_as)).unwrap();
         assert_eq!(
             planted, job,
-            "heredoc must plant the job byte-for-byte — no expansion, no requoting"
+            "heredoc must plant the {} job byte-for-byte — no expansion, no requoting",
+            job_desc.what
         );
         // The URL's `&`/`%`/backticks must have survived intact: a mangled URL
         // yields an S3 403 long after the VM that could explain it is gone.
@@ -1007,6 +1403,103 @@ mod tests {
             planted.contains(url),
             "presigned URL was altered in transit"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The probe shares a serial console with kernel logs and with the leftover
+    /// output of commands the daemon already gave up on at its 30s timeout. The
+    /// parser must find its own reply in that noise, and — critically — must
+    /// never invent a `Succeeded` from it, since the caller destroys the source
+    /// disk on success.
+    #[test]
+    fn probe_parser_survives_a_noisy_shared_console() {
+        use JobState::*;
+        let s = parse_probe;
+
+        assert!(matches!(s("HEYOJOB:P"), Running));
+        assert!(matches!(s("HEYOJOB:D0"), Succeeded));
+        assert!(matches!(s("HEYOJOB:D22"), Failed(22)));
+        // Trailing CR from the console's line discipline.
+        assert!(matches!(s("HEYOJOB:D0\r\n"), Succeeded));
+
+        // Kernel log + the tail of an abandoned earlier command ahead of ours.
+        let noisy = "[  512.3] blk_update_request: I/O error\n\
+                     HEYOJOB:P\n\
+                     __HEYVM_1a2b_END__ 0\n\
+                     HEYOJOB:D0\n";
+        assert!(matches!(s(noisy), Succeeded), "last reply must win");
+
+        // Nothing recognisable → keep waiting. Never `Succeeded`: an empty or
+        // garbled read is exactly what a wedged console produces, and treating
+        // it as success would kill a VM whose dump never uploaded.
+        for junk in ["", "\n\n", "sh: read: not found", "HEYOJOB:", "D0"] {
+            assert!(
+                matches!(s(junk), Running),
+                "unrecognised probe output {junk:?} must read as Running"
+            );
+        }
+        // A completed job whose code is unreadable is a completion, not a hang.
+        assert!(matches!(s("HEYOJOB:Dxx"), Failed(-1)));
+    }
+
+    /// Dump and restore must not share scratch paths: a restore reads its
+    /// sentinel while the VM may still carry the previous dump's, and crossed
+    /// paths would have one job read the other's exit code.
+    #[test]
+    fn detached_jobs_have_disjoint_scratch_paths() {
+        let paths = [
+            ARCHIVE_JOB.script,
+            ARCHIVE_JOB.done,
+            ARCHIVE_JOB.log,
+            DUMP_PATH,
+            RESTORE_JOB.script,
+            RESTORE_JOB.done,
+            RESTORE_JOB.log,
+            RESTORE_PATH,
+        ];
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len(), "scratch paths collide: {paths:?}");
+    }
+
+    /// The probe runs on a VM whose single vCPU is saturated by `pg_dump`, so it
+    /// must fork nothing — every builtin it uses (`[`, `read`, `printf`) has to
+    /// really be a builtin. Run it under a PATH with *no* external commands at
+    /// all: if the script reaches for `cat`/`tail`, it fails here.
+    #[test]
+    fn probe_command_is_fork_free_and_reports_both_states() {
+        let dir = std::env::temp_dir().join(format!("pgfc-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let done = dir.join("_archive.done");
+        let cmd = ARCHIVE_JOB
+            .probe_command()
+            .replace(ARCHIVE_JOB.done, done.to_str().unwrap());
+
+        // Point PATH at an empty directory: `sh` itself is spawned by absolute
+        // path, so nothing the script names can resolve to an external binary.
+        let empty = dir.join("empty-path");
+        std::fs::create_dir_all(&empty).unwrap();
+        let run = || {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&cmd)
+                .env("PATH", &empty)
+                .output()
+                .unwrap();
+            assert!(
+                out.stderr.is_empty(),
+                "probe must not shell out: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+
+        // No sentinel yet → pending.
+        assert!(matches!(parse_probe(&run()), JobState::Running));
+        // Sentinel written by the job → its exit code comes back intact.
+        std::fs::write(&done, "0").unwrap();
+        assert!(matches!(parse_probe(&run()), JobState::Succeeded));
+        std::fs::write(&done, "7\n").unwrap();
+        assert!(matches!(parse_probe(&run()), JobState::Failed(7)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
