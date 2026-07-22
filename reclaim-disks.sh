@@ -35,15 +35,39 @@ human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}B"; }
 allocated() { du -B1 "$1" 2>/dev/null | cut -f1; }
 
 if [ "$(id -u)" != 0 ]; then
-    # A dry run only reads (du/fuser), so allow it — but warn, since fuser can't
-    # see other users' processes without root and may under-report "in use".
+    # A dry run only reads, so allow it — but warn: without root the /proc scan
+    # can't see other users' open files, so the in-use check may under-report.
     [ "$DRY_RUN" = 1 ] || die "must run as root (needs loop-setup, mount, fstrim)"
     echo "warning: not root — dry-run in-use detection may be incomplete" >&2
 fi
 [ -d "$RUN_DIR" ] || die "run dir not found: $RUN_DIR"
-for tool in losetup mount umount fstrim e2fsck fuser du numfmt; do
+for tool in losetup mount umount fstrim e2fsck readlink find du numfmt; do
     command -v "$tool" >/dev/null || die "missing required tool: $tool"
 done
+
+# Point-in-time set of every file currently held open by any process. A live
+# Firecracker keeps its data disk open as a plain fd, so it appears under
+# /proc/<pid>/fd — no fuser/lsof needed. Built once (a single `find` over all
+# fds) instead of re-scanning /proc per disk, which is O(disks x fds) and does
+# not finish on a busy host. Root sees every process's fds; without it some are
+# unreadable and silently skipped (hence the not-root warning above).
+#
+# It's a snapshot, so a VM that *starts* mid-run won't be seen — run during low
+# traffic. The blast radius of a miss is one disk, and the loop mount would still
+# have to win a race with a booting guest for it to matter.
+declare -A OPEN_FILES=()
+snapshot_open_files() {
+    local target
+    while IFS= read -r target; do
+        [ -n "$target" ] && OPEN_FILES["$target"]=1
+    done < <(find /proc/[0-9]*/fd -maxdepth 1 -type l -printf '%l\n' 2>/dev/null)
+}
+
+disk_in_use() {
+    local real
+    real=$(readlink -f "$1" 2>/dev/null) || real="$1"
+    [ -n "${OPEN_FILES[$real]:-}" ]
+}
 
 shopt -s nullglob
 disks=("$RUN_DIR"/sb-*/data.ext4)
@@ -56,7 +80,7 @@ reclaimed=0 trimmed=0 skipped=0 failed=0
 trim_one() {
     local disk="$1" loop="" mnt="" rc=0
     # Guard: never touch a disk a running VM has open.
-    if fuser -s "$disk" 2>/dev/null; then
+    if disk_in_use "$disk"; then
         echo "skip  (in use)      $disk"
         skipped=$((skipped + 1))
         return 0
@@ -112,6 +136,7 @@ trim_one() {
 }
 
 echo "reclaim-disks: ${#disks[@]} disk(s) under $RUN_DIR${DRY_RUN:+ (dry-run=$DRY_RUN)}"
+snapshot_open_files
 for disk in "${disks[@]}"; do
     trim_one "$disk"
 done
