@@ -224,6 +224,33 @@ idle running schema VM has a **reap → S3** button on its detail page to offloa
 it on demand. `PG_VM_POOL_KEEPALIVE_SCHEMAS` are exempt from eviction, same as
 from idle reaping.
 
+### Reclaiming disk slack (`reclaim-disks.sh`)
+
+A VM's data disk (`data.ext4`) is a **sparse** file provisioned at
+`PG_VM_POOL_DATA_DISK_GB`. When Postgres frees blocks inside the guest — recycled
+WAL, vacuumed heap, dropped temp/tables, a reinitialised cluster — ext4 marks
+them free, but with no TRIM/discard reaching the host those blocks are never
+punched out of the backing file. A disk therefore ratchets toward its full
+provisioned size and never shrinks, even when the live database is tiny (a 1 GB
+database routinely pins tens of GB on disk after a transient bulk load).
+
+Eviction reclaims the whole disk once a schema is *long* idle; `reclaim-disks.sh`
+reclaims the **slack** from disks whose VMs are merely stopped, without deleting
+anything. It offline-`fstrim`s every `data.ext4` whose VM is not currently
+running (loop-attach → journal-recover → `fstrim` → detach), and skips any disk a
+live Firecracker still has open (mounting that would corrupt it):
+
+```
+sudo DRY_RUN=1 ./reclaim-disks.sh ~/.heyo/run   # list candidates, change nothing
+sudo ./reclaim-disks.sh ~/.heyo/run             # actually reclaim
+```
+
+Safe to run on a schedule (it no-ops on already-lean and in-use disks), e.g. an
+hourly cron: `0 * * * * root /path/to/reclaim-disks.sh /workbooks/heyvm/run`.
+This only reclaims *stopped* VMs; a permanent fix for live VMs needs the guest to
+issue discards (a `discard` mount option or in-guest `fstrim`) **and** the
+Firecracker drive to pass them through to the backing file.
+
 ### Managing with supervisord
 
 `deploy/supervisor/pg-vm-pool.conf` runs the release binary under supervisord

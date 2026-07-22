@@ -2,7 +2,7 @@
 //! which HTML-escapes by default; no secrets are ever rendered.
 
 use heyo_sdk::SandboxStatus;
-use maud::{DOCTYPE, Markup, html};
+use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::registry::{DbStats, GuestStats};
 
@@ -16,6 +16,12 @@ const SIZE_CLASSES: [&str; 5] = ["micro", "mini", "small", "medium", "large"];
 
 /// Shared page chrome: `<head>` with inline CSS, a nav bar, and the body.
 fn shell(title: &str, body: Markup) -> Markup {
+    shell_with_head(title, html! {}, body)
+}
+
+/// Like [`shell`] but injects `extra_head` into `<head>` (e.g. a `meta
+/// http-equiv="refresh"` for the auto-refreshing log pages).
+fn shell_with_head(title: &str, extra_head: Markup, body: Markup) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -23,6 +29,7 @@ fn shell(title: &str, body: Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "pg-vm-pool · " (title) }
+                (extra_head)
                 style { (STYLE) }
             }
             body {
@@ -606,16 +613,73 @@ pub fn vm_detail_page(
     )
 }
 
-pub fn log_page(title: &str, source: &str, text: &str) -> Markup {
-    shell(
+/// A tailed log. `href_base` is the page's own path (e.g. `/logs/pooler`), used
+/// to build the auto-refresh toggle links so switching intervals keeps you on the
+/// same log. `refresh` is the current interval in seconds (`None`/0 = off).
+///
+/// Refresh is a plain `meta http-equiv="refresh"`: the browser reloads the whole
+/// URL — query string included — so `?refresh=N` survives each reload without any
+/// client state. The only script is a one-liner that jumps to the newest lines
+/// after each load.
+pub fn log_page(
+    title: &str,
+    href_base: &str,
+    source: &str,
+    text: &str,
+    refresh: Option<u64>,
+) -> Markup {
+    let secs = refresh.filter(|&s| s > 0).map(|s| s.clamp(REFRESH_MIN, REFRESH_MAX));
+    let extra_head = html! {
+        @if let Some(s) = secs {
+            meta http-equiv="refresh" content=(s);
+        }
+    };
+    shell_with_head(
         title,
+        extra_head,
         html! {
             p { a href="/" { "← Databases" } }
             h1 { "log · " (title) }
             p.dim { code { (source) } }
-            pre.log { (text) }
+            (refresh_controls(href_base, secs))
+            pre.log #logbody { (text) }
+            // Land on the newest lines after every (auto-)reload.
+            script { (PreEscaped("window.scrollTo(0, document.body.scrollHeight);")) }
         },
     )
+}
+
+/// Bounds on the honored auto-refresh interval, so a hand-edited `?refresh=`
+/// can't ask for a hammering 0.1s reload or an effectively-off multi-hour one.
+const REFRESH_MIN: u64 = 1;
+const REFRESH_MAX: u64 = 3600;
+
+/// The auto-refresh toggle row for a log page: preset intervals plus a manual
+/// reload. The active preset renders as plain text; the rest as links that set
+/// `?refresh=N` on `base` (N=0 clears it).
+fn refresh_controls(base: &str, active: Option<u64>) -> Markup {
+    const PRESETS: [(&str, u64); 5] = [("off", 0), ("2s", 2), ("5s", 5), ("10s", 10), ("30s", 30)];
+    let current = active.unwrap_or(0);
+    let href = |secs: u64| {
+        if secs == 0 {
+            base.to_string()
+        } else {
+            format!("{base}?refresh={secs}")
+        }
+    };
+    html! {
+        div.log-controls {
+            span.dim { "auto-refresh:" }
+            @for (label, secs) in PRESETS {
+                @if secs == current {
+                    span.refresh-opt.active { (label) }
+                } @else {
+                    a.refresh-opt href=(href(secs)) { (label) }
+                }
+            }
+            a.button-link href=(href(current)) { "↻ reload now" }
+        }
+    }
 }
 
 pub fn not_found_page(id: &str) -> Markup {
@@ -946,6 +1010,10 @@ button:hover, .button-link:hover { border-color:var(--btn-hover); text-decoratio
 button.stop { color:var(--err-fg); border-color:var(--err-border); }
 button.start { color:var(--ok-fg); border-color:var(--ok-border); }
 button.reap { color:var(--sess-fg); border-color:var(--sess-fg); }
+.log-controls { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; margin:.5rem 0 1rem; }
+.refresh-opt { padding:.15rem .5rem; border-radius:6px; border:1px solid transparent; }
+a.refresh-opt:hover { border-color:var(--btn-hover); text-decoration:none; }
+.refresh-opt.active { background:var(--btn-bg); border:1px solid var(--btn-border); color:var(--fg); }
 .banner { padding:.55rem .8rem; border-radius:6px; margin-bottom:1rem; border:1px solid; }
 .banner.ok { background:var(--ok-bg); border-color:var(--ok-border); color:var(--ok-fg); }
 .banner.err { background:var(--err-bg); border-color:var(--err-border); color:var(--err-fg); }

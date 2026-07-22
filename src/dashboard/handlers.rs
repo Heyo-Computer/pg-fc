@@ -130,26 +130,40 @@ pub async fn vm_detail(
     Ok(views::vm_detail_page(&st, &row, db.as_ref(), guest.as_ref(), &banner))
 }
 
-pub async fn logs_pooler(State(st): State<DashState>) -> Result<Markup, AppError> {
-    let text = logs::tail_file(&st.cfg.pooler_log, st.cfg.log_lines).await?;
-    let src = st.cfg.pooler_log.display().to_string();
-    Ok(views::log_page("pooler", &src, &text))
+/// Auto-refresh control for the log pages: `?refresh=<secs>` (absent/0 = off).
+/// The view clamps the honored value; the extractor just carries it.
+#[derive(Deserialize)]
+pub struct RefreshParams {
+    pub refresh: Option<u64>,
 }
 
-pub async fn logs_heyvmd(State(st): State<DashState>) -> Result<Markup, AppError> {
+pub async fn logs_pooler(
+    State(st): State<DashState>,
+    Query(p): Query<RefreshParams>,
+) -> Result<Markup, AppError> {
+    let text = logs::tail_file(&st.cfg.pooler_log, st.cfg.log_lines).await?;
+    let src = st.cfg.pooler_log.display().to_string();
+    Ok(views::log_page("pooler", "/logs/pooler", &src, &text, p.refresh))
+}
+
+pub async fn logs_heyvmd(
+    State(st): State<DashState>,
+    Query(p): Query<RefreshParams>,
+) -> Result<Markup, AppError> {
     let text = logs::tail_file(&st.cfg.heyvmd_log, st.cfg.log_lines).await?;
     let src = st.cfg.heyvmd_log.display().to_string();
-    Ok(views::log_page("heyvmd", &src, &text))
+    Ok(views::log_page("heyvmd", "/logs/heyvmd", &src, &text, p.refresh))
 }
 
 pub async fn logs_vm(
     State(st): State<DashState>,
     Path(id): Path<String>,
+    Query(p): Query<RefreshParams>,
 ) -> Result<Markup, AppError> {
     let text = logs::tail_vm_log(&id, st.cfg.log_lines).await?;
     let title = format!("vm {id}");
     let src = format!("{id}:/workspace/pgdata/log/postgresql-*.log");
-    Ok(views::log_page(&title, &src, &text))
+    Ok(views::log_page(&title, &format!("/logs/vm/{id}"), &src, &text, p.refresh))
 }
 
 // ---- control actions -------------------------------------------------------

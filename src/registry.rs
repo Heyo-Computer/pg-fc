@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use deadpool_postgres::Pool;
 use heyo_sdk::{P2pTunnel, Sandbox};
 use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::store::{Store, StoreRecord};
@@ -22,6 +22,12 @@ use crate::vm;
 /// to virtio-SSD storage — seconds on any size class — so a longer wait means
 /// something is wedged and the stop should proceed.
 const PRE_STOP_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often a supervised background loop (reaper, eviction sweep) logs an
+/// info-level "still alive" heartbeat when nothing else is happening. Every pass
+/// also logs at debug; this throttles the visible-at-info line so a healthy,
+/// idle loop proves liveness roughly this often without spamming the log.
+const SUPERVISOR_HEARTBEAT: Duration = Duration::from_secs(900);
 
 /// A ready, warm VM for one schema. `target` is where client bytes are spliced
 /// — either the VM's guest IP directly (same-host, no tunnel) or the local end
@@ -522,19 +528,19 @@ impl SchemaRegistry {
         // Check a few times per timeout window so shutdown lands close to the
         // deadline, but not so often it busies the daemon.
         let tick = (timeout / 4).max(Duration::from_secs(5));
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(tick).await;
-                registry.reap_idle(timeout).await;
-            }
-        });
+        tokio::spawn(supervise("idle-reaper", tick, move || {
+            let registry = registry.clone();
+            async move { registry.reap_idle(timeout).await }
+        }));
     }
 
     /// Evict and stop every idle VM. Eviction (removing the map cell) happens
     /// under the lock so a concurrent `checkout` either sees the entry before
     /// eviction (and bumps `active`, sparing it) or misses it and brings up a
     /// fresh VM. The actual stop happens after the lock is released.
-    async fn reap_idle(&self, timeout: Duration) {
+    ///
+    /// Returns how many VMs were stopped, for the supervisor's heartbeat.
+    async fn reap_idle(&self, timeout: Duration) -> usize {
         let mut victims: Vec<(String, Arc<SchemaEntry>)> = Vec::new();
         {
             let mut map = self.entries.lock().await;
@@ -546,6 +552,7 @@ impl SchemaRegistry {
                 _ => true,
             });
         }
+        let stopped = victims.len();
         for (schema, entry) in victims {
             info!("idle-stopping VM for schema {schema} (no connections for >= {timeout:?})");
             // Checkpoint before the kill. `sandbox.stop()` is an unclean
@@ -575,6 +582,7 @@ impl SchemaRegistry {
             // Dropping the last Arc here tears down the tunnel + pool. Data on
             // the VM's /dev/vdb persists; a later connect restarts the VM.
         }
+        stopped
     }
 
     // ---- S3 eviction tier ---------------------------------------------------
@@ -593,17 +601,19 @@ impl SchemaRegistry {
             archive.archive_after, archive.s3.bucket, archive.s3.prefix, archive.sweep_interval
         );
         let registry = self.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(archive.sweep_interval).await;
-                registry.sweep_archive(archive.archive_after).await;
-            }
-        });
+        let (interval, after) = (archive.sweep_interval, archive.archive_after);
+        tokio::spawn(supervise("s3-eviction", interval, move || {
+            let registry = registry.clone();
+            async move { registry.sweep_archive(after).await }
+        }));
     }
 
     /// One eviction pass: archive every non-keepalive schema untouched for at
     /// least `threshold`, skipping any that is currently warm-and-busy.
-    async fn sweep_archive(&self, threshold: Duration) {
+    ///
+    /// Returns how many schemas were successfully archived this pass, for the
+    /// supervisor's heartbeat.
+    async fn sweep_archive(&self, threshold: Duration) -> usize {
         let now = now_unix();
         let threshold_secs = threshold.as_secs();
 
@@ -636,14 +646,19 @@ impl SchemaRegistry {
         }
 
         if candidates.is_empty() {
-            return;
+            return 0;
         }
         info!("S3 eviction sweep: {} candidate schema(s)", candidates.len());
+        let mut archived = 0usize;
         for schema in candidates {
-            if let Err(e) = self.archive_schema(&schema).await {
-                warn!("archiving schema {schema} to S3 failed (will retry next sweep): {e:#}");
+            match self.archive_schema(&schema).await {
+                Ok(()) => archived += 1,
+                Err(e) => {
+                    warn!("archiving schema {schema} to S3 failed (will retry next sweep): {e:#}")
+                }
             }
         }
+        archived
     }
 
     /// Offload one schema's database to S3 and kill its VM to reclaim the disk.
@@ -710,6 +725,78 @@ impl SchemaRegistry {
 
     fn is_archiving(&self, schema: &str) -> bool {
         self.archiving.lock().unwrap().contains(schema)
+    }
+}
+
+/// Run a periodic background pass forever, surviving panics.
+///
+/// The pooler's reaper and eviction sweep are long-lived `loop { sleep; pass }`
+/// tasks. A bare `tokio::spawn`ed loop that panics mid-pass simply vanishes —
+/// no restart, only a generic task-drop — so reaping would silently stop for the
+/// rest of the process with nothing in the log pointing at it. That is exactly
+/// the class of failure we most want to avoid here.
+///
+/// So each pass runs in its own child task: a panic surfaces as a `JoinError`
+/// this supervisor logs loudly and then *continues* from, rather than an abort
+/// that kills the loop. Passes stay strictly sequential (the child is awaited
+/// before the next tick), so this changes nothing about concurrency — only
+/// survivability. Each pass also emits a heartbeat: `debug` every time, and an
+/// `info` "still alive" line at most every [`SUPERVISOR_HEARTBEAT`], so a healthy
+/// idle loop is visibly live without flooding the log.
+///
+/// `make_pass` returns the future for one pass; its `usize` output is a count of
+/// work done (VMs stopped / schemas archived), surfaced in the heartbeat.
+async fn supervise<F, Fut>(name: &'static str, tick: Duration, mut make_pass: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = usize> + Send + 'static,
+{
+    let mut passes: u64 = 0;
+    let mut actions: u64 = 0;
+    let mut last_beat: Option<Instant> = None;
+    loop {
+        tokio::time::sleep(tick).await;
+        passes += 1;
+        let started = Instant::now();
+        match tokio::spawn(make_pass()).await {
+            Ok(n) => {
+                actions += n as u64;
+                let elapsed = started.elapsed();
+                debug!("{name}: pass {passes} ok in {elapsed:?} (acted on {n})");
+                // Throttle the info-level heartbeat; always beat on the first pass
+                // so startup shows the loop is running.
+                let due = last_beat.is_none_or(|t| t.elapsed() >= SUPERVISOR_HEARTBEAT);
+                if due {
+                    info!(
+                        "{name}: alive — {passes} pass(es), {actions} action(s) total; \
+                         last pass acted on {n} in {elapsed:?}"
+                    );
+                    last_beat = Some(Instant::now());
+                }
+            }
+            // A panicked pass is isolated to its child task; recover and keep the
+            // loop alive so one bad pass never disables reaping for good.
+            Err(e) if e.is_panic() => error!(
+                "{name}: pass {passes} PANICKED after {:?} — supervisor recovering, \
+                 reaping continues: {}",
+                started.elapsed(),
+                panic_message(e.into_panic()),
+            ),
+            // Cancellation only happens on runtime shutdown; nothing to recover.
+            Err(e) => warn!("{name}: pass {passes} did not complete: {e}"),
+        }
+    }
+}
+
+/// Best-effort human text from a caught panic payload (`&str`/`String`, else a
+/// placeholder) for the supervisor's error log.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
     }
 }
 
@@ -945,5 +1032,36 @@ mod tests {
         );
         // Header only (df failed mid-flight) → None.
         assert_eq!(parse_df(out[..1].iter().copied()), None);
+    }
+
+    /// The whole point of the supervisor: a pass that panics must not kill the
+    /// loop. If it did, `calls` would freeze at 1 (the panicking pass) and every
+    /// later tick would never fire.
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_survives_a_panicking_pass() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let task = tokio::spawn(supervise("test", Duration::from_millis(10), move || {
+            let c = c.clone();
+            async move {
+                // Panic on the first pass only; succeed forever after.
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("boom on the first pass");
+                }
+                0usize
+            }
+        }));
+        // Paused clock: advancing time drives the ticks deterministically without
+        // real waiting. Several ticks should elapse past the initial panic.
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        assert!(
+            calls.load(Ordering::SeqCst) >= 3,
+            "loop stalled after the panic (only {} pass(es) ran)",
+            calls.load(Ordering::SeqCst)
+        );
     }
 }
