@@ -143,6 +143,14 @@ pub fn monitoring_page(
                             }
                         }
                     }
+                    @if st.registry.reclaim_enabled() {
+                        form method="post" action="/monitoring/reclaim" class="inline-form" {
+                            button.reap type="submit"
+                                title="Offline-trim every stopped VM's data disk now, returning stranded free space to the host. Running VMs are skipped." {
+                                "reclaim disk slack now"
+                            }
+                        }
+                    }
                 }
             }
             (banner(b))

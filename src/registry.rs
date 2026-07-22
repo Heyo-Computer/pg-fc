@@ -14,6 +14,7 @@ use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
+use crate::reclaim::{POST_STOP_RECLAIM_DELAY, RECLAIM_FIRST_DELAY, Reclaimer};
 use crate::store::{Store, StoreRecord};
 use crate::vm;
 
@@ -254,17 +255,26 @@ pub struct SchemaRegistry {
     // periodic timer and a manual "sweep now" can't stack overlapping passes over
     // the same candidates.
     sweeping: AtomicBool,
+    // Offline-trims stopped VMs' data disks (Firecracker has no discard
+    // passthrough, so freed guest blocks never return to the host on their
+    // own). `Some` when PG_VM_POOL_RECLAIM_CMD is configured.
+    reclaimer: Option<Arc<Reclaimer>>,
 }
 
 impl SchemaRegistry {
     pub fn new(cfg: Config) -> Self {
         let store = Store::load(cfg.state_file.clone());
+        let reclaimer = cfg
+            .reclaim
+            .as_ref()
+            .map(|r| Arc::new(Reclaimer::new(r.cmd.clone())));
         Self {
             cfg,
             entries: Mutex::new(HashMap::new()),
             store,
             archiving: StdMutex::new(HashSet::new()),
             sweeping: AtomicBool::new(false),
+            reclaimer,
         }
     }
 
@@ -284,6 +294,12 @@ impl SchemaRegistry {
     /// "reap to S3" control.
     pub fn archive_enabled(&self) -> bool {
         self.cfg.archive.is_some()
+    }
+
+    /// Whether automatic disk reclamation is configured — gates the dashboard's
+    /// manual "reclaim disk slack" control.
+    pub fn reclaim_enabled(&self) -> bool {
+        self.reclaimer.is_some()
     }
 
     /// Point-in-time view of every *warm* schema entry (VMs the pooler currently
@@ -593,7 +609,52 @@ impl SchemaRegistry {
             // Dropping the last Arc here tears down the tunnel + pool. Data on
             // the VM's /dev/vdb persists; a later connect restarts the VM.
         }
+        // The disks just released are prime reclaim candidates — without a trim
+        // each keeps its full high-water allocation on the host. Trigger a run
+        // once the Firecracker processes have fully exited (the script skips
+        // any disk still held open, so an early fire is safe, just less useful).
+        if stopped > 0
+            && let Some(reclaimer) = &self.reclaimer
+        {
+            reclaimer.spawn_soon(POST_STOP_RECLAIM_DELAY);
+        }
         stopped
+    }
+
+    // ---- disk-slack reclamation ---------------------------------------------
+
+    /// Spawn the periodic disk-reclaim loop if `PG_VM_POOL_RECLAIM_CMD` is
+    /// configured. Complements the post-reap trigger in [`Self::reap_idle`]:
+    /// that one returns a just-stopped VM's slack promptly; this one is the
+    /// backstop for VMs stopped out-of-band (dashboard, heyvm CLI, crashes).
+    pub fn spawn_reclaimer(self: &Arc<Self>) {
+        let Some(rc) = self.cfg.reclaim.clone() else {
+            info!("automatic disk reclaim disabled (PG_VM_POOL_RECLAIM_CMD unset)");
+            return;
+        };
+        // `reclaimer` is always Some when the config is.
+        let Some(reclaimer) = self.reclaimer.clone() else {
+            return;
+        };
+        info!(
+            "disk reclaim: running `{}` every {:?} (and after idle reaps)",
+            rc.cmd, rc.interval
+        );
+        let first = RECLAIM_FIRST_DELAY.min(rc.interval);
+        tokio::spawn(supervise("disk-reclaim", first, rc.interval, move || {
+            let reclaimer = reclaimer.clone();
+            async move { reclaimer.run_once().await }
+        }));
+    }
+
+    /// Kick off one disk-reclaim run now, in the background — the dashboard's
+    /// "reclaim disk slack" control. Errors if reclamation isn't configured or
+    /// a run is already in progress.
+    pub fn spawn_reclaim_now(&self) -> Result<()> {
+        let Some(reclaimer) = &self.reclaimer else {
+            bail!("automatic disk reclaim is not configured (set PG_VM_POOL_RECLAIM_CMD)");
+        };
+        reclaimer.spawn_now()
     }
 
     // ---- S3 eviction tier ---------------------------------------------------

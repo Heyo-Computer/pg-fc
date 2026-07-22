@@ -9,6 +9,7 @@ mod auth;
 mod config;
 mod dashboard;
 mod proxy;
+mod reclaim;
 mod registry;
 mod s3;
 mod startup;
@@ -68,6 +69,10 @@ async fn main() -> Result<()> {
     // Slow, disk-reclaiming eviction tier: offload week-idle schemas to S3 and
     // kill their VMs. No-op unless PG_VM_POOL_ARCHIVE_AFTER_SECS is configured.
     registry.spawn_archiver();
+    // Offline-trim stopped VMs' data disks so freed guest blocks return to the
+    // host (Firecracker has no discard passthrough). No-op unless
+    // PG_VM_POOL_RECLAIM_CMD is configured.
+    registry.spawn_reclaimer();
 
     // Optional admin dashboard: enabled only when PG_VM_POOL_DASHBOARD_LISTEN is
     // set. Runs in its own task sharing the registry, so it never blocks the PG

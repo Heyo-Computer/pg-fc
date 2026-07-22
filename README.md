@@ -154,6 +154,8 @@ Config via env (all optional):
 | `PG_VM_POOL_S3_REGION` | `us-east-1` | region for SigV4 signing |
 | `PG_VM_POOL_S3_ENDPOINT` | unset (AWS) | custom endpoint for an S3-compatible store (MinIO/R2); path-style addressing |
 | `PG_VM_POOL_S3_ACCESS_KEY_ID` / `PG_VM_POOL_S3_SECRET_ACCESS_KEY` | unset | S3 credentials (fall back to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) |
+| `PG_VM_POOL_RECLAIM_CMD` | unset (off) | shell command that offline-trims stopped VMs' disks (normally `sudo -n .../reclaim-disks.sh <run-dir>`); setting it enables automatic disk reclamation — see "Reclaiming disk slack" |
+| `PG_VM_POOL_RECLAIM_INTERVAL_SECS` | `3600` | how often the periodic reclaim run fires (extra runs also fire right after idle reaps) |
 
 Postgres inside each VM **tunes itself to the VM's resources at every boot**:
 `init.sh` reads live RAM/vCPUs/disk and regenerates
@@ -245,11 +247,35 @@ sudo DRY_RUN=1 ./reclaim-disks.sh ~/.heyo/run   # list candidates, change nothin
 sudo ./reclaim-disks.sh ~/.heyo/run             # actually reclaim
 ```
 
-Safe to run on a schedule (it no-ops on already-lean and in-use disks), e.g. an
-hourly cron: `0 * * * * root /path/to/reclaim-disks.sh /workbooks/heyvm/run`.
-This only reclaims *stopped* VMs; a permanent fix for live VMs needs the guest to
-issue discards (a `discard` mount option or in-guest `fstrim`) **and** the
-Firecracker drive to pass them through to the backing file.
+This only reclaims *stopped* VMs; reclaiming a **live** VM's disk would need the
+guest to issue discards (the image already mounts `/workspace` with `-o discard`)
+**and** the Firecracker drive to pass them through to the backing file — which
+Firecracker's virtio-blk does not (in-guest `fstrim` reports "the discard
+operation is not supported"). Until that changes, offline trim is the only
+reclaim path, so the pooler automates it.
+
+**Automatic reclamation:** set `PG_VM_POOL_RECLAIM_CMD` and the pooler runs it
+itself — every `PG_VM_POOL_RECLAIM_INTERVAL_SECS` (default hourly), **plus a run
+~30 s after the idle reaper stops VMs**, so a just-reaped VM's slack returns
+within a minute instead of waiting for a human or the next interval. Runs are
+single-flighted and time-bounded (30 min), the output summary lands in the
+pooler log, and the dashboard's monitoring page gets a **"reclaim disk slack
+now"** button. The command needs root for loop-setup/mount, so a non-root pooler
+invokes the script through a `NOPASSWD` sudoers entry:
+
+```
+# /etc/sudoers.d/pg-vm-pool-reclaim  (chmod 0440; adjust user + paths)
+pooler ALL=(root) NOPASSWD: /opt/pg-vm-pool/reclaim-disks.sh /workbooks/heyvm/run
+```
+
+```
+PG_VM_POOL_RECLAIM_CMD="sudo -n /opt/pg-vm-pool/reclaim-disks.sh /workbooks/heyvm/run"
+PG_VM_POOL_RECLAIM_INTERVAL_SECS=3600
+```
+
+Pin the script at a root-owned path (`chown root:root`, `chmod 0755`) so the
+sudoers entry can't be repointed by editing a user-writable file, and pass the
+run dir in the sudoers line exactly as in the command so `sudo -n` matches.
 
 ### Managing with supervisord
 

@@ -90,6 +90,45 @@ pub struct Config {
     /// [`ArchiveConfig::archive_after`] to S3 and kills its VM to reclaim disk;
     /// the next connect restores it. Enabled by `PG_VM_POOL_ARCHIVE_AFTER_SECS`.
     pub archive: Option<ArchiveConfig>,
+    /// Automatic disk-slack reclamation: periodically offline-trim stopped VMs'
+    /// sparse data disks so freed guest blocks return to the host (Firecracker's
+    /// virtio-blk has no discard passthrough, so they never come back on their
+    /// own). `None` (the default) disables it — enabled by `PG_VM_POOL_RECLAIM_CMD`.
+    pub reclaim: Option<ReclaimConfig>,
+}
+
+/// Settings for automatic disk-slack reclamation. Present (`Some`) only when
+/// `PG_VM_POOL_RECLAIM_CMD` is set — that env var is the on/off switch.
+#[derive(Clone)]
+pub struct ReclaimConfig {
+    /// Shell command (run via `sh -c`) that offline-trims stopped VMs' data
+    /// disks — normally `sudo -n /path/to/reclaim-disks.sh <run-dir>` behind a
+    /// NOPASSWD sudoers entry, since loop-setup/mount need root. The script
+    /// skips disks a running VM holds open, so invoking it at any time is safe.
+    /// Env `PG_VM_POOL_RECLAIM_CMD`.
+    pub cmd: String,
+    /// How often the periodic run fires. The pooler also triggers an extra run
+    /// shortly after the idle reaper stops VMs, so this is a backstop cadence,
+    /// not the reclaim latency. Env `PG_VM_POOL_RECLAIM_INTERVAL_SECS`
+    /// (default 3600).
+    pub interval: Duration,
+}
+
+impl ReclaimConfig {
+    /// Build the reclaim config from the environment. `None` when
+    /// `PG_VM_POOL_RECLAIM_CMD` is unset/empty (reclamation disabled).
+    pub fn from_env() -> Option<Self> {
+        let cmd = std::env::var("PG_VM_POOL_RECLAIM_CMD")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
+        let interval = std::env::var("PG_VM_POOL_RECLAIM_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(3600));
+        Some(Self { cmd, interval })
+    }
 }
 
 /// Settings for the optional S3 eviction tier. Present (`Some`) only when
@@ -177,6 +216,8 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_DASHBOARD_ALERT_INTERVAL_SECS",
     "PG_VM_POOL_ARCHIVE_AFTER_SECS",
     "PG_VM_POOL_ARCHIVE_SWEEP_SECS",
+    "PG_VM_POOL_RECLAIM_CMD",
+    "PG_VM_POOL_RECLAIM_INTERVAL_SECS",
     "PG_VM_POOL_S3_BUCKET",
     "PG_VM_POOL_S3_PREFIX",
     "PG_VM_POOL_S3_REGION",
@@ -278,6 +319,7 @@ impl Config {
 
         let dashboard = DashboardConfig::from_env()?;
         let archive = ArchiveConfig::from_env()?;
+        let reclaim = ReclaimConfig::from_env();
 
         Ok(Self {
             listen_addr,
@@ -297,6 +339,7 @@ impl Config {
             tls_key,
             dashboard,
             archive,
+            reclaim,
         })
     }
 }

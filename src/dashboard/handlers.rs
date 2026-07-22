@@ -115,6 +115,20 @@ pub async fn action_sweep_now(State(st): State<DashState>) -> Redirect {
     }
 }
 
+/// Run a disk-reclaim pass now instead of waiting for the periodic timer:
+/// offline-trim every stopped VM's data disk so its stranded free space returns
+/// to the host. Runs in the background and redirects immediately — the outcome
+/// lands in the pooler log.
+pub async fn action_reclaim_now(State(st): State<DashState>) -> Redirect {
+    match st.registry.spawn_reclaim_now() {
+        Ok(()) => Redirect::to(&format!(
+            "/monitoring?msg={}",
+            qenc("disk reclaim started; watch the pooler log")
+        )),
+        Err(e) => Redirect::to(&format!("/monitoring?err={}", qenc(&e.to_string()))),
+    }
+}
+
 pub async fn alert_delete(State(st): State<DashState>, Path(id): Path<String>) -> Redirect {
     let msg = if st.alerts.remove(&id) {
         format!("?msg={}", qenc("alert rule removed"))
