@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, bail};
 use deadpool_postgres::{Config as PgConfig, Pool, Runtime};
 use heyo_sdk::{
-    CommandRunOptions, DEFAULT_LOCAL_BASE_URL, HeyoClientOptions, HeyoError, P2pTunnel, Sandbox,
-    SandboxCreateOptions, SandboxDriver,
+    CommandResult, CommandRunOptions, DEFAULT_LOCAL_BASE_URL, FileOptions, HeyoClientOptions,
+    HeyoError, P2pTunnel, Sandbox, SandboxCreateOptions, SandboxDriver,
 };
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -99,37 +99,136 @@ pub async fn ensure_vm(
 /// leaks (e.g. into a guest shell-history) expires quickly.
 const PRESIGN_TTL: Duration = Duration::from_secs(3600);
 
-/// Cap on the guest-side dump/restore exec. A one-workbook database dumps and
-/// uploads in seconds-to-minutes; this bound only stops a wedged transfer from
-/// hanging the sweep forever.
-const ARCHIVE_EXEC_TIMEOUT: Duration = Duration::from_secs(1800);
+/// Client-side HTTP timeout for a single guest exec round-trip. The guest exec
+/// API itself hard-caps any one foreground command at ~30s server-side (and the
+/// SDK has no way to raise that — the exec body carries no timeout field), so
+/// this only has to comfortably outlast that cap to receive the response,
+/// including the 500 the server returns when it kills a command at 30s.
+const GUEST_EXEC_HTTP_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Total wall-clock the pooler will wait for a *detached* dump+upload to finish
+/// before giving up. Because the transfer runs detached in the guest (§
+/// [`dump_to_s3`]) rather than as one foreground exec, this bounds only the
+/// pooler's patience — the guest job is never itself subject to the ~30s exec
+/// cap. The sweep retries a timed-out schema next pass.
+const ARCHIVE_DEADLINE: Duration = Duration::from_secs(1800);
+
+/// How often we poll the guest for the detached dump job's completion sentinel.
+/// Each poll is a trivial `test`/`cat`, so it finishes far inside the exec cap.
+const ARCHIVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Fixed in-guest scratch paths for the dump. One VM backs exactly one schema,
 /// so a constant name is unambiguous — and unlike a schema-derived name it can't
 /// be broken by a schema containing `/` or a quote.
 const DUMP_PATH: &str = "/workspace/_archive.dump";
 const RESTORE_PATH: &str = "/workspace/_restore.dump";
+/// Scratch paths for the detached dump job: the shell script we launch, the
+/// sentinel holding its exit code once done, and its combined log (read back
+/// only to surface an error). Absolute forms for the shell; the `files()` API is
+/// rooted at the `/workspace` mount, so it addresses them by basename.
+const ARCHIVE_JOB_PATH: &str = "/workspace/_archive.job.sh";
+const ARCHIVE_DONE_PATH: &str = "/workspace/_archive.done";
+const ARCHIVE_LOG_PATH: &str = "/workspace/_archive.log";
+const ARCHIVE_JOB_FILE: &str = "_archive.job.sh";
+const ARCHIVE_LOG_FILE: &str = "_archive.log";
 
 /// Dump `schema`'s database to S3 using the guest's own `pg_dump` + `curl`
 /// against a pooler-presigned PUT URL. The dump bytes stream straight from the
 /// guest to S3 and never transit the pooler. Dumps to a file first (not a pipe)
 /// so `curl -T` sends a `Content-Length` — S3 rejects a chunked PUT.
+///
+/// The transfer runs **detached** in the guest, not as one foreground exec: the
+/// guest exec API hard-caps a single command at ~30s server-side, far too short
+/// for a multi-workbook dump+upload, and the SDK can't raise it. So we launch
+/// the dump under `setsid` (a new session with stdio fully redirected, so it
+/// outlives the launch exec) and poll a sentinel file for its exit code. Each
+/// exec we issue — the launch and every poll — is trivially short and stays well
+/// inside the cap; only the pooler-side [`ARCHIVE_DEADLINE`] bounds the wait.
 pub async fn dump_to_s3(cfg: &Config, sandbox: &Sandbox, schema: &str, s3: &S3Config) -> Result<()> {
     let key = s3.object_key(schema);
     let url = s3.presign_put(&key, PRESIGN_TTL);
     let resolve = s3_resolve_flag(s3).await;
     let db = shell_squote(schema);
     let user = shell_squote(&cfg.pg_user);
-    // `set -e`: any step failing aborts the script with a non-zero exit, which
-    // `run_guest` turns into an error — so a failed pg_dump never uploads a
-    // truncated object and reports success.
-    let cmd = format!(
-        "set -e; \
-         pg_dump -h 127.0.0.1 -U {user} -Fc -d {db} -f {DUMP_PATH}; \
-         curl -fsS {resolve} -T {DUMP_PATH} '{url}'; \
-         rm -f {DUMP_PATH}"
+
+    // The job script, written to a file rather than passed as `sh -c '…'`, so
+    // the presigned URL — full of `&`/`=` query params — never has to survive a
+    // layer of shell quoting. `ec` captures the first failing step so a failed
+    // pg_dump never uploads a truncated object, and the sentinel records it.
+    let job = format!(
+        "ec=0\n\
+         if pg_dump -h 127.0.0.1 -U {user} -Fc -d {db} -f {DUMP_PATH}; then\n\
+         \tcurl -fsS {resolve} -T {DUMP_PATH} \"{url}\" || ec=$?\n\
+         else\n\
+         \tec=$?\n\
+         fi\n\
+         rm -f {DUMP_PATH}\n\
+         printf %s \"$ec\" > {ARCHIVE_DONE_PATH}.tmp && mv {ARCHIVE_DONE_PATH}.tmp {ARCHIVE_DONE_PATH}\n"
     );
-    run_guest(cfg, sandbox, &cmd, "pg_dump→S3 upload").await
+    sandbox
+        .files()
+        .write(ARCHIVE_JOB_FILE, job, FileOptions::default())
+        .await
+        .with_context(|| format!("writing archive job script for schema {schema}"))?;
+
+    // Launch: clear any prior run's sentinel/scratch, then background the job in
+    // a fresh session so it survives this exec returning. `echo` keeps the exec
+    // itself instant. PGPASSWORD is set on the launch exec and inherited by the
+    // detached job's pg_dump.
+    let launch = format!(
+        "rm -f {ARCHIVE_DONE_PATH} {DUMP_PATH} {ARCHIVE_LOG_PATH}; \
+         setsid sh {ARCHIVE_JOB_PATH} </dev/null >{ARCHIVE_LOG_PATH} 2>&1 & \
+         echo launched"
+    );
+    let res = exec_guest(cfg, sandbox, &launch, true, "pg_dump→S3 upload (launch)").await?;
+    if res.exit_code != 0 {
+        bail!(
+            "launching detached dump failed (exit {}): {}",
+            res.exit_code,
+            truncate(exec_detail(&res), 800)
+        );
+    }
+
+    poll_archive_job(cfg, sandbox, schema).await
+}
+
+/// Poll the detached dump job's sentinel until it reports an exit code or
+/// [`ARCHIVE_DEADLINE`] elapses. On a non-zero job exit, pulls the guest log tail
+/// into the error so the failure (bad credentials, S3 4xx, disk-full) is visible
+/// in the sweep warning rather than lost in the VM we're about to kill.
+async fn poll_archive_job(cfg: &Config, sandbox: &Sandbox, schema: &str) -> Result<()> {
+    // One exec that both proves the guest is still answering and reports status:
+    // "P" while pending, "D<code>" once the sentinel exists. Always exits 0.
+    let probe = format!(
+        "if [ -f {ARCHIVE_DONE_PATH} ]; then printf D; cat {ARCHIVE_DONE_PATH}; else printf P; fi"
+    );
+    let deadline = Instant::now() + ARCHIVE_DEADLINE;
+    loop {
+        sleep(ARCHIVE_POLL_INTERVAL).await;
+        let res = exec_guest(cfg, sandbox, &probe, false, "polling dump job").await?;
+        let out = res.stdout.trim();
+        if let Some(code) = out.strip_prefix('D') {
+            let code: i32 = code.trim().parse().unwrap_or(-1);
+            if code == 0 {
+                return Ok(());
+            }
+            let log = sandbox
+                .files()
+                .read_text(ARCHIVE_LOG_FILE, FileOptions::default())
+                .await
+                .unwrap_or_default();
+            bail!(
+                "detached dump job for schema {schema} failed (exit {code}): {}",
+                truncate(log.trim(), 800)
+            );
+        }
+        // Anything else ("P", or a transient empty read) is "still running".
+        if Instant::now() >= deadline {
+            bail!(
+                "detached dump job for schema {schema} did not finish within {ARCHIVE_DEADLINE:?}"
+            );
+        }
+    }
 }
 
 /// Restore `schema`'s database from S3 into the (already-created, empty) target
@@ -217,34 +316,58 @@ fn build_resolve_flag(host: &str, ips: &[String]) -> String {
 /// command line — so it never lands in the guest's process list. Fails on a
 /// non-zero exit, surfacing a bounded slice of the guest's output.
 async fn run_guest(cfg: &Config, sandbox: &Sandbox, command: &str, what: &str) -> Result<()> {
-    let env = cfg.pg_password.as_ref().map(|pw| {
-        let mut m = HashMap::new();
-        m.insert("PGPASSWORD".to_string(), pw.clone());
-        m
-    });
-    let opts = CommandRunOptions {
-        timeout: Some(ARCHIVE_EXEC_TIMEOUT),
-        env,
-        ..Default::default()
-    };
-    let res = sandbox
-        .commands()
-        .run(command, opts)
-        .await
-        .with_context(|| format!("{what}: guest exec failed"))?;
+    let res = exec_guest(cfg, sandbox, command, true, what).await?;
     if res.exit_code != 0 {
-        let detail = if res.output.trim().is_empty() {
-            res.stderr.trim()
-        } else {
-            res.output.trim()
-        };
         bail!(
             "{what} failed in guest (exit {}): {}",
             res.exit_code,
-            truncate(detail, 800)
+            truncate(exec_detail(&res), 800)
         );
     }
     Ok(())
+}
+
+/// Issue one guest exec and hand back its raw result without judging the exit
+/// code — the caller decides. `with_pgpassword` injects `PGPASSWORD` for commands
+/// that shell out to `pg_dump`/`pg_restore`; a bare `cat`/`test` poll doesn't need
+/// it. The exec's own foreground command must finish inside the guest API's ~30s
+/// server-side cap; [`dump_to_s3`] keeps every call it makes trivially short.
+async fn exec_guest(
+    cfg: &Config,
+    sandbox: &Sandbox,
+    command: &str,
+    with_pgpassword: bool,
+    what: &str,
+) -> Result<CommandResult> {
+    let env = if with_pgpassword {
+        cfg.pg_password.as_ref().map(|pw| {
+            let mut m = HashMap::new();
+            m.insert("PGPASSWORD".to_string(), pw.clone());
+            m
+        })
+    } else {
+        None
+    };
+    let opts = CommandRunOptions {
+        timeout: Some(GUEST_EXEC_HTTP_TIMEOUT),
+        env,
+        ..Default::default()
+    };
+    sandbox
+        .commands()
+        .run(command, opts)
+        .await
+        .with_context(|| format!("{what}: guest exec failed"))
+}
+
+/// Best-effort human-readable detail from a failed guest command: the combined
+/// output if the backend populated it, else stderr.
+fn exec_detail(res: &CommandResult) -> &str {
+    if res.output.trim().is_empty() {
+        res.stderr.trim()
+    } else {
+        res.output.trim()
+    }
 }
 
 /// Single-quote a string for POSIX `sh`, escaping embedded single quotes as
