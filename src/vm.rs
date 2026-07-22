@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, bail};
 use deadpool_postgres::{Config as PgConfig, Pool, Runtime};
 use heyo_sdk::{
-    CommandResult, CommandRunOptions, DEFAULT_LOCAL_BASE_URL, FileOptions, HeyoClientOptions,
-    HeyoError, P2pTunnel, Sandbox, SandboxCreateOptions, SandboxDriver,
+    CommandResult, CommandRunOptions, DEFAULT_LOCAL_BASE_URL, HeyoClientOptions, HeyoError,
+    P2pTunnel, Sandbox, SandboxCreateOptions, SandboxDriver,
 };
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -124,13 +124,18 @@ const DUMP_PATH: &str = "/workspace/_archive.dump";
 const RESTORE_PATH: &str = "/workspace/_restore.dump";
 /// Scratch paths for the detached dump job: the shell script we launch, the
 /// sentinel holding its exit code once done, and its combined log (read back
-/// only to surface an error). Absolute forms for the shell; the `files()` API is
-/// rooted at the `/workspace` mount, so it addresses them by basename.
+/// only to surface an error). All addressed by absolute path from inside the
+/// guest shell — the SDK's `files()` API cannot reach them (see
+/// [`dump_to_s3`]).
 const ARCHIVE_JOB_PATH: &str = "/workspace/_archive.job.sh";
 const ARCHIVE_DONE_PATH: &str = "/workspace/_archive.done";
 const ARCHIVE_LOG_PATH: &str = "/workspace/_archive.log";
-const ARCHIVE_JOB_FILE: &str = "_archive.job.sh";
-const ARCHIVE_LOG_FILE: &str = "_archive.log";
+
+/// Heredoc delimiter used to plant the job script from the launch exec. Quoted
+/// at the use site (`<<'…'`) so the body — which contains `$ec`, `$?` and a
+/// presigned URL full of `&`/`=`/`%` — is written through verbatim, with no
+/// expansion and no shell-quoting layer to survive.
+const ARCHIVE_JOB_EOF: &str = "HEYO_ARCHIVE_JOB_EOF";
 
 /// Dump `schema`'s database to S3 using the guest's own `pg_dump` + `curl`
 /// against a pooler-presigned PUT URL. The dump bytes stream straight from the
@@ -144,42 +149,26 @@ const ARCHIVE_LOG_FILE: &str = "_archive.log";
 /// outlives the launch exec) and poll a sentinel file for its exit code. Each
 /// exec we issue — the launch and every poll — is trivially short and stays well
 /// inside the cap; only the pooler-side [`ARCHIVE_DEADLINE`] bounds the wait.
-pub async fn dump_to_s3(cfg: &Config, sandbox: &Sandbox, schema: &str, s3: &S3Config) -> Result<()> {
+///
+/// Everything here goes through `exec` rather than the SDK's `files()` API,
+/// which is **not usable on these VMs**: `write-file`/`read-file` resolve a path
+/// against a *host-side bind mount* declared at create time, so on a Firecracker
+/// sandbox whose `/workspace` is a guest block device (`/dev/vdb`) there is no
+/// matching mount and the daemon answers `Mount not found: /workspace (available
+/// mounts: [])`. The guest's own shell is the only way in.
+pub async fn dump_to_s3(
+    cfg: &Config,
+    sandbox: &Sandbox,
+    schema: &str,
+    s3: &S3Config,
+) -> Result<()> {
     let key = s3.object_key(schema);
     let url = s3.presign_put(&key, PRESIGN_TTL);
     let resolve = s3_resolve_flag(s3).await;
     let db = shell_squote(schema);
     let user = shell_squote(&cfg.pg_user);
 
-    // The job script, written to a file rather than passed as `sh -c '…'`, so
-    // the presigned URL — full of `&`/`=` query params — never has to survive a
-    // layer of shell quoting. `ec` captures the first failing step so a failed
-    // pg_dump never uploads a truncated object, and the sentinel records it.
-    let job = format!(
-        "ec=0\n\
-         if pg_dump -h 127.0.0.1 -U {user} -Fc -d {db} -f {DUMP_PATH}; then\n\
-         \tcurl -fsS {resolve} -T {DUMP_PATH} \"{url}\" || ec=$?\n\
-         else\n\
-         \tec=$?\n\
-         fi\n\
-         rm -f {DUMP_PATH}\n\
-         printf %s \"$ec\" > {ARCHIVE_DONE_PATH}.tmp && mv {ARCHIVE_DONE_PATH}.tmp {ARCHIVE_DONE_PATH}\n"
-    );
-    sandbox
-        .files()
-        .write(ARCHIVE_JOB_FILE, job, FileOptions::default())
-        .await
-        .with_context(|| format!("writing archive job script for schema {schema}"))?;
-
-    // Launch: clear any prior run's sentinel/scratch, then background the job in
-    // a fresh session so it survives this exec returning. `echo` keeps the exec
-    // itself instant. PGPASSWORD is set on the launch exec and inherited by the
-    // detached job's pg_dump.
-    let launch = format!(
-        "rm -f {ARCHIVE_DONE_PATH} {DUMP_PATH} {ARCHIVE_LOG_PATH}; \
-         setsid sh {ARCHIVE_JOB_PATH} </dev/null >{ARCHIVE_LOG_PATH} 2>&1 & \
-         echo launched"
-    );
+    let launch = archive_launch_script(&archive_job_body(&user, &db, &resolve, &url));
     let res = exec_guest(cfg, sandbox, &launch, true, "pg_dump→S3 upload (launch)").await?;
     if res.exit_code != 0 {
         bail!(
@@ -190,6 +179,43 @@ pub async fn dump_to_s3(cfg: &Config, sandbox: &Sandbox, schema: &str, s3: &S3Co
     }
 
     poll_archive_job(cfg, sandbox, schema).await
+}
+
+/// The dump job body, planted as a *file* rather than run as `sh -c '…'`, so
+/// the presigned URL — full of `&`/`=` query params — never has to survive a
+/// layer of shell quoting. `ec` captures the first failing step so a failed
+/// pg_dump never uploads a truncated object, and the sentinel records it.
+/// `user`/`db` arrive already shell-quoted.
+fn archive_job_body(user: &str, db: &str, resolve: &str, url: &str) -> String {
+    format!(
+        "ec=0\n\
+         if pg_dump -h 127.0.0.1 -U {user} -Fc -d {db} -f {DUMP_PATH}; then\n\
+         \tcurl -fsS {resolve} -T {DUMP_PATH} \"{url}\" || ec=$?\n\
+         else\n\
+         \tec=$?\n\
+         fi\n\
+         rm -f {DUMP_PATH}\n\
+         printf %s \"$ec\" > {ARCHIVE_DONE_PATH}.tmp && mv {ARCHIVE_DONE_PATH}.tmp {ARCHIVE_DONE_PATH}\n"
+    )
+}
+
+/// One exec that plants `job` and launches it: clear any prior run's
+/// sentinel/scratch, write the body through a quoted heredoc (verbatim — no
+/// expansion, so `$ec`/`$?` and the URL land intact), then background the job in
+/// a fresh session so it survives the exec returning. `echo` keeps the exec
+/// itself instant. PGPASSWORD is set on the launch exec and inherited by the
+/// detached job's pg_dump.
+///
+/// `job` must end in a newline — the heredoc delimiter has to start its own line
+/// or `sh` never closes the redirect.
+fn archive_launch_script(job: &str) -> String {
+    format!(
+        "rm -f {ARCHIVE_DONE_PATH} {DUMP_PATH} {ARCHIVE_LOG_PATH}\n\
+         cat > {ARCHIVE_JOB_PATH} <<'{ARCHIVE_JOB_EOF}'\n\
+         {job}{ARCHIVE_JOB_EOF}\n\
+         setsid sh {ARCHIVE_JOB_PATH} </dev/null >{ARCHIVE_LOG_PATH} 2>&1 &\n\
+         echo launched\n"
+    )
 }
 
 /// Poll the detached dump job's sentinel until it reports an exit code or
@@ -212,10 +238,13 @@ async fn poll_archive_job(cfg: &Config, sandbox: &Sandbox, schema: &str) -> Resu
             if code == 0 {
                 return Ok(());
             }
-            let log = sandbox
-                .files()
-                .read_text(ARCHIVE_LOG_FILE, FileOptions::default())
+            // Read the log back through the guest shell, not `files()` (see
+            // `dump_to_s3`). Best-effort: an unreadable log must not mask the
+            // job's own failure, so a failed read degrades to an empty tail.
+            let tail = format!("tail -c 2000 {ARCHIVE_LOG_PATH} 2>/dev/null || true");
+            let log = exec_guest(cfg, sandbox, &tail, false, "reading dump job log")
                 .await
+                .map(|r| r.stdout)
                 .unwrap_or_default();
             bail!(
                 "detached dump job for schema {schema} failed (exit {code}): {}",
@@ -233,7 +262,12 @@ async fn poll_archive_job(cfg: &Config, sandbox: &Sandbox, schema: &str) -> Resu
 
 /// Restore `schema`'s database from S3 into the (already-created, empty) target
 /// database, using the guest's `curl` + `pg_restore` against a presigned GET.
-async fn restore_from_s3(cfg: &Config, sandbox: &Sandbox, schema: &str, s3: &S3Config) -> Result<()> {
+async fn restore_from_s3(
+    cfg: &Config,
+    sandbox: &Sandbox,
+    schema: &str,
+    s3: &S3Config,
+) -> Result<()> {
     let key = s3.object_key(schema);
     let url = s3.presign_get(&key, PRESIGN_TTL);
     let resolve = s3_resolve_flag(s3).await;
@@ -275,7 +309,9 @@ async fn s3_resolve_flag(s3: &S3Config) -> String {
     let addrs = match tokio::time::timeout(RESOLVE_TIMEOUT, lookup).await {
         Ok(Ok(addrs)) => addrs,
         Ok(Err(e)) => {
-            warn!("resolving {host} on host for guest curl failed ({e}); guest will use its own DNS");
+            warn!(
+                "resolving {host} on host for guest curl failed ({e}); guest will use its own DNS"
+            );
             return String::new();
         }
         Err(_) => {
@@ -910,13 +946,80 @@ mod tests {
         build_pool("127.0.0.1", port, "postgres", "postgres", None).unwrap()
     }
 
+    /// The launch script is parsed by the guest's `sh`, and its heredoc carries
+    /// a presigned URL (`&`, `=`, `%`, `?`) plus literal `$ec`/`$?`. Run the
+    /// real thing through a real shell — with `cat`/`setsid`/`pg_dump` shadowed
+    /// by stubs on PATH — and assert the file that lands is byte-identical to
+    /// the job we asked for. A quoting slip here is invisible until an archive
+    /// silently uploads nothing.
+    #[test]
+    fn launch_script_plants_the_job_verbatim() {
+        let url = "https://wb.s3.us-east-2.amazonaws.com/x.dump?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+                   &X-Amz-Credential=AK%2F20260721%2Fus-east-2%2Fs3%2Faws4_request\
+                   &X-Amz-Signature=deadbeef&x=`whoami`&y=$(id)";
+        let job = archive_job_body(
+            &shell_squote("postgres"),
+            &shell_squote("Kb0s7KwS"),
+            &build_resolve_flag("wb.s3.us-east-2.amazonaws.com", &["3.5.130.160".into()]),
+            url,
+        );
+        let script = archive_launch_script(&job);
+
+        let dir = std::env::temp_dir().join(format!("pgfc-launch-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        // Redirect the guest's absolute /workspace paths into the temp dir, and
+        // stub every command the script calls so nothing actually runs. The same
+        // rewrite applies to the expected body, since it is embedded in the
+        // script we run.
+        let root = format!("{}/", dir.display());
+        let script = script.replace("/workspace/", &root);
+        let job = job.replace("/workspace/", &root);
+        for cmd in ["setsid", "pg_dump", "curl"] {
+            let p = dir.join("bin").join(cmd);
+            std::fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", format!("{}/bin:/usr/bin:/bin", dir.display()))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "launch script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "launched");
+
+        let planted = std::fs::read_to_string(dir.join("_archive.job.sh")).unwrap();
+        assert_eq!(
+            planted, job,
+            "heredoc must plant the job byte-for-byte — no expansion, no requoting"
+        );
+        // The URL's `&`/`%`/backticks must have survived intact: a mangled URL
+        // yields an S3 403 long after the VM that could explain it is gone.
+        assert!(
+            planted.contains(url),
+            "presigned URL was altered in transit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn resolve_flag_pins_ips_or_stays_empty() {
         // No IPs → no flag, so curl falls back to the guest's own DNS unchanged.
         assert_eq!(build_resolve_flag("wb.s3.us-east-2.amazonaws.com", &[]), "");
         // One or more IPs → a single quoted, comma-joined --resolve entry.
         let one = build_resolve_flag("wb.s3.us-east-2.amazonaws.com", &["3.5.130.160".into()]);
-        assert_eq!(one, "--resolve 'wb.s3.us-east-2.amazonaws.com:443:3.5.130.160'");
+        assert_eq!(
+            one,
+            "--resolve 'wb.s3.us-east-2.amazonaws.com:443:3.5.130.160'"
+        );
         let many = build_resolve_flag(
             "wb.s3.us-east-2.amazonaws.com",
             &["3.5.130.160".into(), "52.219.0.1".into()],
