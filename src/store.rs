@@ -27,7 +27,8 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -73,6 +74,16 @@ impl Rec {
 pub struct Store {
     path: PathBuf,
     map: Mutex<HashMap<String, Rec>>,
+    /// Monotone snapshot generation, assigned under the `map` lock when a
+    /// snapshot is produced. The writer refuses to write a generation older
+    /// than the newest already written, so out-of-order write tasks can never
+    /// roll the file back to a stale snapshot.
+    seq: AtomicU64,
+    /// Serializes the actual file writes and remembers the newest generation
+    /// written. Deliberately separate from `map`: the write path fsyncs, and
+    /// on a saturated disk that stalls for seconds — it must never hold up
+    /// readers or in-memory updates. `Arc` so write closures can own it.
+    written: Arc<Mutex<u64>>,
 }
 
 impl Store {
@@ -95,7 +106,16 @@ impl Store {
         Store {
             path,
             map: Mutex::new(map),
+            seq: AtomicU64::new(0),
+            written: Arc::new(Mutex::new(0)),
         }
+    }
+
+    /// Stamp a freshly serialized snapshot with the next generation. Must be
+    /// called while the `map` lock is held, so generation order matches
+    /// snapshot content order.
+    fn stamp(&self, snapshot: String) -> (u64, String) {
+        (self.seq.fetch_add(1, Ordering::SeqCst) + 1, snapshot)
     }
 
     /// The full durable record for `schema`, if any.
@@ -128,7 +148,7 @@ impl Store {
                     r.last_active = now;
                     if now.saturating_sub(r.flushed_last_active) >= FLUSH_DEBOUNCE_SECS {
                         r.flushed_last_active = now;
-                        Some(serialize(&map))
+                        Some(self.stamp(serialize(&map)))
                     } else {
                         None
                     }
@@ -143,11 +163,11 @@ impl Store {
                             flushed_last_active: now,
                         },
                     );
-                    Some(serialize(&map))
+                    Some(self.stamp(serialize(&map)))
                 }
             }
         };
-        self.maybe_write(snapshot);
+        self.write_detached(snapshot);
     }
 
     /// Bump `last_active` for `schema` to now (in memory), flushing only past
@@ -162,38 +182,84 @@ impl Store {
             r.last_active = now;
             if now.saturating_sub(r.flushed_last_active) >= FLUSH_DEBOUNCE_SECS {
                 r.flushed_last_active = now;
-                Some(serialize(&map))
+                Some(self.stamp(serialize(&map)))
             } else {
                 None
             }
         };
-        self.maybe_write(snapshot);
+        self.write_detached(snapshot);
     }
 
     /// Mark `schema` archived (VM killed, data only in S3) and flush. The
     /// archived flag is *cleared* by [`Self::put`] when a fresh VM id is recorded
     /// after a restore — that's the same event that makes the data live again.
-    pub fn mark_archived(&self, schema: &str) {
+    ///
+    /// Unlike `put`/`touch` this **waits for the write to reach disk**: the
+    /// caller kills the VM right after, and the archived flag must be durable
+    /// *before* the kill — a crash in between with the flag unwritten would
+    /// leave a "live" record pointing at a dead VM, and the next connect would
+    /// build a fresh empty database instead of restoring from S3.
+    pub async fn mark_archived(&self, schema: &str) {
         let snapshot = {
             let mut map = self.map.lock().unwrap();
             let Some(r) = map.get_mut(schema) else {
                 return;
             };
             r.archived = true;
-            Some(serialize(&map))
+            self.stamp(serialize(&map))
         };
-        self.maybe_write(snapshot);
-    }
-
-    fn maybe_write(&self, snapshot: Option<String>) {
-        if let Some(snapshot) = snapshot
-            && let Err(e) = write_atomic(&self.path, &snapshot)
-        {
+        let (seq, contents) = snapshot;
+        let path = self.path.clone();
+        let written = self.written.clone();
+        let res =
+            tokio::task::spawn_blocking(move || write_latest(&path, &written, seq, &contents))
+                .await;
+        if let Err(e) = res {
             warn!(
-                "failed to persist pooler registry to {}: {e:#}",
+                "persisting archived flag to {} did not complete: {e}",
                 self.path.display()
             );
         }
+    }
+
+    /// Queue a stamped snapshot for writing without blocking this thread on
+    /// disk I/O. The write (create + fsync + rename) runs on the blocking
+    /// pool — an fsync stalled behind heavy writeback must never pin an async
+    /// worker thread, or enough of them starve the whole runtime (the
+    /// "dashboard times out during sweeps" failure). Best-effort by design:
+    /// `put`/`touch` losing their last write to a crash only costs a
+    /// find-by-name or a slightly stale idle clock on the next boot.
+    /// Generation stamping keeps concurrent writes from ever regressing the
+    /// file. Outside a tokio runtime (unit tests, sync callers) it writes
+    /// inline.
+    fn write_detached(&self, snapshot: Option<(u64, String)>) {
+        let Some((seq, contents)) = snapshot else {
+            return;
+        };
+        let path = self.path.clone();
+        let written = self.written.clone();
+        let write = move || write_latest(&path, &written, seq, &contents);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(write);
+            }
+            Err(_) => write(),
+        }
+    }
+}
+
+/// Write `contents` (generation `seq`) unless a newer generation has already
+/// been written. Holds the `written` lock across the write so writers
+/// serialize; on success records the generation, on failure logs and leaves
+/// the previous generation in place (a later snapshot will retry the state).
+fn write_latest(path: &Path, written: &Mutex<u64>, seq: u64, contents: &str) {
+    let mut newest = written.lock().unwrap();
+    if seq <= *newest {
+        return;
+    }
+    match write_atomic(path, contents) {
+        Ok(()) => *newest = seq,
+        Err(e) => warn!("failed to persist pooler registry to {}: {e:#}", path.display()),
     }
 }
 
@@ -301,8 +367,8 @@ mod tests {
         assert_eq!(reparsed.get("b").unwrap().last_active, 200);
     }
 
-    #[test]
-    fn put_touch_mark_clear_flow() {
+    #[tokio::test]
+    async fn put_touch_mark_clear_flow() {
         let dir = std::env::temp_dir().join(format!("pgvmpool-store-{}", std::process::id()));
         let path = dir.join("registry.tsv");
         let _ = std::fs::remove_file(&path);
@@ -313,7 +379,9 @@ mod tests {
         assert_eq!(r.sandbox_id, "sb-1");
         assert!(!r.archived);
 
-        store.mark_archived("wb");
+        // Durable once it returns — the reload below must see it even if the
+        // detached `put` write above hasn't landed (generation order covers it).
+        store.mark_archived("wb").await;
         assert!(store.record("wb").unwrap().archived);
 
         // Reload from disk: archived state survives a restart.
@@ -328,5 +396,20 @@ mod tests {
         assert_eq!(r.sandbox_id, "sb-2");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stale_generations_never_regress_the_file() {
+        let dir = std::env::temp_dir().join(format!("pgvmpool-seq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.tsv");
+        let written = Mutex::new(0u64);
+        write_latest(&path, &written, 2, "newer\tsb-2\t2\tlive\n");
+        // A write task carrying an older snapshot finishes late: skipped.
+        write_latest(&path, &written, 1, "older\tsb-1\t1\tlive\n");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("newer"));
+        assert!(!on_disk.contains("older"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

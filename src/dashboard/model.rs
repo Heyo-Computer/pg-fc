@@ -15,7 +15,9 @@
 //! also walks `GET /sandboxes/inactive`.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::http::Method;
@@ -55,7 +57,8 @@ pub const STATE_ALL: &str = "all";
 
 /// The subset of the daemon's raw sandbox record we render. Extra JSON fields
 /// are ignored; missing ones default, so this tolerates daemon schema drift.
-#[derive(Deserialize)]
+/// `Clone` because page renders clone the cached inventory to join/filter it.
+#[derive(Deserialize, Clone)]
 struct RawSandbox {
     id: String,
     #[serde(default)]
@@ -318,6 +321,120 @@ pub async fn fetch_host_usage(st: &DashState) -> Option<HostUsage> {
     }
 }
 
+/// How long a cached inventory snapshot is served without kicking a refresh.
+/// Auto-refreshing dashboards (2–5s presets), the 60s history sampler, and the
+/// alerts evaluator all read through the cache, so heyvmd sees at most one
+/// inventory walk per this interval instead of one per request.
+const INVENTORY_FRESH: Duration = Duration::from_secs(5);
+
+/// One fetched-and-parsed daemon inventory: the merged sandbox list plus the
+/// per-sandbox CPU sample, wrapped in `Arc`s so serving a cached copy is a
+/// pointer clone.
+#[derive(Clone)]
+struct InvSnapshot {
+    at: Instant,
+    list: Arc<Vec<RawSandbox>>,
+    usage: Arc<HashMap<String, f32>>,
+}
+
+/// Cached daemon inventory with stale-while-revalidate semantics. Page renders
+/// were previously O(daemon latency) — one `/deployed-sandboxes` call plus a
+/// cursor walk of `/sandboxes/inactive`, each leg with its own fresh 10s
+/// budget, so a daemon slowed by a sweep's start/dump/kill cycles could
+/// stretch a single render past 30s without any one call timing out. With the
+/// cache, a render is an in-memory read: a fresh snapshot is served as-is, a
+/// stale one is served *immediately* while one background task (single-flight)
+/// refreshes it, and only the very first render after startup fetches inline.
+pub struct InventoryCache {
+    snapshot: Mutex<Option<InvSnapshot>>,
+    refreshing: AtomicBool,
+}
+
+/// What `cached_inventory` should do for a snapshot of a given age. Factored
+/// out for testability.
+#[derive(PartialEq, Debug)]
+enum Serve {
+    Fresh,
+    StaleRefresh,
+    ColdFetch,
+}
+
+fn serve_plan(age: Option<Duration>) -> Serve {
+    match age {
+        None => Serve::ColdFetch,
+        Some(a) if a < INVENTORY_FRESH => Serve::Fresh,
+        Some(_) => Serve::StaleRefresh,
+    }
+}
+
+impl InventoryCache {
+    pub fn new() -> Self {
+        Self {
+            snapshot: Mutex::new(None),
+            refreshing: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Clears the refresh single-flight flag on drop, so a panicking or cancelled
+/// refresh task can't permanently wedge the cache into never refreshing again.
+struct RefreshGuard(Arc<InventoryCache>);
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        self.0.refreshing.store(false, Ordering::SeqCst);
+    }
+}
+
+/// One full inventory fetch straight from the daemon (no cache).
+async fn fetch_snapshot() -> Result<InvSnapshot> {
+    let client = HeyoClient::new(vm::local_opts()).context("building heyo client")?;
+    let (list, usage) = tokio::join!(fetch_inventory(&client), fetch_usage(&client));
+    Ok(InvSnapshot {
+        at: Instant::now(),
+        list: Arc::new(list?),
+        usage: Arc::new(usage),
+    })
+}
+
+/// The daemon inventory for a page render, via the cache. Serves stale data
+/// (refreshing in the background) rather than making the request wait — for an
+/// admin view, seconds-old data beats a spinner every time.
+async fn cached_inventory(
+    st: &DashState,
+) -> Result<(Arc<Vec<RawSandbox>>, Arc<HashMap<String, f32>>)> {
+    let cache = &st.inventory;
+    let current = cache.snapshot.lock().unwrap().clone();
+    match serve_plan(current.as_ref().map(|s| s.at.elapsed())) {
+        Serve::Fresh => {
+            let s = current.unwrap();
+            Ok((s.list, s.usage))
+        }
+        Serve::StaleRefresh => {
+            let s = current.unwrap();
+            if !cache.refreshing.swap(true, Ordering::SeqCst) {
+                let cache = st.inventory.clone();
+                tokio::spawn(async move {
+                    let _guard = RefreshGuard(cache.clone());
+                    match fetch_snapshot().await {
+                        Ok(snap) => *cache.snapshot.lock().unwrap() = Some(snap),
+                        // Keep serving the stale snapshot; the next stale read
+                        // retries. The daemon being briefly unlistable must
+                        // not blank a page that has data to show.
+                        Err(e) => warn!("background inventory refresh failed: {e:#}"),
+                    }
+                });
+            }
+            Ok((s.list, s.usage))
+        }
+        Serve::ColdFetch => {
+            let snap = fetch_snapshot().await?;
+            *cache.snapshot.lock().unwrap() = Some(snap.clone());
+            Ok((snap.list, snap.usage))
+        }
+    }
+}
+
 const INACTIVE_PAGE_SIZE: usize = 200;
 /// Backstop on the inactive-list walk so a pathological daemon answer can't
 /// spin the dashboard: 25 pages × 200 = 5000 sandboxes per request, far above
@@ -464,13 +581,12 @@ fn join_row(
     }
 }
 
-/// Build the full VM list: fetch the raw sandbox inventory and the daemon's
+/// Build the full VM list: read the (cached) sandbox inventory and daemon
 /// usage sample, join the registry snapshot + store. No guest access — safe
 /// to call on every page load/refresh.
 pub async fn build_rows(st: &DashState) -> Result<Vec<VmRow>> {
-    let client = HeyoClient::new(vm::local_opts()).context("building heyo client")?;
-    let (list, usage) = tokio::join!(fetch_inventory(&client), fetch_usage(&client));
-    let mut list = list?;
+    let (list, usage) = cached_inventory(st).await?;
+    let mut list = (*list).clone();
     let (snap, store, records) = pooler_maps(st).await;
     append_archived(&mut list, &records);
 
@@ -523,9 +639,8 @@ pub async fn build_page(
     page: usize,
     per: usize,
 ) -> Result<SandboxPage> {
-    let client = HeyoClient::new(vm::local_opts()).context("building heyo client")?;
-    let (list, usage) = tokio::join!(fetch_inventory(&client), fetch_usage(&client));
-    let mut list = list?;
+    let (list, usage) = cached_inventory(st).await?;
+    let mut list = (*list).clone();
     let (snap, store, records) = pooler_maps(st).await;
     append_archived(&mut list, &records);
     let total = list.len();
@@ -778,6 +893,19 @@ mod tests {
         assert!(!state_matches(&running, "bogus"));
         // Every filter label is a status_str label, so pill counts line up.
         assert!(STATE_FILTERS.contains(&status_str(&running.status)));
+    }
+
+    #[test]
+    fn serve_plan_prefers_stale_over_waiting() {
+        // No snapshot yet: the render must fetch inline — there is nothing to show.
+        assert_eq!(serve_plan(None), Serve::ColdFetch);
+        // Fresh: serve as-is, no daemon traffic.
+        assert_eq!(serve_plan(Some(Duration::from_secs(1))), Serve::Fresh);
+        // Stale — even *very* stale (daemon was down a while): still serve the
+        // data immediately and refresh behind the request, never block a render
+        // on the daemon.
+        assert_eq!(serve_plan(Some(INVENTORY_FRESH)), Serve::StaleRefresh);
+        assert_eq!(serve_plan(Some(Duration::from_secs(3600))), Serve::StaleRefresh);
     }
 
     #[test]

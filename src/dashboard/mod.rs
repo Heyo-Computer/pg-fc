@@ -63,6 +63,7 @@ pub async fn serve(cfg: DashboardConfig, registry: Arc<SchemaRegistry>) -> Resul
         cfg: Arc::new(cfg),
         alerts,
         history: Arc::new(history::VmHistory::new(history::CAPACITY)),
+        inventory: Arc::new(model::InventoryCache::new()),
     };
     // Background webhook-alert evaluator: samples host metrics on an interval and
     // fires any crossed rules. Shares the same `AlertStore` the pages mutate.

@@ -840,7 +840,7 @@ impl SchemaRegistry {
             .await
             .with_context(|| format!("dumping schema {schema} to S3"))?;
 
-        self.store.mark_archived(schema);
+        self.store.mark_archived(schema).await;
         info!("schema {schema}: dumped to s3://{}/{}", archive.s3.bucket, archive.s3.object_key(schema));
 
         if let Err(e) = entry.sandbox.kill().await {
