@@ -186,10 +186,22 @@ impl S3Config {
                 .unwrap_or_default()
                 .to_string()
         };
+        // The object size must come from the `content-length` HEADER.
+        // `reqwest::Response::content_length()` reports the response *body*
+        // size — and a HEAD response has no body, so it returns 0 for every
+        // object regardless of its real size. That made production log
+        // "archive present (0 bytes)" for perfectly good dumps, and would make
+        // any size-based validity check reject everything.
+        let content_length = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or_default();
         Ok(Head::Found(Some(ObjectId {
             etag: header("etag"),
             last_modified: header("last-modified"),
-            content_length: resp.content_length().unwrap_or_default(),
+            content_length,
         })))
     }
 

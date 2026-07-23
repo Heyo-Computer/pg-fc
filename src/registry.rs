@@ -13,7 +13,7 @@ use heyo_sdk::{P2pTunnel, Sandbox};
 use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, PressureConfig};
 use crate::reclaim::{POST_STOP_RECLAIM_DELAY, RECLAIM_FIRST_DELAY, Reclaimer};
 use crate::store::{Store, StoreRecord};
 use crate::vm;
@@ -34,6 +34,15 @@ const SUPERVISOR_HEARTBEAT: Duration = Duration::from_secs(900);
 /// that redeploys don't starve eviction (see [`supervise`]), long enough to let
 /// the pooler finish coming up first.
 const ARCHIVE_FIRST_SWEEP_DELAY: Duration = Duration::from_secs(120);
+
+/// Circuit breaker for one eviction sweep: after this many *consecutive*
+/// archive failures the pass aborts instead of grinding on. Each failed archive
+/// can cost a full ready-timeout (~5 min of a wedged bring-up), and a run of
+/// them means the environment is sick — daemon flaking, host disk full,
+/// Postgres unable to start — not that these particular schemas are odd.
+/// Sweeping on multiplies a systemic outage by the candidate count; stopping
+/// costs nothing, since every remaining candidate is retried next sweep.
+const SWEEP_MAX_CONSECUTIVE_FAILURES: usize = 3;
 
 /// A ready, warm VM for one schema. `target` is where client bytes are spliced
 /// — either the VM's guest IP directly (same-host, no tunnel) or the local end
@@ -684,6 +693,142 @@ impl SchemaRegistry {
         }));
     }
 
+    /// Spawn the disk-pressure watchdog if `PG_VM_POOL_PRESSURE_PATH` is
+    /// configured: when the VM-disk filesystem crosses the high-water mark,
+    /// emergency-archive the oldest-idle schemas — TTL ignored — until it
+    /// drops below the low-water mark. The backstop against the disk-full
+    /// outage where VM creates, Postgres, and the dumps themselves all fail.
+    pub fn spawn_pressure_reaper(self: &Arc<Self>) {
+        let Some(pressure) = self.cfg.archive.as_ref().and_then(|a| a.pressure.clone()) else {
+            info!("disk-pressure eviction disabled (PG_VM_POOL_PRESSURE_PATH unset)");
+            return;
+        };
+        info!(
+            "disk-pressure eviction: watching {} — archiving oldest-idle schemas at \
+             >= {:.0}% full until < {:.0}% (checked every {:?}; TTL is overridden \
+             under pressure)",
+            pressure.path.display(),
+            pressure.high_pct,
+            pressure.low_pct,
+            pressure.check_interval
+        );
+        let registry = self.clone();
+        let tick = pressure.check_interval;
+        tokio::spawn(supervise("disk-pressure", tick, tick, move || {
+            let registry = registry.clone();
+            let pressure = pressure.clone();
+            async move { registry.pressure_pass(&pressure).await }
+        }));
+    }
+
+    /// One pressure check: no-op below the high-water mark; above it, archive
+    /// oldest-idle schemas one at a time, re-reading usage after each, until
+    /// below the low-water mark or out of candidates. Claims the same
+    /// single-flight flag as the periodic sweep, so the two never interleave
+    /// over the same schemas. Returns how many schemas were archived.
+    async fn pressure_pass(&self, p: &PressureConfig) -> usize {
+        let Some(pct) = disk_used_pct(&p.path).await else {
+            warn!(
+                "disk-pressure: could not read filesystem usage of {}; skipping this check",
+                p.path.display()
+            );
+            return 0;
+        };
+        if pct < p.high_pct {
+            debug!("disk-pressure: {} at {pct:.1}% (< {:.1}%), ok", p.path.display(), p.high_pct);
+            return 0;
+        }
+        if self.sweeping.swap(true, Ordering::SeqCst) {
+            info!(
+                "disk-pressure: {} at {pct:.1}% but an eviction sweep is already running; \
+                 will re-check in {:?}",
+                p.path.display(),
+                p.check_interval
+            );
+            return 0;
+        }
+        let _sweeping = SweepGuard(&self.sweeping);
+        warn!(
+            "disk-pressure: {} is {pct:.1}% full (>= {:.1}%) — emergency-archiving \
+             oldest-idle schemas until < {:.1}%",
+            p.path.display(),
+            p.high_pct,
+            p.low_pct
+        );
+
+        // Live view for skipping busy schemas without paying a bring-up.
+        let active: HashMap<String, usize> = self
+            .snapshot()
+            .await
+            .into_iter()
+            .map(|e| (e.schema, e.active))
+            .collect();
+        // Oldest last-active first. The TTL is deliberately not consulted:
+        // under pressure, "least recently used" is the whole policy.
+        let mut candidates: Vec<(String, u64)> = self
+            .store_records()
+            .into_iter()
+            .filter(|(schema, rec)| !rec.archived && !self.cfg.is_keepalive(schema))
+            .map(|(schema, rec)| (schema, rec.last_active))
+            .collect();
+        candidates.sort_by_key(|(_, last_active)| *last_active);
+
+        let now = now_unix();
+        let mut archived = 0usize;
+        let mut consecutive_failures = 0usize;
+        for (schema, last_active) in candidates {
+            match disk_used_pct(&p.path).await {
+                Some(cur) if cur < p.low_pct => {
+                    info!(
+                        "disk-pressure: {} down to {cur:.1}% (< {:.1}%) after {archived} \
+                         emergency archive(s); standing down",
+                        p.path.display(),
+                        p.low_pct
+                    );
+                    return archived;
+                }
+                _ => {}
+            }
+            if active.get(&schema).copied().unwrap_or(0) > 0 {
+                continue; // live sessions — archive_schema would refuse anyway
+            }
+            let idle_hours = now.saturating_sub(last_active) / 3600;
+            info!(
+                "disk-pressure: emergency-archiving schema {schema} (idle ~{idle_hours}h, \
+                 TTL overridden)"
+            );
+            match self.archive_schema(&schema).await {
+                Ok(()) => {
+                    archived += 1;
+                    consecutive_failures = 0;
+                }
+                Err(e) => {
+                    warn!("disk-pressure: archiving schema {schema} failed: {e:#}");
+                    consecutive_failures += 1;
+                    if consecutive_failures >= SWEEP_MAX_CONSECUTIVE_FAILURES {
+                        error!(
+                            "disk-pressure: aborting after {consecutive_failures} consecutive \
+                             failures — environment unhealthy; re-checking in {:?}",
+                            p.check_interval
+                        );
+                        return archived;
+                    }
+                }
+            }
+        }
+        if let Some(cur) = disk_used_pct(&p.path).await
+            && cur >= p.low_pct
+        {
+            error!(
+                "disk-pressure: exhausted every candidate schema with {} still at {cur:.1}% — \
+                 the remaining usage is running/keepalive VMs or non-VM data; eviction alone \
+                 cannot relieve this",
+                p.path.display()
+            );
+        }
+        archived
+    }
+
     /// Kick off one eviction sweep now, in the background, instead of waiting for
     /// the periodic timer — the dashboard's "sweep now" control. Returns as soon
     /// as the sweep is launched (it can take a long time for a big backlog); the
@@ -781,11 +926,25 @@ impl SchemaRegistry {
             return 0;
         }
         let mut archived = 0usize;
+        let mut consecutive_failures = 0usize;
         for schema in candidates {
             match self.archive_schema(&schema).await {
-                Ok(()) => archived += 1,
+                Ok(()) => {
+                    archived += 1;
+                    consecutive_failures = 0;
+                }
                 Err(e) => {
-                    warn!("archiving schema {schema} to S3 failed (will retry next sweep): {e:#}")
+                    warn!("archiving schema {schema} to S3 failed (will retry next sweep): {e:#}");
+                    consecutive_failures += 1;
+                    if consecutive_failures >= SWEEP_MAX_CONSECUTIVE_FAILURES {
+                        error!(
+                            "S3 eviction sweep: aborting after {consecutive_failures} consecutive \
+                             archive failures — the environment looks unhealthy (daemon, host disk, \
+                             or S3), and each failure burns minutes of wedged bring-up; remaining \
+                             candidates will be retried next sweep"
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -1149,9 +1308,50 @@ fn parse_df<'a>(lines: impl Iterator<Item = &'a str>) -> Option<(u64, u64, u64)>
     None
 }
 
+/// Percent-full of the filesystem holding `path`, read on the host via
+/// `df -kP` (same basis as df's own Use%: `used / (used + avail)`, excluding
+/// root-reserved blocks). `None` on any failure — the pressure loop treats
+/// that as "can't tell", never as pressure.
+async fn disk_used_pct(path: &std::path::Path) -> Option<f64> {
+    let out = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("df").arg("-kP").arg(path).output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (_total, used, avail) = parse_df(text.lines())?;
+    used_pct(used, avail)
+}
+
+/// `used / (used + avail)` as a percentage; `None` when the denominator is 0.
+fn used_pct(used: u64, avail: u64) -> Option<f64> {
+    let denom = (used + avail) as f64;
+    if denom <= 0.0 {
+        return None;
+    }
+    Some(used as f64 / denom * 100.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn used_pct_matches_df_semantics() {
+        // 850 used / 1000 (used+avail) → 85%, independent of `total` (which
+        // includes root-reserved blocks df's Use% ignores).
+        assert_eq!(used_pct(850, 150), Some(85.0));
+        assert_eq!(used_pct(0, 100), Some(0.0));
+        assert_eq!(used_pct(100, 0), Some(100.0));
+        // An empty df line must read as "unknown", not 0% (which would
+        // silently disable pressure eviction forever).
+        assert_eq!(used_pct(0, 0), None);
+    }
 
     #[test]
     fn meminfo_yields_total_and_available_bytes() {

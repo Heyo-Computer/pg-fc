@@ -145,9 +145,77 @@ pub struct ArchiveConfig {
     /// How often the archive sweep scans for eviction candidates. Env
     /// `PG_VM_POOL_ARCHIVE_SWEEP_SECS` (default 3600).
     pub sweep_interval: Duration,
+    /// Emergency disk-pressure eviction. `None` (default) disables it —
+    /// enabled by `PG_VM_POOL_PRESSURE_PATH`.
+    pub pressure: Option<PressureConfig>,
     /// S3 addressing + credentials the pooler uses to presign the guest's
     /// dump upload / restore download.
     pub s3: crate::s3::S3Config,
+}
+
+/// Settings for emergency disk-pressure eviction: when the VM-disk filesystem
+/// crosses a high-water mark, the pooler archives the *oldest-idle* schemas to
+/// S3 — ignoring `archive_after`; pressure overrides the TTL — until usage
+/// drops below the low-water mark. The backstop that keeps a filling disk from
+/// becoming the `No space left on device` outage where nothing (VM creates,
+/// Postgres, the dumps themselves) works anymore.
+#[derive(Clone)]
+pub struct PressureConfig {
+    /// Path on the filesystem holding the VM disks (the heyvmd run dir, e.g.
+    /// `/workbooks/heyvm/run`). Its filesystem's usage is what's watched. Env
+    /// `PG_VM_POOL_PRESSURE_PATH` — setting it is the on/off switch.
+    pub path: PathBuf,
+    /// Usage percentage at/above which emergency eviction starts. Env
+    /// `PG_VM_POOL_PRESSURE_HIGH_PCT` (default 85).
+    pub high_pct: f64,
+    /// Usage percentage below which it stops. Env
+    /// `PG_VM_POOL_PRESSURE_LOW_PCT` (default 75).
+    pub low_pct: f64,
+    /// How often usage is checked. Env `PG_VM_POOL_PRESSURE_CHECK_SECS`
+    /// (default 60).
+    pub check_interval: Duration,
+}
+
+impl PressureConfig {
+    fn from_env() -> anyhow::Result<Option<Self>> {
+        let Some(path) = std::env::var("PG_VM_POOL_PRESSURE_PATH")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        let pct = |key: &str, default: f64| -> anyhow::Result<f64> {
+            match std::env::var(key) {
+                Ok(v) => v
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|p| (1.0..=99.0).contains(p))
+                    .ok_or_else(|| anyhow::anyhow!("invalid {key} {v:?}: expected 1-99")),
+                Err(_) => Ok(default),
+            }
+        };
+        let high_pct = pct("PG_VM_POOL_PRESSURE_HIGH_PCT", 85.0)?;
+        let low_pct = pct("PG_VM_POOL_PRESSURE_LOW_PCT", 75.0)?;
+        if low_pct >= high_pct {
+            anyhow::bail!(
+                "PG_VM_POOL_PRESSURE_LOW_PCT ({low_pct}) must be below \
+                 PG_VM_POOL_PRESSURE_HIGH_PCT ({high_pct})"
+            );
+        }
+        let check_interval = std::env::var("PG_VM_POOL_PRESSURE_CHECK_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(60));
+        Ok(Some(Self {
+            path: PathBuf::from(path),
+            high_pct,
+            low_pct,
+            check_interval,
+        }))
+    }
 }
 
 /// Settings for the optional server-side-rendered admin dashboard. Present
@@ -218,6 +286,10 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_ARCHIVE_SWEEP_SECS",
     "PG_VM_POOL_RECLAIM_CMD",
     "PG_VM_POOL_RECLAIM_INTERVAL_SECS",
+    "PG_VM_POOL_PRESSURE_PATH",
+    "PG_VM_POOL_PRESSURE_HIGH_PCT",
+    "PG_VM_POOL_PRESSURE_LOW_PCT",
+    "PG_VM_POOL_PRESSURE_CHECK_SECS",
     "PG_VM_POOL_S3_BUCKET",
     "PG_VM_POOL_S3_PREFIX",
     "PG_VM_POOL_S3_REGION",
@@ -319,6 +391,19 @@ impl Config {
 
         let dashboard = DashboardConfig::from_env()?;
         let archive = ArchiveConfig::from_env()?;
+        // Pressure eviction archives to S3, so it's meaningless without the
+        // tier — a set path with the tier off is a config mistake, fail fast.
+        if archive.is_none()
+            && std::env::var("PG_VM_POOL_PRESSURE_PATH")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+        {
+            anyhow::bail!(
+                "PG_VM_POOL_PRESSURE_PATH is set but the S3 eviction tier is not \
+                 configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_*) — \
+                 disk-pressure eviction archives to S3"
+            );
+        }
         let reclaim = ReclaimConfig::from_env();
 
         Ok(Self {
@@ -461,6 +546,7 @@ impl ArchiveConfig {
         Ok(Some(Self {
             archive_after,
             sweep_interval,
+            pressure: PressureConfig::from_env()?,
             s3: crate::s3::S3Config {
                 bucket,
                 prefix,

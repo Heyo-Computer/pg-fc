@@ -154,6 +154,9 @@ Config via env (all optional):
 | `PG_VM_POOL_S3_REGION` | `us-east-1` | region for SigV4 signing |
 | `PG_VM_POOL_S3_ENDPOINT` | unset (AWS) | custom endpoint for an S3-compatible store (MinIO/R2); path-style addressing |
 | `PG_VM_POOL_S3_ACCESS_KEY_ID` / `PG_VM_POOL_S3_SECRET_ACCESS_KEY` | unset | S3 credentials (fall back to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) |
+| `PG_VM_POOL_PRESSURE_PATH` | unset (off) | filesystem to watch (the heyvmd run dir); setting it enables emergency disk-pressure eviction — see "S3 eviction tier" |
+| `PG_VM_POOL_PRESSURE_HIGH_PCT` / `PG_VM_POOL_PRESSURE_LOW_PCT` | `85` / `75` | start emergency-archiving oldest-idle schemas at/above high; stop below low |
+| `PG_VM_POOL_PRESSURE_CHECK_SECS` | `60` | how often the pressure watchdog reads disk usage |
 | `PG_VM_POOL_RECLAIM_CMD` | unset (off) | shell command that offline-trims stopped VMs' disks (normally `sudo -n .../reclaim-disks.sh <run-dir>`); setting it enables automatic disk reclamation — see "Reclaiming disk slack" |
 | `PG_VM_POOL_RECLAIM_INTERVAL_SECS` | `3600` | how often the periodic reclaim run fires (extra runs also fire right after idle reaps) |
 
@@ -219,6 +222,20 @@ pooler and the S3 secret key never leaves it. This requires the guest VMs to
 have outbound network egress to the S3 endpoint. Each schema maps to one object,
 `s3://{bucket}/{prefix}{schema}.dump`; a single `PUT` caps at 5 GB, which is
 ample for one-workbook databases.
+
+**Disk-pressure eviction (emergency tier):** the TTL-based sweep can't help
+when load outruns it — a filesystem that hits `No space left on device` takes
+everything down at once (VM creates fail, Postgres PANICs, even the rescue
+dumps fail). Set `PG_VM_POOL_PRESSURE_PATH` to the filesystem holding the VM
+disks and a watchdog checks usage every `PG_VM_POOL_PRESSURE_CHECK_SECS`: at or
+above `PG_VM_POOL_PRESSURE_HIGH_PCT` it archives the **oldest-idle** schemas —
+ignoring `archive_after`; under pressure, least-recently-used is the policy —
+one at a time, re-reading usage after each, until below
+`PG_VM_POOL_PRESSURE_LOW_PCT`. Keepalive schemas and schemas with live sessions
+are never touched, it shares the sweep's single-flight lock, and it aborts
+after 3 consecutive failures (an unhealthy environment shouldn't be ground
+through). If every candidate is exhausted while still above the low-water mark
+it says so loudly — at that point the pressure is running VMs or non-VM data.
 
 Archived schemas show up in the dashboard with an **"archived (S3)"** status
 (filterable via the `archived` state pill) even though no VM backs them, and any

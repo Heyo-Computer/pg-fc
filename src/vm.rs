@@ -59,8 +59,10 @@ pub async fn ensure_vm(
     let keepalive = cfg.is_keepalive(schema);
 
     // An archived schema's VM was killed, so its stored id is dead — never try
-    // to reattach; force the create-fresh path so the restore lands on a clean
-    // data disk rather than (racily) on top of a stale one.
+    // to reattach by id. Note this does NOT guarantee a clean disk: the
+    // find-by-name fallback reuses a VM left behind by a previously *failed*
+    // restore, whose database is partially loaded — which is why the restore
+    // job runs `pg_restore --clean --if-exists` (idempotent over that débris).
     let known_id = if restore.is_some() { None } else { known_id };
     let sandbox = resolve_sandbox(cfg, &name, keepalive, known_id).await?;
 
@@ -122,6 +124,16 @@ const ARCHIVE_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Per-request timeout for the pooler's own S3 HEAD.
 const ARCHIVE_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Smallest object accepted as a real archive. A `pg_dump -Fc` of even an
+/// empty database is ~1.5KB — nothing legitimate is under 512 bytes. Small
+/// objects happen for real: with the host disk full, the guest's dump file is
+/// torn to zero length by failed writeback while `pg_dump` and `curl` both
+/// exit 0, and production accepted such a 0-byte "archive" and then killed the
+/// VM — destroying the only copy of the data. Size is checked on the dump side
+/// (never report a tiny upload durable) *and* the restore side (fail with the
+/// truth instead of feeding `pg_restore` an empty file).
+const MIN_ARCHIVE_BYTES: u64 = 512;
 
 /// How many *consecutive* failed guest probes we tolerate before we stop asking
 /// the guest and let S3 alone decide. The guest exec channel failing says
@@ -329,8 +341,14 @@ fn archive_job_body(user: &str, db: &str, resolve: &str, url: &str) -> String {
     format!(
         "ec=0\n\
          if pg_dump -h 127.0.0.1 -U {user} -Fc -d {db} -f {DUMP_PATH}; then\n\
-         \tcode=$(curl -sS {resolve} -T {DUMP_PATH} -o /dev/null -w '%{{http_code}}' \"{url}\") || ec=$?\n\
+         \tsync {DUMP_PATH} 2>/dev/null || true\n\
+         \tif [ -s {DUMP_PATH} ]; then\n\
+         \t\tcode=$(curl -sS {resolve} -T {DUMP_PATH} -o /dev/null -w '%{{http_code}}' \"{url}\") || ec=$?\n\
          {}\
+         \telse\n\
+         \t\techo \"dump file empty/missing after pg_dump reported success (disk trouble?)\" >&2\n\
+         \t\tec=1\n\
+         \tfi\n\
          else\n\
          \tec=$?\n\
          fi\n\
@@ -363,9 +381,16 @@ fn require_2xx(what: &str) -> String {
 }
 
 /// The restore job body: fetch the archive from S3, load it into the
-/// already-created empty database, drop the scratch copy. Same `ec`/sentinel
+/// already-created database, drop the scratch copy. Same `ec`/sentinel
 /// discipline as the dump, so a failed download never looks like a successful
 /// restore of nothing.
+///
+/// `--clean --if-exists` makes the load idempotent: a *previous* restore
+/// attempt that died partway (host outage, kill mid-load) leaves a partially
+/// restored database on the reused VM's persistent disk, and without it every
+/// retry fails on `relation already exists` — one interrupted restore wedged
+/// the schema forever. Object-level clean handles that; `--if-exists` keeps it
+/// a no-op on the genuinely fresh, empty database of the common case.
 fn restore_job_body(user: &str, db: &str, resolve: &str, url: &str) -> String {
     let done = RESTORE_JOB.done;
     format!(
@@ -373,7 +398,7 @@ fn restore_job_body(user: &str, db: &str, resolve: &str, url: &str) -> String {
          code=$(curl -sS {resolve} -o {RESTORE_PATH} -w '%{{http_code}}' \"{url}\") || ec=$?\n\
          {}\
          if [ \"$ec\" = 0 ]; then\n\
-         \tpg_restore -h 127.0.0.1 -U {user} --no-owner --no-privileges -d {db} {RESTORE_PATH} || ec=$?\n\
+         \tpg_restore -h 127.0.0.1 -U {user} --clean --if-exists --no-owner --no-privileges -j \"$(nproc)\" -d {db} {RESTORE_PATH} || ec=$?\n\
          fi\n\
          rm -f {RESTORE_PATH}\n\
          printf %s \"$ec\" > {done}.tmp && mv {done}.tmp {done}\n",
@@ -518,6 +543,21 @@ async fn await_archive(
                 if let Some(now) = &now
                     && Some(now) != baseline
                 {
+                    // A new object landed — but existence is not validity. An
+                    // implausibly small object is a failed dump that still
+                    // uploaded (torn dump file under disk pressure); reporting
+                    // it durable would let the caller destroy the source disk.
+                    if now.content_length < MIN_ARCHIVE_BYTES {
+                        bail!(
+                            "schema {schema}: upload at s3://{}/{key} is only {} bytes — \
+                             no pg_dump archive is that small, so the dump itself \
+                             produced no data (disk-full tears the dump file this way); \
+                             refusing to report this archive durable. Guest log: {}",
+                            s3.bucket,
+                            now.content_length,
+                            truncate(ARCHIVE_JOB.log_tail(cfg, sandbox).await.trim(), 800)
+                        );
+                    }
                     info!(
                         "schema {schema}: archive present in s3://{}/{key} ({} bytes)",
                         s3.bucket, now.content_length
@@ -681,6 +721,34 @@ async fn restore_from_s3(
     s3: &S3Config,
 ) -> Result<()> {
     let key = s3.object_key(schema);
+
+    // Pre-flight: is there actually a restorable archive at the key? Feeding
+    // `pg_restore` a missing or torn (sub-minimum) object costs a full VM
+    // bring-up and yields a generic guest error; checking here yields the
+    // truth. Best-effort on transport failure — the guest's own download would
+    // surface that anyway.
+    if let Ok(http) = reqwest::Client::builder().build() {
+        match s3.head_object(&http, &key, ARCHIVE_HEAD_TIMEOUT).await {
+            Ok(None) => bail!(
+                "schema {schema} is marked archived but s3://{}/{key} does not exist — \
+                 there is no archive to restore",
+                s3.bucket
+            ),
+            Ok(Some(id)) if id.content_length < MIN_ARCHIVE_BYTES => bail!(
+                "schema {schema}: the archive at s3://{}/{key} is only {} bytes — it was \
+                 produced by a failed dump (accepted before the size guard existed) and \
+                 holds no data; this workbook cannot be restored from S3",
+                s3.bucket,
+                id.content_length
+            ),
+            Ok(Some(_)) => {}
+            Err(e) => warn!(
+                "schema {schema}: pre-restore HEAD failed (continuing — the guest's \
+                 own download will decide): {e:#}"
+            ),
+        }
+    }
+
     let url = s3.presign_get(&key, PRESIGN_TTL);
     let resolve = s3_resolve_flag(s3).await;
     let db = shell_squote(schema);
@@ -1537,10 +1605,15 @@ mod tests {
         )
         .replace("/workspace/", &root);
 
-        // pg_dump succeeds; curl prints the status to stdout and — as curl does
-        // for a redirect it isn't following — exits 0 regardless.
+        // pg_dump succeeds and produces a non-empty dump (the empty-file guard
+        // would otherwise fail the job before curl runs); curl prints the
+        // status to stdout and — as curl does for a redirect it isn't
+        // following — exits 0 regardless.
         let stubs = [
-            ("pg_dump", "#!/bin/sh\nexit 0\n".to_string()),
+            (
+                "pg_dump",
+                format!("#!/bin/sh\nprintf dumpbytes > {root}_archive.dump\nexit 0\n"),
+            ),
             ("curl", format!("#!/bin/sh\nprintf %s '{code}'\nexit 0\n")),
         ];
         for (cmd, script) in stubs {
@@ -1569,6 +1642,68 @@ mod tests {
                 .expect("job must always write a sentinel");
         let _ = std::fs::remove_dir_all(&dir);
         sentinel
+    }
+
+    /// The production failure of 2026-07-23: with the host disk full, the
+    /// guest's dump file was torn to zero length while `pg_dump` and `curl`
+    /// both exited 0 — a 0-byte "archive" was accepted and the VM (the only
+    /// copy of the data) was killed. The job must fail before uploading when
+    /// the dump file is empty or missing.
+    #[test]
+    fn an_empty_dump_file_never_uploads() {
+        for create_file in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "pgfc-empty-{}-{create_file}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(dir.join("bin")).unwrap();
+            let root = format!("{}/", dir.display());
+            let body = archive_job_body(
+                &shell_squote("postgres"),
+                &shell_squote("s"),
+                "",
+                "https://x/y",
+            )
+            .replace("/workspace/", &root);
+
+            // pg_dump "succeeds" but leaves the dump empty (or absent); curl
+            // records that it ran — it must not.
+            let dump_script = if create_file {
+                format!("#!/bin/sh\n: > {root}_archive.dump\nexit 0\n")
+            } else {
+                "#!/bin/sh\nexit 0\n".to_string()
+            };
+            let stubs = [
+                ("pg_dump", dump_script),
+                ("curl", format!("#!/bin/sh\ntouch {root}curl-ran\nprintf 200\nexit 0\n")),
+            ];
+            for (cmd, script) in stubs {
+                let p = dir.join("bin").join(cmd);
+                std::fs::write(&p, script).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+                }
+            }
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&body)
+                .env("PATH", format!("{}/bin:/usr/bin:/bin", dir.display()))
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "job body itself must not error");
+            let sentinel = std::fs::read_to_string(
+                dir.join(ARCHIVE_JOB.done.trim_start_matches("/workspace/")),
+            )
+            .expect("job must always write a sentinel");
+            assert_ne!(sentinel, "0", "an empty dump must never write a zero sentinel");
+            assert!(
+                !dir.join("curl-ran").exists(),
+                "an empty dump must never be uploaded at all"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// The probe shares a serial console with kernel logs and with the leftover

@@ -69,6 +69,10 @@ async fn main() -> Result<()> {
     // Slow, disk-reclaiming eviction tier: offload week-idle schemas to S3 and
     // kill their VMs. No-op unless PG_VM_POOL_ARCHIVE_AFTER_SECS is configured.
     registry.spawn_archiver();
+    // Emergency disk-pressure eviction: when the VM-disk filesystem crosses the
+    // high-water mark, archive oldest-idle schemas (TTL overridden) until it
+    // recovers. No-op unless PG_VM_POOL_PRESSURE_PATH is configured.
+    registry.spawn_pressure_reaper();
     // Offline-trim stopped VMs' data disks so freed guest blocks return to the
     // host (Firecracker has no discard passthrough). No-op unless
     // PG_VM_POOL_RECLAIM_CMD is configured.
