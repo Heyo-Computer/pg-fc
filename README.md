@@ -134,7 +134,7 @@ Config via env (all optional):
 | `PG_VM_POOL_USER` / `PG_VM_POOL_PASSWORD` | `postgres` / unset | probe+bootstrap credentials, and (if set) the required client password |
 | `PG_VM_POOL_IDLE_TIMEOUT_SECS` | `900` | stop a VM after this long with no connections; `0` disables |
 | `PG_VM_POOL_KEEPALIVE_SCHEMAS` | none | comma-separated schemas exempt from idle reaping |
-| `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size |
+| `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size — a *cap*, not an upfront allocation: the guest formats a small (4GB) filesystem inside it and grows it online as the database grows (see "Reclaiming disk slack") |
 | `PG_VM_POOL_READY_TIMEOUT_SECS` | `300` | max wait for VM+Postgres readiness |
 | `PG_VM_POOL_CONNECT_TIMEOUT_SECS` | `30` | iroh tunnel handshake cap |
 | `PG_VM_POOL_DIRECT_CONNECT` | on | dial guest IP directly; `0` forces the tunnel |
@@ -236,6 +236,16 @@ punched out of the backing file. A disk therefore ratchets toward its full
 provisioned size and never shrinks, even when the live database is tiny (a 1 GB
 database routinely pins tens of GB on disk after a transient bulk load).
 
+**Thin provisioning (first line of defense):** the image formats only a small
+(4GB, `pgdata_init_mb` cmdline override) filesystem inside the provisioned
+device on first boot, and a watcher in the guest grows it online with
+`resize2fs` — doubling up to the device cap — whenever free space drops below
+1GB (or ⅛ of the fs). Since ext4 never touches blocks past its own end, the
+host allocation can never ratchet past the *current filesystem* size: the
+provisioned max is a cap, not the de-facto footprint. The disk-derived Postgres
+knobs (`max_wal_size`, `temp_file_limit`, swap sizing) key off the live
+filesystem size and are recomputed + reloaded on each growth step.
+
 Eviction reclaims the whole disk once a schema is *long* idle; `reclaim-disks.sh`
 reclaims the **slack** from disks whose VMs are merely stopped, without deleting
 anything. It offline-`fstrim`s every `data.ext4` whose VM is not currently
@@ -245,7 +255,21 @@ live Firecracker still has open (mounting that would corrupt it):
 ```
 sudo DRY_RUN=1 ./reclaim-disks.sh ~/.heyo/run   # list candidates, change nothing
 sudo ./reclaim-disks.sh ~/.heyo/run             # actually reclaim
+sudo SHRINK=1 ./reclaim-disks.sh ~/.heyo/run    # also shrink filesystems (below)
 ```
+
+**`SHRINK=1` — retro-fit thin provisioning onto legacy disks.** Disks formatted
+before thin provisioning have a full-device filesystem, so even after a trim
+their next growth ratchets straight back toward the provisioned max, and ~1GB
+of full-device ext4 metadata stays allocated forever. With `SHRINK=1` the
+script also *shrinks* each stopped VM's filesystem to `used × 1.25` (floored at
+`MIN_FS_MB`, default 4096 to match the image's initial size) and hole-punches
+the backing file past the new end. The guest's grow watcher re-extends the
+filesystem online if the database later needs the space. Shrinking relocates
+blocks, so it's slower than a plain trim and the script re-fscks each shrunk
+filesystem before mounting it — run it once during a quiet window to convert
+the existing fleet, then let the pooler's periodic (non-shrink) runs maintain
+it.
 
 This only reclaims *stopped* VMs; reclaiming a **live** VM's disk would need the
 guest to issue discards (the image already mounts `/workspace` with `-o discard`)

@@ -30,6 +30,15 @@ done
 DATA_DEV="${pgdata_dev:-/dev/vdb}"
 WORKSPACE=/workspace
 PGDATA="${PGDATA:-/workspace/pgdata}"
+# Initial filesystem size on a blank data device — thin provisioning. The
+# device size (PG_VM_POOL_DATA_DISK_GB) is only a *cap*: the filesystem starts
+# this small and the grow watcher (below) extends it online as the database
+# approaches capacity. The host's sparse-file allocation can never exceed the
+# filesystem's high-water mark (ext4 never touches blocks past its own end), so
+# this also bounds how much host disk one VM can strand — and skips the ~1GB of
+# ext4 metadata a full-device format writes up front. Override via the kernel
+# cmdline (`pgdata_init_mb=8192`).
+INIT_FS_MB=4096
 
 echo "[init] mounting pseudo-filesystems"
 mount -t proc     proc     /proc      2>/dev/null || true
@@ -62,15 +71,22 @@ fi
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         pgdata_dev=*) DATA_DEV="${arg#pgdata_dev=}" ;;
+        pgdata_init_mb=*) INIT_FS_MB="${arg#pgdata_init_mb=}" ;;
     esac
 done
 
 if [ -b "$DATA_DEV" ]; then
     echo "[init] data volume $DATA_DEV present"
     # Format on first boot only: blkid prints nothing for an unformatted device.
+    # Format only INIT_FS_MB of the device (thin provisioning, see above); the
+    # 4k block size is pinned so the block math here and in the grow watcher
+    # agrees regardless of mkfs heuristics.
     if ! blkid "$DATA_DEV" >/dev/null 2>&1; then
-        echo "[init] $DATA_DEV is blank, creating ext4 filesystem"
-        mkfs.ext4 -q -L pgdata "$DATA_DEV"
+        dev_mb=$(($(blockdev --getsize64 "$DATA_DEV") / 1024 / 1024))
+        fs_mb="$INIT_FS_MB"
+        [ "$fs_mb" -gt "$dev_mb" ] && fs_mb="$dev_mb"
+        echo "[init] $DATA_DEV is blank, creating ${fs_mb}MB ext4 filesystem (device cap ${dev_mb}MB)"
+        mkfs.ext4 -q -L pgdata -b 4096 "$DATA_DEV" $((fs_mb * 256))
     fi
     echo "[init] mounting $DATA_DEV at $WORKSPACE"
     # `discard`: issue TRIM inline as ext4 frees blocks (recycled WAL, dropped
@@ -105,9 +121,14 @@ if [ -b "$DATA_DEV" ]; then
         avail_mb=$(df -Pm "$WORKSPACE" | awk 'NR==2 {print $4}')
         swap_mb=$mem_mb
         [ "$swap_mb" -gt 2048 ] && swap_mb=2048
-        # Never let swap eat more than an eighth of the disk, and only create
-        # it with 2x headroom so it can't crowd out the data it exists to save.
-        disk_eighth=$(($(blockdev --getsize64 "$DATA_DEV") / 1024 / 1024 / 8))
+        # Never let swap eat more than an eighth of the *filesystem* (not the
+        # device — the fs starts small under thin provisioning and the device
+        # size is just the cap), and only create it with 2x headroom so it
+        # can't crowd out the data it exists to save. Created once at first
+        # boot, so on a thin fs it starts small (512MB on the 4GB initial fs)
+        # and stays that size as the fs grows — it's an emergency spillway,
+        # not a working set.
+        disk_eighth=$(df -Pm "$WORKSPACE" | awk 'NR==2 {print int($2/8)}')
         [ "$swap_mb" -gt "$disk_eighth" ] && swap_mb="$disk_eighth"
         if [ "$avail_mb" -gt $((swap_mb * 2)) ]; then
             echo "[init] creating ${swap_mb}MB swapfile at $SWAPFILE"
@@ -274,28 +295,40 @@ autovac_mem_mb=$((maint_mem_mb / 4)); [ "$autovac_mem_mb" -gt 256 ] && autovac_m
 # swap (also capped at disk/8, above) on the default 4GB volume. The 512MB
 # floor trades checkpoint frequency for safety on tiny disks: worst case is
 # more checkpoints during a big load, never a WAL-full PANIC.
+# Both are derived from the *current filesystem* size, not the device: under
+# thin provisioning the fs starts small and grows, and the grow watcher (below)
+# recomputes + SIGHUPs these on every growth step, so they track the space that
+# actually exists. Shared helpers so boot and watcher can't drift apart.
+wal_mb_for() {
+    v=$(($1 / 8))
+    [ "$v" -lt 512 ] && v=512
+    [ "$v" -gt 4096 ] && v=4096
+    echo "$v"
+}
+# Cap per-session spill: a runaway sort exhausting temp space only errors
+# that query, never the whole cluster. Temp *tables* don't count against this
+# — they're ordinary relation files, budgeted in the arithmetic above.
+#
+# Temp files live on the tmpfs scratch (see the top of this script), so this
+# ceiling bounds per-session *RAM* rather than persistent disk; it must stay
+# under the tmpfs size cap so one session can't fill the tmpfs and starve
+# others. Clamp like max_wal_size: an unbounded disk/4 is far too much RAM to
+# let a single query pin. 4GB still allows big spills; the 1GB floor keeps
+# small VMs usable. (If the tmpfs mount ever fails and temp falls back to the
+# data disk, this same bound also caps the on-disk strand, so it's the right
+# guard either way.)
+temp_mb_for() {
+    v=$(($1 / 4))
+    [ "$v" -lt 1024 ] && v=1024
+    [ "$v" -gt 4096 ] && v=4096
+    echo "$v"
+}
 max_wal_mb=512
 temp_limit_mb=1024
-if [ -b "$DATA_DEV" ]; then
-    disk_mb=$(($(blockdev --getsize64 "$DATA_DEV") / 1024 / 1024))
-    max_wal_mb=$((disk_mb / 8))
-    [ "$max_wal_mb" -lt 512 ] && max_wal_mb=512
-    [ "$max_wal_mb" -gt 4096 ] && max_wal_mb=4096
-    # Cap per-session spill: a runaway sort exhausting temp space only errors
-    # that query, never the whole cluster. Temp *tables* don't count against this
-    # — they're ordinary relation files, budgeted in the arithmetic above.
-    #
-    # Temp files now live on the tmpfs scratch (see the top of this script), so
-    # this ceiling bounds per-session *RAM* rather than persistent disk; it must
-    # stay under the tmpfs size cap so one session can't fill the tmpfs and starve
-    # others. Clamp like max_wal_size: an unbounded disk/4 (12.5GB on a 50GB
-    # volume) is far too much RAM to let a single query pin. 4GB still allows big
-    # spills; the 1GB floor keeps small VMs usable. (If the tmpfs mount ever fails
-    # and temp falls back to the data disk, this same bound also caps the on-disk
-    # strand, so it's the right guard either way.)
-    temp_limit_mb=$((disk_mb / 4))
-    [ "$temp_limit_mb" -lt 1024 ] && temp_limit_mb=1024
-    [ "$temp_limit_mb" -gt 4096 ] && temp_limit_mb=4096
+if [ -b "$DATA_DEV" ] && mountpoint -q "$WORKSPACE" 2>/dev/null; then
+    disk_mb=$(df -Pm "$WORKSPACE" | awk 'NR==2 {print $2}')
+    max_wal_mb=$(wal_mb_for "$disk_mb")
+    temp_limit_mb=$(temp_mb_for "$disk_mb")
 fi
 
 cat > "$PGDATA/heyvm-tuning.conf" <<EOF
@@ -429,6 +462,61 @@ if mountpoint -q "$PGTMP" 2>/dev/null && [ -d "$PGDATA/base" ]; then
             echo "[init] temp files -> tmpfs ($PGTMP)"
         fi
     fi
+fi
+
+# --- online filesystem growth (thin provisioning) ----------------------------
+# The filesystem starts small (see the mkfs above) and must be grown before the
+# database fills it. ext4 grows *online* — resize2fs on the mounted device from
+# inside the guest, no VM restart, sub-second — so this watcher polls free space
+# and doubles the filesystem (capped at the device size) whenever headroom drops
+# below 1GB or 1/8 of the filesystem, whichever is larger. That headroom covers
+# several seconds of worst-case bulk-load writes between 5s polls; if a burst
+# outruns it anyway the damage is one query's disk-full error, and the next poll
+# still grows the filesystem (WAL keeps 512MB+ of budget, so the PANIC path
+# stays guarded). After each step the disk-derived Postgres knobs are recomputed
+# and reloaded (both are SIGHUP-safe). Exits once the filesystem spans the
+# device — immediately on legacy disks formatted before thin provisioning.
+if [ -b "$DATA_DEV" ] && mountpoint -q "$WORKSPACE" 2>/dev/null; then
+    (
+        set +e   # a transient df/tune2fs hiccup must not kill the watcher
+        dev_b=$(blockdev --getsize64 "$DATA_DEV")
+        while :; do
+            geom=$(tune2fs -l "$DATA_DEV" 2>/dev/null)
+            bs=$(echo "$geom" | awk -F: '/^Block size:/ {gsub(/ /,"",$2); print $2}')
+            blocks=$(echo "$geom" | awk -F: '/^Block count:/ {gsub(/ /,"",$2); print $2}')
+            if [ -z "$bs" ] || [ -z "$blocks" ]; then
+                sleep 60
+                continue
+            fi
+            fs_b=$((blocks * bs))
+            if [ "$fs_b" -ge "$dev_b" ]; then
+                echo "[grow] filesystem spans $DATA_DEV; watcher done"
+                exit 0
+            fi
+            free_kb=$(df -Pk "$WORKSPACE" | awk 'NR==2 {print $4}')
+            min_free_kb=$((fs_b / 1024 / 8))
+            [ "$min_free_kb" -lt 1048576 ] && min_free_kb=1048576
+            if [ -n "$free_kb" ] && [ "$free_kb" -lt "$min_free_kb" ]; then
+                new_b=$((fs_b * 2))
+                [ "$new_b" -gt "$dev_b" ] && new_b="$dev_b"
+                echo "[grow] $WORKSPACE has ${free_kb}K free (< ${min_free_kb}K): growing filesystem $((fs_b / 1048576))MB -> $((new_b / 1048576))MB"
+                if resize2fs "$DATA_DEV" $((new_b / bs)) >/dev/null 2>&1; then
+                    new_mb=$((new_b / 1048576))
+                    sed -i \
+                        -e "s/^max_wal_size = .*/max_wal_size = $(wal_mb_for "$new_mb")MB/" \
+                        -e "s/^temp_file_limit = .*/temp_file_limit = $(temp_mb_for "$new_mb")MB/" \
+                        "$PGDATA/heyvm-tuning.conf" 2>/dev/null
+                    chown postgres:postgres "$PGDATA/heyvm-tuning.conf" 2>/dev/null
+                    pg_pid=$(head -n1 "$PGDATA/postmaster.pid" 2>/dev/null)
+                    [ -n "$pg_pid" ] && kill -HUP "$pg_pid" 2>/dev/null
+                else
+                    echo "[grow] WARNING: resize2fs $DATA_DEV to $((new_b / 1048576))MB failed; retrying in 60s"
+                    sleep 60
+                fi
+            fi
+            sleep 5
+        done
+    ) &
 fi
 
 echo "[init] starting postgres"

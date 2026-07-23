@@ -20,14 +20,29 @@
 # started. Everything else is best-effort per disk: one failure never aborts the
 # run and never leaves a loop device or mount behind.
 #
+# SHRINK=1 additionally *shrinks the filesystem* toward its used size before
+# trimming. Legacy disks were formatted across the whole device, so even after
+# an fstrim their next growth ratchets straight back toward the full
+# provisioned size, and the ~1GB of full-device ext4 metadata stays allocated
+# forever. Shrinking retro-fits the thin-provisioning cap the image now applies
+# at first format (see init.sh): target = used * 1.25, floored at MIN_FS_MB
+# (default 4096, matching init.sh's initial size); the guest's grow watcher
+# re-extends the filesystem online if the database needs more. Blocks past the
+# new filesystem end are hole-punched out of the backing file directly (fstrim
+# can't reach past the fs). The shrunk fs is re-fscked before anything mounts
+# it; a disk that fails that check is reported and left unmounted.
+#
 # Usage:
 #   sudo ./reclaim-disks.sh [RUN_DIR]        # default RUN_DIR: ~/.heyo/run
 #   sudo DRY_RUN=1 ./reclaim-disks.sh [DIR]  # report candidates, change nothing
+#   sudo SHRINK=1 ./reclaim-disks.sh [DIR]   # also shrink filesystems (slower)
 #
 set -uo pipefail
 
 RUN_DIR="${1:-${HOME}/.heyo/run}"
 DRY_RUN="${DRY_RUN:-0}"
+SHRINK="${SHRINK:-0}"
+MIN_FS_MB="${MIN_FS_MB:-4096}"
 
 die() { echo "error: $*" >&2; exit 1; }
 human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}B"; }
@@ -44,6 +59,11 @@ fi
 for tool in losetup mount umount fstrim e2fsck find stat du numfmt; do
     command -v "$tool" >/dev/null || die "missing required tool: $tool"
 done
+if [ "$SHRINK" = 1 ]; then
+    for tool in dumpe2fs resize2fs fallocate; do
+        command -v "$tool" >/dev/null || die "missing required tool for SHRINK=1: $tool"
+    done
+fi
 
 # Point-in-time set of every file held open by any process, keyed by
 # device:inode. A live Firecracker keeps its data disk open as a plain fd under
@@ -81,7 +101,38 @@ shopt -s nullglob
 disks=("$RUN_DIR"/sb-*/data.ext4)
 [ "${#disks[@]}" -gt 0 ] || die "no sb-*/data.ext4 disks under $RUN_DIR"
 
-reclaimed=0 trimmed=0 skipped=0 failed=0
+reclaimed=0 trimmed=0 skipped=0 failed=0 shrunk=0
+
+# SHRINK=1: shrink the (unmounted, freshly fsck'd) filesystem on $1 toward its
+# used size. On success sets SHRINK_PUNCH_OFFSET to the new filesystem's end in
+# bytes — the caller hole-punches the backing file past that point *after*
+# detaching the loop device (never while attached, so no page-cache aliasing on
+# the punched range). Returns: 0 = shrunk or nothing to do, 1 = shrink failed
+# (fs untouched or restored — trimming may proceed), 2 = post-shrink fsck
+# failed (do NOT mount).
+SHRINK_PUNCH_OFFSET=""
+shrink_fs() {
+    local loop="$1" geom bs blocks free used target floor_blk
+    SHRINK_PUNCH_OFFSET=""
+    geom=$(dumpe2fs -h "$loop" 2>/dev/null) || return 1
+    bs=$(awk -F: '/^Block size:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+    blocks=$(awk -F: '/^Block count:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+    free=$(awk -F: '/^Free blocks:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+    { [ -n "$bs" ] && [ -n "$blocks" ] && [ -n "$free" ]; } || return 1
+    used=$((blocks - free))
+    target=$((used + used / 4))
+    floor_blk=$((MIN_FS_MB * 1024 * 1024 / bs))
+    [ "$target" -lt "$floor_blk" ] && target=$floor_blk
+    # Not worth a slow, block-moving resize unless it retires at least 256MB
+    # of future ratchet room.
+    [ "$blocks" -le $((target + 268435456 / bs)) ] && return 0
+    resize2fs "$loop" "$target" >/dev/null 2>&1 || return 1
+    # A shrink relocates data; verify the result before anything mounts it.
+    e2fsck -fp "$loop" >/dev/null 2>&1
+    [ $? -ge 4 ] && return 2
+    SHRINK_PUNCH_OFFSET=$((target * bs))
+    return 0
+}
 
 # Trim one disk with fully local cleanup. Returns non-zero on any failure but the
 # caller keeps going — a single bad disk must not stop the sweep.
@@ -98,7 +149,7 @@ trim_one() {
     before=$(allocated "$disk")
 
     if [ "$DRY_RUN" = 1 ]; then
-        echo "would-trim         $disk  ($(human "$before"))"
+        echo "would-trim$([ "$SHRINK" = 1 ] && echo ' (+shrink)')  $disk  ($(human "$before"))"
         return 0
     fi
 
@@ -120,6 +171,23 @@ trim_one() {
         return 1
     fi
 
+    # Optional filesystem shrink (see header). Runs on the clean, unmounted fs;
+    # the hole-punch past the new fs end happens after loop detach, below.
+    local punch_off=""
+    if [ "$SHRINK" = 1 ]; then
+        shrink_fs "$loop"
+        case $? in
+            0) punch_off="$SHRINK_PUNCH_OFFSET" ;;
+            1) echo "note  (shrink failed, trim only)  $disk" ;;
+            2)
+                echo "FAIL  (fsck after shrink)  $disk"
+                losetup -d "$loop"
+                failed=$((failed + 1))
+                return 1
+                ;;
+        esac
+    fi
+
     mnt=$(mktemp -d)
     if ! mount "$loop" "$mnt" 2>/dev/null; then
         echo "FAIL  (mount)      $disk"
@@ -133,6 +201,18 @@ trim_one() {
     umount "$mnt"
     rmdir "$mnt"
     losetup -d "$loop"
+
+    # With the fs shrunk, everything in the backing file past its end is dead —
+    # old metadata/data from the full-size format that fstrim (fs-scoped) can't
+    # reach. Punch it out now that the loop device (and its page cache) is gone.
+    if [ -n "$punch_off" ]; then
+        local file_bytes
+        file_bytes=$(stat -c %s "$disk" 2>/dev/null || echo 0)
+        if [ "$file_bytes" -gt "$punch_off" ]; then
+            fallocate -p -o "$punch_off" -l $((file_bytes - punch_off)) "$disk" 2>/dev/null
+        fi
+        shrunk=$((shrunk + 1))
+    fi
 
     after=$(allocated "$disk")
     local freed=$((before - after))
@@ -153,5 +233,7 @@ echo "----"
 if [ "$DRY_RUN" = 1 ]; then
     echo "dry-run: $((${#disks[@]} - skipped)) candidate(s), $skipped in use (skipped)"
 else
-    echo "trimmed $trimmed disk(s), reclaimed $(human "$reclaimed"); $skipped in use, $failed failed"
+    shrink_note=""
+    [ "$SHRINK" = 1 ] && shrink_note=" ($shrunk filesystem(s) shrunk)"
+    echo "trimmed $trimmed disk(s), reclaimed $(human "$reclaimed")$shrink_note; $skipped in use, $failed failed"
 fi
