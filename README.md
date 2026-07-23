@@ -154,6 +154,11 @@ Config via env (all optional):
 | `PG_VM_POOL_S3_REGION` | `us-east-1` | region for SigV4 signing |
 | `PG_VM_POOL_S3_ENDPOINT` | unset (AWS) | custom endpoint for an S3-compatible store (MinIO/R2); path-style addressing |
 | `PG_VM_POOL_S3_ACCESS_KEY_ID` / `PG_VM_POOL_S3_SECRET_ACCESS_KEY` | unset | S3 credentials (fall back to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) |
+| `PG_VM_POOL_FREEZE_AFTER_SECS` | `0` (off) | local freeze tier: dump a schema idle this long to a local file and delete its VM — see "Local freeze tier" |
+| `PG_VM_POOL_FREEZE_SWEEP_SECS` | `900` | how often the freeze sweep scans for candidates |
+| `PG_VM_POOL_DUMP_DIR` | `~/.heyo/pg-vm-pool/dumps` | where local dump files live |
+| `PG_VM_POOL_DUMP_LISTEN` | `0.0.0.0:6433` | local dump server bind; guests reach it at their default gateway, access is token-gated |
+| `PG_VM_POOL_WARM_SPARES` | `0` (off) | keep N pre-booted, initdb-complete spare VMs (`spare-pg-*`) for cold bring-ups to claim — an S3 restore skips create+boot+initdb and goes straight to download+load; capped at 16, each parked spare holds its size class's RAM |
 | `PG_VM_POOL_PRESSURE_PATH` | unset (off) | filesystem to watch (the heyvmd run dir); setting it enables emergency disk-pressure eviction — see "S3 eviction tier" |
 | `PG_VM_POOL_PRESSURE_HIGH_PCT` / `PG_VM_POOL_PRESSURE_LOW_PCT` | `85` / `75` | start emergency-archiving oldest-idle schemas at/above high; stop below low |
 | `PG_VM_POOL_PRESSURE_CHECK_SECS` | `60` | how often the pressure watchdog reads disk usage |
@@ -189,6 +194,31 @@ over the host tap and skips the iroh tunnel entirely — no relay dependency,
 lower latency, faster bring-up. It falls back to a tunnel automatically if the
 daemon reports no `guest_ip`. Set `PG_VM_POOL_DIRECT_CONNECT=0` to force the
 tunnel path (e.g. if the pooler ever runs on a different machine than the VMs).
+
+### Local freeze tier
+
+Between "idle-stopped VM" (full filesystem image on disk) and "archived to S3"
+(off-host, slow to restore) sits the **frozen** tier: a schema idle for
+`PG_VM_POOL_FREEZE_AFTER_SECS` is dumped to a local file
+(`PG_VM_POOL_DUMP_DIR/<schema>.dump`) and its **VM is deleted**. A cold schema
+then costs dump-file bytes (~1–5MB for a typical workbook) instead of a
+filesystem image (~200MB+ floor) — roughly an order of magnitude more cold
+schemas per host disk. The next client connect restores it: with
+`PG_VM_POOL_WARM_SPARES` set it claims a pre-booted spare and goes straight to
+download + parallel `pg_restore` (seconds for small workbooks).
+
+The dump bytes move exactly like the S3 tier's — the guest streams
+`pg_dump`/`pg_restore` through `curl` — but against a tiny token-gated HTTP
+server the pooler runs on the host (`PG_VM_POOL_DUMP_LISTEN`), reached in-guest
+at the VM's default gateway. Every guard from the S3 pipeline applies: the VM
+is only killed after the server has fully received, fsync'd, and renamed the
+dump (size-checked); the tier flip is durable before the kill; restores are
+idempotent (`--clean --if-exists`).
+
+The tiers ladder: after `PG_VM_POOL_ARCHIVE_AFTER_SECS`, a *frozen* schema's
+dump is **promoted to S3 by the pooler itself** — a file upload, no VM bring-up
+at all — and the local file is deleted. `frozen` schemas appear in the
+dashboard with a "frozen (local)" badge and a `frozen` state filter.
 
 ### S3 eviction tier
 

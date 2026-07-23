@@ -14,9 +14,12 @@ use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, PressureConfig};
+use crate::dumpsrv::DumpServer;
 use crate::reclaim::{POST_STOP_RECLAIM_DELAY, RECLAIM_FIRST_DELAY, Reclaimer};
-use crate::store::{Store, StoreRecord};
+use crate::spares::SparePool;
+use crate::store::{Store, StoreRecord, Tier};
 use crate::vm;
+use crate::vm::RestoreSource;
 
 /// Bound on the pre-stop CHECKPOINT the reaper issues before killing an idle
 /// VM. An immediate checkpoint flushes at most shared_buffers of dirty pages
@@ -34,6 +37,15 @@ const SUPERVISOR_HEARTBEAT: Duration = Duration::from_secs(900);
 /// that redeploys don't starve eviction (see [`supervise`]), long enough to let
 /// the pooler finish coming up first.
 const ARCHIVE_FIRST_SWEEP_DELAY: Duration = Duration::from_secs(120);
+
+/// Cap on freezes per sweep pass. Each freeze costs a VM bring-up (a cold
+/// boot) + dump + kill — minutes — and the sweeps share one single-flight
+/// lock, so an uncapped pass over a large idle backlog (first enable on an
+/// existing fleet: hundreds of candidates) would monopolize eviction for
+/// hours. Capped, the backlog drains a batch per sweep interval and the S3 /
+/// pressure sweeps get windows in between; the pressure reaper remains the
+/// urgent path if disk demands faster.
+const FREEZE_MAX_PER_SWEEP: usize = 25;
 
 /// Circuit breaker for one eviction sweep: after this many *consecutive*
 /// archive failures the pass aborts instead of grinding on. Each failed archive
@@ -268,6 +280,12 @@ pub struct SchemaRegistry {
     // passthrough, so freed guest blocks never return to the host on their
     // own). `Some` when PG_VM_POOL_RECLAIM_CMD is configured.
     reclaimer: Option<Arc<Reclaimer>>,
+    // Warm-spare pool: pre-booted empty VMs a cold bring-up claims instead of
+    // paying create + boot + initdb. `Some` when PG_VM_POOL_WARM_SPARES > 0.
+    spares: Option<Arc<SparePool>>,
+    // Local dump store + token registry for the frozen tier. `Some` when
+    // PG_VM_POOL_FREEZE_AFTER_SECS is configured.
+    dumps: Option<Arc<DumpServer>>,
 }
 
 impl SchemaRegistry {
@@ -277,6 +295,11 @@ impl SchemaRegistry {
             .reclaim
             .as_ref()
             .map(|r| Arc::new(Reclaimer::new(r.cmd.clone())));
+        let spares = (cfg.warm_spares > 0).then(|| Arc::new(SparePool::new(cfg.warm_spares)));
+        let dumps = cfg
+            .freeze
+            .as_ref()
+            .map(|f| Arc::new(DumpServer::new(f.dump_dir.clone())));
         Self {
             cfg,
             entries: Mutex::new(HashMap::new()),
@@ -284,7 +307,20 @@ impl SchemaRegistry {
             archiving: StdMutex::new(HashSet::new()),
             sweeping: AtomicBool::new(false),
             reclaimer,
+            spares,
+            dumps,
         }
+    }
+
+    /// Sandbox ids currently bound to a schema — the exclusion set that keeps
+    /// the spare pool from handing out a VM some schema already owns (a spare
+    /// keeps its `spare-pg-*` name after being claimed, so the name alone
+    /// can't tell).
+    fn bound_ids(&self) -> HashSet<String> {
+        self.store_records()
+            .into_iter()
+            .map(|(_, r)| r.sandbox_id)
+            .collect()
     }
 
     /// Password clients must present before the pooler proxies them anywhere;
@@ -478,20 +514,37 @@ impl SchemaRegistry {
             // reattach.
             let record = self.store.record(schema);
             let known_id = record.as_ref().map(|r| r.sandbox_id.clone());
-            let restore = match record.as_ref() {
-                Some(r) if r.archived => match self.cfg.archive.as_ref() {
-                    Some(a) => Some(a.s3.clone()),
+            let restore = match record.as_ref().map(|r| r.tier) {
+                Some(Tier::Archived) => match self.cfg.archive.as_ref() {
+                    Some(a) => Some(RestoreSource::S3(a.s3.clone())),
                     None => bail!(
                         "schema {schema} is archived to S3, but the eviction tier is not \
                          configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_*) — \
                          cannot restore it"
                     ),
                 },
+                Some(Tier::Frozen) => match (&self.dumps, &self.cfg.freeze) {
+                    (Some(srv), Some(f)) => Some(RestoreSource::Local {
+                        srv: srv.clone(),
+                        port: f.listen.port(),
+                    }),
+                    _ => bail!(
+                        "schema {schema} is frozen to a local dump, but the frozen tier is \
+                         not configured (set PG_VM_POOL_FREEZE_AFTER_SECS) — cannot restore it"
+                    ),
+                },
                 _ => None,
             };
+            let bound = self.spares.as_ref().map(|_| self.bound_ids()).unwrap_or_default();
             match cell
                 .get_or_try_init(|| {
-                    vm::ensure_vm(&self.cfg, schema, known_id.as_deref(), restore.as_ref())
+                    vm::ensure_vm(
+                        &self.cfg,
+                        schema,
+                        known_id.as_deref(),
+                        restore.as_ref(),
+                        self.spares.as_deref().map(|p| (p, &bound)),
+                    )
                 })
                 .await
             {
@@ -693,6 +746,33 @@ impl SchemaRegistry {
         }));
     }
 
+    /// Spawn the warm-spare replenisher if `PG_VM_POOL_WARM_SPARES` > 0: keeps
+    /// the pool of pre-booted claimable VMs topped up (see `spares`).
+    pub fn spawn_spare_replenisher(self: &Arc<Self>) {
+        let Some(pool) = self.spares.clone() else {
+            info!("warm-spare pool disabled (PG_VM_POOL_WARM_SPARES unset/0)");
+            return;
+        };
+        info!(
+            "warm-spare pool: keeping {} pre-booted VM(s) ready for claiming",
+            self.cfg.warm_spares.min(crate::spares::MAX_SPARES)
+        );
+        let registry = self.clone();
+        tokio::spawn(supervise(
+            "warm-spares",
+            Duration::from_secs(15),
+            Duration::from_secs(60),
+            move || {
+                let registry = registry.clone();
+                let pool = pool.clone();
+                async move {
+                    let bound = registry.bound_ids();
+                    pool.replenish(&registry.cfg, &bound).await
+                }
+            },
+        ));
+    }
+
     /// Spawn the disk-pressure watchdog if `PG_VM_POOL_PRESSURE_PATH` is
     /// configured: when the VM-disk filesystem crosses the high-water mark,
     /// emergency-archive the oldest-idle schemas — TTL ignored — until it
@@ -768,7 +848,7 @@ impl SchemaRegistry {
         let mut candidates: Vec<(String, u64)> = self
             .store_records()
             .into_iter()
-            .filter(|(schema, rec)| !rec.archived && !self.cfg.is_keepalive(schema))
+            .filter(|(schema, rec)| rec.tier == Tier::Live && !self.cfg.is_keepalive(schema))
             .map(|(schema, rec)| (schema, rec.last_active))
             .collect();
         candidates.sort_by_key(|(_, last_active)| *last_active);
@@ -884,16 +964,27 @@ impl SchemaRegistry {
             .collect();
 
         let mut candidates: Vec<String> = Vec::new();
+        // Frozen schemas past the archive threshold get promoted local-file →
+        // S3 without any VM (the dump already exists on the host).
+        let mut frozen_candidates: Vec<String> = Vec::new();
         let mut total = 0usize;
         let (mut refreshed, mut keepalive, mut already, mut not_idle) = (0usize, 0usize, 0usize, 0usize);
         for (schema, rec) in self.store_records() {
             total += 1;
             let ka = self.cfg.is_keepalive(&schema);
+            if rec.tier == Tier::Frozen {
+                if !ka && now.saturating_sub(rec.last_active) >= threshold_secs {
+                    frozen_candidates.push(schema);
+                } else {
+                    not_idle += 1;
+                }
+                continue;
+            }
             match classify_candidate(&rec, ka, now, threshold_secs, live.get(&schema).copied()) {
                 SweepAction::Skip => {
                     // classify_candidate skips for exactly these reasons; tally
                     // them so a sweep that archives nothing still says why.
-                    if rec.archived {
+                    if rec.offloaded() {
                         already += 1;
                     } else if ka {
                         keepalive += 1;
@@ -915,17 +1006,31 @@ impl SchemaRegistry {
         // explained ("all skipped as not-idle") rather than silent — the manual
         // "sweep now" button and the periodic pass both surface here.
         info!(
-            "S3 eviction sweep: evaluated {total} schema(s) — {} candidate(s), \
-             {refreshed} refreshed (warm), skipped {} ({keepalive} keepalive, \
-             {already} already archived, {not_idle} idle < {threshold_secs}s)",
+            "S3 eviction sweep: evaluated {total} schema(s) — {} live candidate(s) + \
+             {} frozen promotion(s), {refreshed} refreshed (warm), skipped {} \
+             ({keepalive} keepalive, {already} already archived, {not_idle} idle < \
+             {threshold_secs}s)",
             candidates.len(),
+            frozen_candidates.len(),
             keepalive + already + not_idle,
         );
 
-        if candidates.is_empty() {
-            return 0;
+        // Promote frozen dumps first: cheap (a file upload, no VM), and every
+        // success frees local disk.
+        let mut archived_frozen = 0usize;
+        for schema in frozen_candidates {
+            match self.archive_frozen_schema(&schema).await {
+                Ok(()) => archived_frozen += 1,
+                Err(e) => warn!(
+                    "promoting frozen schema {schema} to S3 failed (will retry next sweep): {e:#}"
+                ),
+            }
         }
-        let mut archived = 0usize;
+
+        if candidates.is_empty() {
+            return archived_frozen;
+        }
+        let mut archived = archived_frozen;
         let mut consecutive_failures = 0usize;
         for schema in candidates {
             match self.archive_schema(&schema).await {
@@ -959,8 +1064,11 @@ impl SchemaRegistry {
         let Some(archive) = self.cfg.archive.clone() else {
             bail!("S3 eviction tier is not configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_*)");
         };
-        if self.store.record(schema).map(|r| r.archived).unwrap_or(false) {
-            bail!("schema {schema} is already archived to S3");
+        match self.store.record(schema).map(|r| r.tier) {
+            Some(Tier::Archived) => bail!("schema {schema} is already archived to S3"),
+            // Frozen: no VM to dump — promote the existing local dump file.
+            Some(Tier::Frozen) => return self.archive_frozen_schema(schema).await,
+            _ => {}
         }
 
         // Claim the archiving slot; a Drop guard clears it on every exit path so
@@ -991,7 +1099,9 @@ impl SchemaRegistry {
         // S3 and the store says "archived", so the next connect restores — the
         // reverse order could lose the mapping to a killed VM.
         let known_id = self.store.record(schema).map(|r| r.sandbox_id);
-        let entry = vm::ensure_vm(&self.cfg, schema, known_id.as_deref(), None)
+        // No spare pool here: this bring-up exists to dump an *existing* VM's
+        // data — a fresh spare would have nothing to dump.
+        let entry = vm::ensure_vm(&self.cfg, schema, known_id.as_deref(), None, None)
             .await
             .with_context(|| format!("bringing up VM for schema {schema} to archive it"))?;
 
@@ -999,7 +1109,7 @@ impl SchemaRegistry {
             .await
             .with_context(|| format!("dumping schema {schema} to S3"))?;
 
-        self.store.mark_archived(schema).await;
+        self.store.set_tier(schema, Tier::Archived).await;
         info!("schema {schema}: dumped to s3://{}/{}", archive.s3.bucket, archive.s3.object_key(schema));
 
         if let Err(e) = entry.sandbox.kill().await {
@@ -1010,6 +1120,240 @@ impl SchemaRegistry {
             info!("schema {schema}: VM killed, disk reclaimed");
         }
         // Dropping `entry` tears down its pool/tunnel.
+        Ok(())
+    }
+
+    /// Promote a frozen schema's local dump file to S3 — no VM involved: the
+    /// dump already exists on the host, so this is a pooler-side upload,
+    /// verified with a HEAD, then tier flip and local-file cleanup.
+    async fn archive_frozen_schema(&self, schema: &str) -> Result<()> {
+        let Some(archive) = self.cfg.archive.clone() else {
+            bail!("S3 eviction tier is not configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_*)");
+        };
+        let Some(dumps) = self.dumps.clone() else {
+            bail!("schema {schema} is frozen but the frozen tier is not configured");
+        };
+        let _guard = match ArchivingGuard::claim(&self.archiving, schema) {
+            Some(g) => g,
+            None => bail!("schema {schema} is already being archived"),
+        };
+        anyhow::ensure!(
+            self.store.record(schema).map(|r| r.tier) == Some(Tier::Frozen),
+            "schema {schema} is no longer frozen; not promoting"
+        );
+
+        let path = dumps.dump_path(schema);
+        let meta = std::fs::metadata(&path)
+            .with_context(|| format!("reading local dump {}", path.display()))?;
+        let len = meta.len();
+        anyhow::ensure!(
+            len >= 512,
+            "local dump {} is only {len} bytes — refusing to promote a failed dump",
+            path.display()
+        );
+        // The whole object rides through memory (the SDK's reqwest has no
+        // streaming-body feature enabled). Bound it; an oversized dump simply
+        // stays frozen locally, which is safe.
+        const MAX_POOLER_UPLOAD: u64 = 512 * 1024 * 1024;
+        anyhow::ensure!(
+            len <= MAX_POOLER_UPLOAD,
+            "local dump {} is {len} bytes (> {MAX_POOLER_UPLOAD}); leaving it frozen \
+             locally rather than buffering it through the pooler",
+            path.display()
+        );
+        let bytes = tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+
+        let key = archive.s3.object_key(schema);
+        let http = reqwest::Client::builder()
+            .build()
+            .context("building HTTP client for S3 upload")?;
+        // HEAD first so a wrong-region bucket is discovered (and latched)
+        // before the PUT is presigned.
+        let _ = archive.s3.head_object(&http, &key, Duration::from_secs(10)).await;
+        archive
+            .s3
+            .put_object(&http, &key, bytes, Duration::from_secs(600))
+            .await?;
+        // Verify: the object must exist with exactly the file's size.
+        match archive.s3.head_object(&http, &key, Duration::from_secs(10)).await {
+            Ok(Some(id)) if id.content_length == len => {}
+            Ok(Some(id)) => bail!(
+                "uploaded s3://{}/{key} reports {} bytes but the local dump is {len} — \
+                 refusing to trust it",
+                archive.s3.bucket,
+                id.content_length
+            ),
+            Ok(None) => bail!("uploaded s3://{}/{key} but a HEAD finds nothing", archive.s3.bucket),
+            Err(e) => return Err(e.context("verifying the uploaded archive")),
+        }
+
+        self.store.set_tier(schema, Tier::Archived).await;
+        if let Err(e) = tokio::fs::remove_file(&path).await {
+            warn!("schema {schema}: promoted to S3 but deleting {} failed: {e}", path.display());
+        }
+        info!(
+            "schema {schema}: frozen dump promoted to s3://{}/{key} ({len} bytes), local file removed",
+            archive.s3.bucket
+        );
+        Ok(())
+    }
+
+    // ---- local frozen tier --------------------------------------------------
+
+    /// Start the local dump HTTP server (frozen tier). Serves guest uploads
+    /// and downloads; without it, freezing and thawing are inert.
+    pub fn spawn_dump_server(self: &Arc<Self>) {
+        let (Some(srv), Some(freeze)) = (self.dumps.clone(), self.cfg.freeze.clone()) else {
+            return;
+        };
+        tokio::spawn(async move {
+            if let Err(e) = srv.serve(freeze.listen).await {
+                error!("local dump server exited: {e:#} — freezing and thawing are down");
+            }
+        });
+    }
+
+    /// Spawn the freeze sweep if `PG_VM_POOL_FREEZE_AFTER_SECS` is configured:
+    /// dump long-idle schemas to local files and delete their VMs, shrinking a
+    /// cold schema's footprint from a filesystem image to dump-file bytes.
+    pub fn spawn_freezer(self: &Arc<Self>) {
+        let Some(freeze) = self.cfg.freeze.clone() else {
+            info!("local freeze tier disabled (PG_VM_POOL_FREEZE_AFTER_SECS unset/0)");
+            return;
+        };
+        info!(
+            "local freeze tier: dumping schemas idle >= {:?} to {} and deleting their \
+             VMs (sweep every {:?})",
+            freeze.freeze_after,
+            freeze.dump_dir.display(),
+            freeze.sweep_interval
+        );
+        let registry = self.clone();
+        let (interval, after) = (freeze.sweep_interval, freeze.freeze_after);
+        let first = ARCHIVE_FIRST_SWEEP_DELAY.min(interval);
+        tokio::spawn(supervise("local-freeze", first, interval, move || {
+            let registry = registry.clone();
+            async move { registry.sweep_freeze(after).await }
+        }));
+    }
+
+    /// One freeze pass: freeze every live, non-keepalive schema untouched for
+    /// at least `threshold`. Shares the sweep single-flight with the S3 sweep
+    /// and the pressure reaper, so the passes never interleave.
+    async fn sweep_freeze(&self, threshold: Duration) -> usize {
+        if self.sweeping.swap(true, Ordering::SeqCst) {
+            info!("local freeze: another sweep is running; skipping this pass");
+            return 0;
+        }
+        let _sweeping = SweepGuard(&self.sweeping);
+
+        let now = now_unix();
+        let threshold_secs = threshold.as_secs();
+        let live: HashMap<String, (usize, u64)> = self
+            .snapshot()
+            .await
+            .into_iter()
+            .map(|e| (e.schema, (e.active, e.idle_secs)))
+            .collect();
+
+        let mut candidates: Vec<String> = Vec::new();
+        for (schema, rec) in self.store_records() {
+            let ka = self.cfg.is_keepalive(&schema);
+            if classify_candidate(&rec, ka, now, threshold_secs, live.get(&schema).copied())
+                == SweepAction::Archive
+            {
+                candidates.push(schema);
+            }
+        }
+        if candidates.is_empty() {
+            return 0;
+        }
+        let backlog = candidates.len().saturating_sub(FREEZE_MAX_PER_SWEEP);
+        candidates.truncate(FREEZE_MAX_PER_SWEEP);
+        info!(
+            "local freeze sweep: {} candidate(s) this pass{}",
+            candidates.len(),
+            if backlog > 0 {
+                format!(" ({backlog} more deferred to later sweeps)")
+            } else {
+                String::new()
+            }
+        );
+        let mut frozen = 0usize;
+        let mut consecutive_failures = 0usize;
+        for schema in candidates {
+            match self.freeze_schema(&schema).await {
+                Ok(()) => {
+                    frozen += 1;
+                    consecutive_failures = 0;
+                }
+                Err(e) => {
+                    warn!("freezing schema {schema} failed (will retry next sweep): {e:#}");
+                    consecutive_failures += 1;
+                    if consecutive_failures >= SWEEP_MAX_CONSECUTIVE_FAILURES {
+                        error!(
+                            "local freeze sweep: aborting after {consecutive_failures} \
+                             consecutive failures — environment looks unhealthy; remaining \
+                             candidates will be retried next sweep"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        frozen
+    }
+
+    /// Dump one schema to the local dump store and delete its VM. The frozen
+    /// twin of [`Self::archive_schema`], with the same guards: `archiving`
+    /// claim (checkouts wait), live-session refusal, dump verified complete
+    /// (size-checked by `dump_to_local`) *before* the durable tier flip, and
+    /// the tier flip durable *before* the kill.
+    pub async fn freeze_schema(&self, schema: &str) -> Result<()> {
+        let (Some(freeze), Some(dumps)) = (self.cfg.freeze.clone(), self.dumps.clone()) else {
+            bail!("local freeze tier is not configured (set PG_VM_POOL_FREEZE_AFTER_SECS)");
+        };
+        if self.store.record(schema).map(|r| r.offloaded()).unwrap_or(false) {
+            bail!("schema {schema} is already frozen or archived");
+        }
+        let _guard = match ArchivingGuard::claim(&self.archiving, schema) {
+            Some(g) => g,
+            None => bail!("schema {schema} is already being frozen/archived"),
+        };
+        {
+            let mut map = self.entries.lock().await;
+            if let Some(entry) = map.get(schema).and_then(|c| c.get()) {
+                let active = entry.active_count();
+                if active > 0 {
+                    bail!("schema {schema} has {active} live session(s); refusing to freeze");
+                }
+            }
+            map.remove(schema);
+        }
+
+        let known_id = self.store.record(schema).map(|r| r.sandbox_id);
+        let entry = vm::ensure_vm(&self.cfg, schema, known_id.as_deref(), None, None)
+            .await
+            .with_context(|| format!("bringing up VM for schema {schema} to freeze it"))?;
+
+        let bytes = vm::dump_to_local(
+            &self.cfg,
+            &entry.sandbox,
+            schema,
+            &dumps,
+            freeze.listen.port(),
+        )
+        .await
+        .with_context(|| format!("dumping schema {schema} to the local dump store"))?;
+
+        self.store.set_tier(schema, Tier::Frozen).await;
+        if let Err(e) = entry.sandbox.kill().await {
+            warn!("schema {schema}: frozen locally but killing the VM failed (orphaned): {e:#}");
+        } else {
+            info!("schema {schema}: frozen ({bytes}-byte local dump), VM deleted, disk reclaimed");
+        }
         Ok(())
     }
 
@@ -1169,7 +1513,7 @@ fn classify_candidate(
     threshold_secs: u64,
     live: Option<(usize, u64)>,
 ) -> SweepAction {
-    if rec.archived || keepalive {
+    if rec.offloaded() || keepalive {
         return SweepAction::Skip;
     }
     if now.saturating_sub(rec.last_active) < threshold_secs {
@@ -1191,7 +1535,7 @@ mod archive_tests {
         StoreRecord {
             sandbox_id: "sb-x".into(),
             last_active,
-            archived,
+            tier: if archived { Tier::Archived } else { Tier::Live },
         }
     }
 

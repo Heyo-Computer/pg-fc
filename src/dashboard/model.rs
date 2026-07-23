@@ -42,7 +42,7 @@ pub const MAX_PER: usize = 200;
 /// sentinel [`STATE_ALL`] disables the filter. The view defaults to showing
 /// only running sandboxes — on a busy host the stopped tail dwarfs the live
 /// set.
-pub const STATE_FILTERS: [&str; 8] = [
+pub const STATE_FILTERS: [&str; 9] = [
     "running",
     "provisioning",
     "stopped",
@@ -50,6 +50,7 @@ pub const STATE_FILTERS: [&str; 8] = [
     "cold-stored",
     "failed",
     "unknown",
+    "frozen",
     "archived",
 ];
 pub const DEFAULT_STATE: &str = "running";
@@ -88,16 +89,18 @@ struct RawSandbox {
     #[serde(default)]
     disk_size_gb: Option<u32>,
     // Not from the daemon (it never sees these — they were killed). Set on the
-    // synthetic rows we splice in for schemas whose data lives only in S3.
-    #[serde(default)]
-    archived: bool,
+    // synthetic rows we splice in for schemas whose data lives only in a local
+    // dump ("frozen") or in S3 ("archived").
+    #[serde(skip)]
+    offload: Option<&'static str>,
 }
 
 impl RawSandbox {
-    /// A synthetic record for a schema archived to S3: its VM was killed, so it
-    /// is absent from the daemon inventory. `status` is a placeholder — the
-    /// `archived` flag is what drives display and filtering.
-    fn archived(schema: &str, sandbox_id: &str) -> Self {
+    /// A synthetic record for an offloaded schema (frozen locally or archived
+    /// to S3): its VM was killed, so it is absent from the daemon inventory.
+    /// `status` is a placeholder — the `offload` label drives display and
+    /// filtering.
+    fn offloaded(schema: &str, sandbox_id: &str, label: &'static str) -> Self {
         RawSandbox {
             id: sandbox_id.to_string(),
             name: format!("pg-{schema}"),
@@ -113,7 +116,7 @@ impl RawSandbox {
             cpus: None,
             memory: None,
             disk_size_gb: None,
-            archived: true,
+            offload: Some(label),
         }
     }
 }
@@ -122,21 +125,27 @@ impl RawSandbox {
 /// otherwise the daemon status label. Shared by the state filter, pill counts,
 /// and search so all three agree on what "archived" matches.
 fn row_state_label(s: &RawSandbox) -> &'static str {
-    if s.archived {
-        "archived"
+    if let Some(label) = s.offload {
+        label
     } else {
         status_str(&s.status)
     }
 }
 
-/// Append synthetic rows for every archived schema not already represented in
-/// the daemon inventory (deduped by sandbox id).
-fn append_archived(list: &mut Vec<RawSandbox>, records: &[(String, StoreRecord)]) {
+/// Append synthetic rows for every offloaded (frozen/archived) schema not
+/// already represented in the daemon inventory (deduped by sandbox id).
+fn append_offloaded(list: &mut Vec<RawSandbox>, records: &[(String, StoreRecord)]) {
     let existing: std::collections::HashSet<&str> = list.iter().map(|s| s.id.as_str()).collect();
     let mut extra: Vec<RawSandbox> = records
         .iter()
-        .filter(|(_, r)| r.archived && !existing.contains(r.sandbox_id.as_str()))
-        .map(|(schema, r)| RawSandbox::archived(schema, &r.sandbox_id))
+        .filter(|(_, r)| r.offloaded() && !existing.contains(r.sandbox_id.as_str()))
+        .map(|(schema, r)| {
+            let label = match r.tier {
+                crate::store::Tier::Frozen => "frozen",
+                _ => "archived",
+            };
+            RawSandbox::offloaded(schema, &r.sandbox_id, label)
+        })
         .collect();
     list.append(&mut extra);
 }
@@ -178,9 +187,10 @@ pub struct VmRow {
     pub target: Option<std::net::SocketAddr>,
     /// True when reached over an iroh tunnel rather than a direct guest IP.
     pub tunneled: Option<bool>,
-    /// True when this schema's data lives only in S3 (VM killed by the eviction
-    /// tier). No live sandbox backs it; the next client connect restores it.
-    pub archived: bool,
+    /// `Some("frozen")`/`Some("archived")` when this schema's data lives only
+    /// in a local dump / in S3 (VM killed). No live sandbox backs it; the next
+    /// client connect restores it.
+    pub offload: Option<&'static str>,
 }
 
 impl VmRow {
@@ -577,7 +587,7 @@ fn join_row(
         keepalive: entry.map(|e| e.keepalive).unwrap_or(false),
         target: entry.map(|e| e.target),
         tunneled: entry.map(|e| e.tunneled),
-        archived: s.archived,
+        offload: s.offload,
     }
 }
 
@@ -588,7 +598,7 @@ pub async fn build_rows(st: &DashState) -> Result<Vec<VmRow>> {
     let (list, usage) = cached_inventory(st).await?;
     let mut list = (*list).clone();
     let (snap, store, records) = pooler_maps(st).await;
-    append_archived(&mut list, &records);
+    append_offloaded(&mut list, &records);
 
     let mut rows: Vec<VmRow> = list
         .into_iter()
@@ -642,7 +652,7 @@ pub async fn build_page(
     let (list, usage) = cached_inventory(st).await?;
     let mut list = (*list).clone();
     let (snap, store, records) = pooler_maps(st).await;
-    append_archived(&mut list, &records);
+    append_offloaded(&mut list, &records);
     let total = list.len();
 
     let needle = q.trim().to_lowercase();

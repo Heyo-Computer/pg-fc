@@ -8,10 +8,12 @@
 mod auth;
 mod config;
 mod dashboard;
+mod dumpsrv;
 mod proxy;
 mod reclaim;
 mod registry;
 mod s3;
+mod spares;
 mod startup;
 mod store;
 mod tls;
@@ -73,6 +75,15 @@ async fn main() -> Result<()> {
     // high-water mark, archive oldest-idle schemas (TTL overridden) until it
     // recovers. No-op unless PG_VM_POOL_PRESSURE_PATH is configured.
     registry.spawn_pressure_reaper();
+    // Warm-spare pool: pre-booted empty VMs that cold bring-ups (notably S3
+    // restores) claim instead of paying create + boot + initdb. No-op unless
+    // PG_VM_POOL_WARM_SPARES > 0.
+    registry.spawn_spare_replenisher();
+    // Local frozen tier: dump long-idle schemas to local files and delete
+    // their VMs (the dump server carries the bytes both ways). No-op unless
+    // PG_VM_POOL_FREEZE_AFTER_SECS is configured.
+    registry.spawn_dump_server();
+    registry.spawn_freezer();
     // Offline-trim stopped VMs' data disks so freed guest blocks return to the
     // host (Firecracker has no discard passthrough). No-op unless
     // PG_VM_POOL_RECLAIM_CMD is configured.

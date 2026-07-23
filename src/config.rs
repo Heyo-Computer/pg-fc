@@ -90,6 +90,18 @@ pub struct Config {
     /// [`ArchiveConfig::archive_after`] to S3 and kills its VM to reclaim disk;
     /// the next connect restores it. Enabled by `PG_VM_POOL_ARCHIVE_AFTER_SECS`.
     pub archive: Option<ArchiveConfig>,
+    /// Local "frozen" tier: dump long-idle schemas to a local file and delete
+    /// their VM entirely, so a cold schema costs dump-file bytes (~1-5MB)
+    /// instead of a filesystem image. `None` (default) disables it — enabled
+    /// by `PG_VM_POOL_FREEZE_AFTER_SECS`. Sits between the idle reaper (stops
+    /// the VM, keeps the disk) and the S3 tier (offloads off-host).
+    pub freeze: Option<FreezeConfig>,
+    /// How many warm-spare VMs (pre-booted, initdb done, parked empty) to keep
+    /// ready for claiming, so a cold bring-up — notably a restore from S3 —
+    /// skips create + boot + initdb. `0` (default) disables the pool. Each
+    /// spare holds its size class's RAM while parked. Env
+    /// `PG_VM_POOL_WARM_SPARES` (capped at 16).
+    pub warm_spares: usize,
     /// Automatic disk-slack reclamation: periodically offline-trim stopped VMs'
     /// sparse data disks so freed guest blocks return to the host (Firecracker's
     /// virtio-blk has no discard passthrough, so they never come back on their
@@ -151,6 +163,63 @@ pub struct ArchiveConfig {
     /// S3 addressing + credentials the pooler uses to presign the guest's
     /// dump upload / restore download.
     pub s3: crate::s3::S3Config,
+}
+
+/// Settings for the local "frozen" tier. Present (`Some`) only when
+/// `PG_VM_POOL_FREEZE_AFTER_SECS` is a positive number.
+#[derive(Clone)]
+pub struct FreezeConfig {
+    /// A non-keepalive schema untouched this long is dumped to a local file
+    /// and its VM killed; the next connect restores it (onto a warm spare when
+    /// the pool is enabled). Env `PG_VM_POOL_FREEZE_AFTER_SECS`.
+    pub freeze_after: Duration,
+    /// How often the freeze sweep scans for candidates. Env
+    /// `PG_VM_POOL_FREEZE_SWEEP_SECS` (default 900).
+    pub sweep_interval: Duration,
+    /// Where local dump files live. Env `PG_VM_POOL_DUMP_DIR`
+    /// (default `~/.heyo/pg-vm-pool/dumps`).
+    pub dump_dir: PathBuf,
+    /// Where the local dump HTTP server listens. Guests reach it at their
+    /// default gateway (the host side of their tap), so this must bind an
+    /// address reachable from the VM bridge — the default binds all
+    /// interfaces. Access is token-gated per operation. Env
+    /// `PG_VM_POOL_DUMP_LISTEN` (default `0.0.0.0:6433`).
+    pub listen: SocketAddr,
+}
+
+impl FreezeConfig {
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        let freeze_after = match std::env::var("PG_VM_POOL_FREEZE_AFTER_SECS") {
+            Ok(v) => match v.trim().parse::<u64>() {
+                Ok(0) | Err(_) => return Ok(None),
+                Ok(secs) => Duration::from_secs(secs),
+            },
+            Err(_) => return Ok(None),
+        };
+        let sweep_interval = std::env::var("PG_VM_POOL_FREEZE_SWEEP_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(900));
+        let dump_dir = std::env::var("PG_VM_POOL_DUMP_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                PathBuf::from(home).join(".heyo/pg-vm-pool/dumps")
+            });
+        let listen = std::env::var("PG_VM_POOL_DUMP_LISTEN")
+            .unwrap_or_else(|_| "0.0.0.0:6433".to_string());
+        let listen: SocketAddr = listen
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid PG_VM_POOL_DUMP_LISTEN {listen:?}: {e}"))?;
+        Ok(Some(Self {
+            freeze_after,
+            sweep_interval,
+            dump_dir,
+            listen,
+        }))
+    }
 }
 
 /// Settings for emergency disk-pressure eviction: when the VM-disk filesystem
@@ -286,6 +355,11 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_ARCHIVE_SWEEP_SECS",
     "PG_VM_POOL_RECLAIM_CMD",
     "PG_VM_POOL_RECLAIM_INTERVAL_SECS",
+    "PG_VM_POOL_WARM_SPARES",
+    "PG_VM_POOL_FREEZE_AFTER_SECS",
+    "PG_VM_POOL_FREEZE_SWEEP_SECS",
+    "PG_VM_POOL_DUMP_DIR",
+    "PG_VM_POOL_DUMP_LISTEN",
     "PG_VM_POOL_PRESSURE_PATH",
     "PG_VM_POOL_PRESSURE_HIGH_PCT",
     "PG_VM_POOL_PRESSURE_LOW_PCT",
@@ -405,6 +479,22 @@ impl Config {
             );
         }
         let reclaim = ReclaimConfig::from_env();
+        let warm_spares = std::env::var("PG_VM_POOL_WARM_SPARES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let freeze = FreezeConfig::from_env()?;
+        if let (Some(f), Some(a)) = (&freeze, &archive)
+            && f.freeze_after >= a.archive_after
+        {
+            tracing::warn!(
+                "PG_VM_POOL_FREEZE_AFTER_SECS ({}s) >= PG_VM_POOL_ARCHIVE_AFTER_SECS ({}s): \
+                 schemas will be archived to S3 before they ever freeze locally, so the \
+                 frozen tier will not fire",
+                f.freeze_after.as_secs(),
+                a.archive_after.as_secs()
+            );
+        }
 
         Ok(Self {
             listen_addr,
@@ -424,6 +514,8 @@ impl Config {
             tls_key,
             dashboard,
             archive,
+            freeze,
+            warm_spares,
             reclaim,
         })
     }

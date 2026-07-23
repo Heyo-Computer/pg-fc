@@ -126,7 +126,8 @@ pub fn monitoring_page(
     // Sum of per-VM guest CPU (heyvmd's `top`-convention sample: 100% = one
     // core), i.e. how many cores' worth of work the fleet's guests are doing.
     let guest_cpu: f32 = running.iter().filter_map(|r| r.cpu_percent).sum();
-    let archived = rows.iter().filter(|r| r.archived).count();
+    let archived = rows.iter().filter(|r| r.offload == Some("archived")).count();
+    let frozen = rows.iter().filter(|r| r.offload == Some("frozen")).count();
 
     shell(
         "Monitoring",
@@ -196,6 +197,7 @@ pub fn monitoring_page(
                 (stat("allocated RAM", &human_bytes(alloc_mem), Some("across running VMs")))
                 (stat("guest CPU", &format!("{guest_cpu:.0}%"), Some("cores busy, top-convention")))
                 @if st.registry.archive_enabled() {
+                    (stat("frozen (local)", &frozen.to_string(), None))
                     (stat("archived (S3)", &archived.to_string(), None))
                 }
             }
@@ -918,7 +920,7 @@ fn action_buttons(r: &VmRow, archive_enabled: bool) -> Markup {
     let can_reap = archive_enabled
         && running
         && r.pool_managed
-        && !r.archived
+        && r.offload.is_none()
         && r.schema.is_some()
         && r.live_sessions.unwrap_or(0) == 0;
     html! {
@@ -996,13 +998,15 @@ fn sessions_cell(r: &VmRow) -> Markup {
     }
 }
 
-/// Status badge that accounts for the S3 eviction tier: an archived schema has
-/// no live sandbox, so its daemon status is meaningless — show "archived (S3)".
+/// Status badge that accounts for the offloaded tiers: an offloaded schema has
+/// no live sandbox, so its daemon status is meaningless — show where the data
+/// actually lives instead.
 fn status_badge_row(r: &VmRow) -> Markup {
-    if r.archived {
-        return html! { span.badge class="s-archived" { "archived (S3)" } };
+    match r.offload {
+        Some("frozen") => html! { span.badge class="s-archived" { "frozen (local)" } },
+        Some(_) => html! { span.badge class="s-archived" { "archived (S3)" } },
+        None => status_badge(&r.status),
     }
-    status_badge(&r.status)
 }
 
 fn status_badge(status: &SandboxStatus) -> Markup {

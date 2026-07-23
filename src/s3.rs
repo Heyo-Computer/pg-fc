@@ -205,6 +205,36 @@ impl S3Config {
         })))
     }
 
+    /// Upload `bytes` to `key` from the pooler itself — used by the frozen
+    /// tier, where the dump already exists as a local file and archiving it
+    /// needs no VM. The caller bounds `bytes` (it holds the whole object in
+    /// memory) and should HEAD first so a wrong-region bucket is discovered
+    /// before this presigns.
+    pub async fn put_object(
+        &self,
+        http: &reqwest::Client,
+        key: &str,
+        bytes: Vec<u8>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = self.presign_put(key, std::time::Duration::from_secs(600));
+        let resp = http
+            .put(&url)
+            .body(bytes)
+            .timeout(timeout)
+            .send()
+            .await
+            .with_context(|| format!("PUT s3://{}/{key}", self.bucket))?;
+        anyhow::ensure!(
+            resp.status().is_success(),
+            "PUT s3://{}/{key} returned {}",
+            self.bucket,
+            resp.status()
+        );
+        Ok(())
+    }
+
     /// Resolve `(scheme://host, canonical_uri)` for `key`. Virtual-hosted by
     /// default; path-style when a custom endpoint is configured. `canonical_uri`
     /// is the URI-encoded object path with `/` preserved — exactly what goes

@@ -14,8 +14,9 @@
 //!     the VM leaving the warm map (idle-stop), so the hourly archive sweep can
 //!     find schemas untouched for a week even though their VM is already
 //!     stopped — the in-memory `SchemaEntry::last_active` is gone by then.
-//!   - `state`: `live` or `archived`. `archived` means the VM was killed and the
-//!     data lives only in S3, so the next checkout must restore it before use.
+//!   - `state`: the storage tier — `live`, `frozen` (VM killed, data in a
+//!     local dump file), or `archived` (data only in S3). Both offloaded tiers
+//!     mean the next checkout must restore before serving.
 //!
 //! Format: one `schema\tsandbox_id\tlast_active_unix\tstate` line per entry.
 //! Older 2-column files (`schema\tsandbox_id`) still parse: the missing
@@ -41,15 +42,51 @@ use tracing::{info, warn};
 /// a busy schema from fsync-storming the registry on every connect.
 const FLUSH_DEBOUNCE_SECS: u64 = 60;
 
+/// Where a schema's data currently lives — the storage tier ladder.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tier {
+    /// A VM (running or merely stopped) holds the data on its disk.
+    Live,
+    /// The VM was killed; the data lives in a local dump file under the
+    /// pooler's dump dir. The next checkout restores from it.
+    Frozen,
+    /// The data lives only in S3. The next checkout restores from there.
+    Archived,
+}
+
+impl Tier {
+    fn as_str(self) -> &'static str {
+        match self {
+            Tier::Live => "live",
+            Tier::Frozen => "frozen",
+            Tier::Archived => "archived",
+        }
+    }
+
+    fn parse(s: &str) -> Tier {
+        match s {
+            "archived" => Tier::Archived,
+            "frozen" => Tier::Frozen,
+            _ => Tier::Live,
+        }
+    }
+}
+
 /// A durable, owned view of one schema's registry entry.
 #[derive(Clone)]
 pub struct StoreRecord {
     pub sandbox_id: String,
     /// Unix seconds of the last client checkout for this schema.
     pub last_active: u64,
-    /// True once the VM has been dumped to S3 and killed — the data is only in
-    /// S3 and the next checkout must restore it.
-    pub archived: bool,
+    /// Storage tier: whether a VM disk, a local dump, or S3 holds the data.
+    pub tier: Tier,
+}
+
+impl StoreRecord {
+    /// The VM is gone and a restore (local or S3) is needed before serving.
+    pub fn offloaded(&self) -> bool {
+        self.tier != Tier::Live
+    }
 }
 
 /// Internal map value: a [`StoreRecord`] plus the `last_active` value currently
@@ -57,7 +94,7 @@ pub struct StoreRecord {
 struct Rec {
     sandbox_id: String,
     last_active: u64,
-    archived: bool,
+    tier: Tier,
     flushed_last_active: u64,
 }
 
@@ -66,7 +103,7 @@ impl Rec {
         StoreRecord {
             sandbox_id: self.sandbox_id.clone(),
             last_active: self.last_active,
-            archived: self.archived,
+            tier: self.tier,
         }
     }
 }
@@ -135,15 +172,15 @@ impl Store {
     }
 
     /// Record `schema -> id` (a fresh, live VM) and flush to disk. Refreshes
-    /// `last_active` and clears any `archived` flag. Best-effort: a write
-    /// failure is logged, not fatal. Skips the write when the mapping is
+    /// `last_active` and resets the tier to [`Tier::Live`]. Best-effort: a
+    /// write failure is logged, not fatal. Skips the write when the mapping is
     /// unchanged and still live (then it behaves like a debounced `touch`).
     pub fn put(&self, schema: &str, id: &str) {
         let now = now_unix();
         let snapshot = {
             let mut map = self.map.lock().unwrap();
             match map.get_mut(schema) {
-                Some(r) if r.sandbox_id == id && !r.archived => {
+                Some(r) if r.sandbox_id == id && r.tier == Tier::Live => {
                     // Unchanged live mapping: just a debounced activity bump.
                     r.last_active = now;
                     if now.saturating_sub(r.flushed_last_active) >= FLUSH_DEBOUNCE_SECS {
@@ -159,7 +196,7 @@ impl Store {
                         Rec {
                             sandbox_id: id.to_string(),
                             last_active: now,
-                            archived: false,
+                            tier: Tier::Live,
                             flushed_last_active: now,
                         },
                     );
@@ -190,22 +227,23 @@ impl Store {
         self.write_detached(snapshot);
     }
 
-    /// Mark `schema` archived (VM killed, data only in S3) and flush. The
-    /// archived flag is *cleared* by [`Self::put`] when a fresh VM id is recorded
-    /// after a restore — that's the same event that makes the data live again.
+    /// Move `schema` to an offloaded tier ([`Tier::Frozen`] or
+    /// [`Tier::Archived`]) and flush. The tier is *reset* to live by
+    /// [`Self::put`] when a fresh VM id is recorded after a restore — that's
+    /// the same event that makes the data live again.
     ///
     /// Unlike `put`/`touch` this **waits for the write to reach disk**: the
-    /// caller kills the VM right after, and the archived flag must be durable
-    /// *before* the kill — a crash in between with the flag unwritten would
-    /// leave a "live" record pointing at a dead VM, and the next connect would
-    /// build a fresh empty database instead of restoring from S3.
-    pub async fn mark_archived(&self, schema: &str) {
+    /// caller kills the VM (or deletes the local dump) right after, and the
+    /// tier must be durable *before* that — a crash in between with the tier
+    /// unwritten would leave a "live" record pointing at a dead VM, and the
+    /// next connect would build a fresh empty database instead of restoring.
+    pub async fn set_tier(&self, schema: &str, tier: Tier) {
         let snapshot = {
             let mut map = self.map.lock().unwrap();
             let Some(r) = map.get_mut(schema) else {
                 return;
             };
-            r.archived = true;
+            r.tier = tier;
             self.stamp(serialize(&map))
         };
         let (seq, contents) = snapshot;
@@ -282,13 +320,13 @@ fn parse(s: &str, now: u64) -> HashMap<String, Rec> {
                 return None;
             }
             let last_active = f.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(now);
-            let archived = matches!(f.next(), Some("archived"));
+            let tier = Tier::parse(f.next().unwrap_or("live"));
             Some((
                 schema.to_string(),
                 Rec {
                     sandbox_id: id.to_string(),
                     last_active,
-                    archived,
+                    tier,
                     flushed_last_active: last_active,
                 },
             ))
@@ -299,7 +337,7 @@ fn parse(s: &str, now: u64) -> HashMap<String, Rec> {
 fn serialize(map: &HashMap<String, Rec>) -> String {
     let mut out = String::new();
     for (k, v) in map {
-        let state = if v.archived { "archived" } else { "live" };
+        let state = v.tier.as_str();
         out.push_str(k);
         out.push('\t');
         out.push_str(&v.sandbox_id);
@@ -334,14 +372,19 @@ mod tests {
 
     #[test]
     fn parses_new_four_column_format() {
-        let map = parse("wb1\tsb-1\t1700000000\tlive\nwb2\tsb-2\t1700000500\tarchived\n", 999);
+        let map = parse(
+            "wb1\tsb-1\t1700000000\tlive\nwb2\tsb-2\t1700000500\tarchived\n\
+             wb3\tsb-3\t1700000900\tfrozen\n",
+            999,
+        );
         let wb1 = map.get("wb1").unwrap();
         assert_eq!(wb1.sandbox_id, "sb-1");
         assert_eq!(wb1.last_active, 1_700_000_000);
-        assert!(!wb1.archived);
+        assert_eq!(wb1.tier, Tier::Live);
         let wb2 = map.get("wb2").unwrap();
-        assert!(wb2.archived);
+        assert_eq!(wb2.tier, Tier::Archived);
         assert_eq!(wb2.last_active, 1_700_000_500);
+        assert_eq!(map.get("wb3").unwrap().tier, Tier::Frozen);
     }
 
     #[test]
@@ -353,18 +396,19 @@ mod tests {
         let r = map.get("wb").unwrap();
         assert_eq!(r.sandbox_id, "sb-legacy");
         assert_eq!(r.last_active, 12345);
-        assert!(!r.archived);
+        assert_eq!(r.tier, Tier::Live);
     }
 
     #[test]
     fn round_trips_through_serialize() {
-        let map = parse("a\tsb-a\t100\tlive\nb\tsb-b\t200\tarchived\n", 0);
+        let map = parse("a\tsb-a\t100\tlive\nb\tsb-b\t200\tarchived\nc\tsb-c\t300\tfrozen\n", 0);
         let reparsed = parse(&serialize(&map), 0);
         assert_eq!(reparsed.get("a").unwrap().sandbox_id, "sb-a");
         assert_eq!(reparsed.get("a").unwrap().last_active, 100);
-        assert!(!reparsed.get("a").unwrap().archived);
-        assert!(reparsed.get("b").unwrap().archived);
+        assert_eq!(reparsed.get("a").unwrap().tier, Tier::Live);
+        assert_eq!(reparsed.get("b").unwrap().tier, Tier::Archived);
         assert_eq!(reparsed.get("b").unwrap().last_active, 200);
+        assert_eq!(reparsed.get("c").unwrap().tier, Tier::Frozen);
     }
 
     #[tokio::test]
@@ -377,22 +421,23 @@ mod tests {
         store.put("wb", "sb-1");
         let r = store.record("wb").unwrap();
         assert_eq!(r.sandbox_id, "sb-1");
-        assert!(!r.archived);
+        assert_eq!(r.tier, Tier::Live);
 
         // Durable once it returns — the reload below must see it even if the
         // detached `put` write above hasn't landed (generation order covers it).
-        store.mark_archived("wb").await;
-        assert!(store.record("wb").unwrap().archived);
+        store.set_tier("wb", Tier::Frozen).await;
+        assert_eq!(store.record("wb").unwrap().tier, Tier::Frozen);
+        store.set_tier("wb", Tier::Archived).await;
 
-        // Reload from disk: archived state survives a restart.
+        // Reload from disk: the tier survives a restart.
         let reloaded = Store::load(path.clone());
-        assert!(reloaded.record("wb").unwrap().archived);
+        assert_eq!(reloaded.record("wb").unwrap().tier, Tier::Archived);
 
-        // Recording a fresh VM id (a restore) clears the archived flag — the
-        // schema is live again.
+        // Recording a fresh VM id (a restore) resets the tier — the schema is
+        // live again.
         reloaded.put("wb", "sb-2");
         let r = reloaded.record("wb").unwrap();
-        assert!(!r.archived);
+        assert_eq!(r.tier, Tier::Live);
         assert_eq!(r.sandbox_id, "sb-2");
 
         let _ = std::fs::remove_file(&path);

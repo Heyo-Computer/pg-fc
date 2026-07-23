@@ -49,11 +49,23 @@ pub(crate) fn local_opts() -> HeyoClientOptions {
 /// reattaching by id avoids a data-loss race where a just-stopped VM is briefly
 /// absent from list-by-name and we'd otherwise create a duplicate with a fresh
 /// (empty) data disk.
+/// Where a restore's dump bytes come from: the S3 archive tier or the local
+/// frozen tier's dump server. Owned so the registry can hand it into the
+/// bring-up closure without lifetime gymnastics.
+pub enum RestoreSource {
+    S3(S3Config),
+    Local {
+        srv: std::sync::Arc<crate::dumpsrv::DumpServer>,
+        port: u16,
+    },
+}
+
 pub async fn ensure_vm(
     cfg: &Config,
     schema: &str,
     known_id: Option<&str>,
-    restore: Option<&S3Config>,
+    restore: Option<&RestoreSource>,
+    spares: Option<(&crate::spares::SparePool, &std::collections::HashSet<String>)>,
 ) -> Result<Arc<SchemaEntry>> {
     let name = format!("pg-{schema}");
     let keepalive = cfg.is_keepalive(schema);
@@ -64,7 +76,7 @@ pub async fn ensure_vm(
     // restore, whose database is partially loaded — which is why the restore
     // job runs `pg_restore --clean --if-exists` (idempotent over that débris).
     let known_id = if restore.is_some() { None } else { known_id };
-    let sandbox = resolve_sandbox(cfg, &name, keepalive, known_id).await?;
+    let sandbox = resolve_sandbox(cfg, &name, keepalive, known_id, spares).await?;
 
     // Pin keep-alive schemas idempotently: TTL 0 = never auto-stopped. This
     // covers a VM created before its schema was pinned (or created with a
@@ -80,13 +92,19 @@ pub async fn ensure_vm(
     let (target, tunnel, pool) = ready_pg(cfg, &sandbox, &name).await?;
     ensure_database(&pool, schema).await?;
 
-    // Restore from S3 into the freshly-created, empty database before the entry
-    // is handed to any client. A failure here must abort the bring-up: serving
+    // Restore into the freshly-created, empty database before the entry is
+    // handed to any client. A failure here must abort the bring-up: serving
     // an empty DB in place of a restored one would look like silent data loss.
-    if let Some(s3) = restore {
-        restore_from_s3(cfg, &sandbox, schema, s3)
+    match restore {
+        Some(RestoreSource::S3(s3)) => restore_from_s3(cfg, &sandbox, schema, s3)
             .await
-            .with_context(|| format!("restoring schema {schema} from S3"))?;
+            .with_context(|| format!("restoring schema {schema} from S3"))?,
+        Some(RestoreSource::Local { srv, port }) => {
+            restore_from_local(cfg, &sandbox, schema, srv, *port)
+                .await
+                .with_context(|| format!("restoring schema {schema} from the local dump"))?
+        }
+        None => {}
     }
 
     let slots = client_slot_budget(&pool, &name).await;
@@ -355,6 +373,29 @@ fn archive_job_body(user: &str, db: &str, resolve: &str, url: &str) -> String {
          rm -f {DUMP_PATH}\n\
          printf %s \"$ec\" > {done}.tmp && mv {done}.tmp {done}\n",
         require_2xx("upload")
+    )
+}
+
+/// Shell prelude for jobs that talk to the *local* dump server: resolve the
+/// host's address as the guest's default gateway (the host side of its tap)
+/// from `/proc/net/route` — the guest image has no `iproute2`, and the pooler
+/// can't know each VM's gateway from outside. Sets `$GW`, which the job's URL
+/// references (`http://$GW:port/...`, expanded by the shell inside the curl's
+/// double quotes). On failure it writes the job's failure sentinel and exits,
+/// so the pooler gets a prompt, explained error instead of a deadline wait.
+/// `/proc/net/route` stores the gateway as little-endian hex, hence the
+/// byte-reversing `cut`s (POSIX sh has no substring expansion).
+fn gw_prelude(done: &str) -> String {
+    format!(
+        "GW=$(awk '$2==\"00000000\" {{print $3; exit}}' /proc/net/route)\n\
+         if [ -n \"$GW\" ]; then\n\
+         \tGW=$(printf '%d.%d.%d.%d' \"0x$(echo \"$GW\" | cut -c7-8)\" \"0x$(echo \"$GW\" | cut -c5-6)\" \"0x$(echo \"$GW\" | cut -c3-4)\" \"0x$(echo \"$GW\" | cut -c1-2)\")\n\
+         fi\n\
+         if [ -z \"$GW\" ]; then\n\
+         \techo 'cannot determine host gateway from /proc/net/route' >&2\n\
+         \tprintf %s 1 > {done}.tmp && mv {done}.tmp {done}\n\
+         \texit 0\n\
+         fi\n"
     )
 }
 
@@ -659,6 +700,130 @@ async fn await_archive(
             );
         }
     }
+}
+
+/// Dump `schema` to the local dump server (the frozen tier's counterpart of
+/// [`dump_to_s3`]). Same detached guest job — `pg_dump` then `curl -T` — but
+/// the upload lands on the host, and completion is confirmed *in-process* by
+/// the server having fully written, fsync'd, and renamed the file: an even
+/// stronger signal than the S3 tier's HEAD, with the same refusal to trust
+/// the guest's word alone. Returns the completed dump's byte count.
+pub async fn dump_to_local(
+    cfg: &Config,
+    sandbox: &Sandbox,
+    schema: &str,
+    srv: &crate::dumpsrv::DumpServer,
+    port: u16,
+) -> Result<u64> {
+    let db = shell_squote(schema);
+    let user = shell_squote(&cfg.pg_user);
+    let token = srv.issue(schema, crate::dumpsrv::Mode::Put)?;
+    let url = format!("http://$GW:{port}/d/{token}");
+    let body = format!(
+        "{}{}",
+        gw_prelude(ARCHIVE_JOB.done),
+        archive_job_body(&user, &db, "", &url)
+    );
+    ARCHIVE_JOB.launch(cfg, sandbox, &body, DUMP_PATH).await?;
+
+    let deadline = Instant::now() + ARCHIVE_DEADLINE;
+    let mut probe_failures: u32 = 0;
+    let mut probes_muted = false;
+    let mut claimed_done: Option<Instant> = None;
+    loop {
+        sleep(ARCHIVE_POLL_INTERVAL).await;
+        // Authoritative: our own server fully wrote and renamed the upload.
+        if let Some(bytes) = srv.upload_completed(&token) {
+            if bytes < MIN_ARCHIVE_BYTES {
+                bail!(
+                    "schema {schema}: local dump is only {bytes} bytes — no pg_dump \
+                     archive is that small, so the dump itself produced no data; \
+                     refusing to freeze. Guest log: {}",
+                    truncate(ARCHIVE_JOB.log_tail(cfg, sandbox).await.trim(), 800)
+                );
+            }
+            info!("schema {schema}: local dump complete ({bytes} bytes)");
+            return Ok(bytes);
+        }
+        // Guest sentinel: turns a failed dump into a prompt, explained error.
+        if !probes_muted {
+            match ARCHIVE_JOB.probe(cfg, sandbox).await {
+                Ok(JobState::Failed(code)) => {
+                    let log = ARCHIVE_JOB.log_tail(cfg, sandbox).await;
+                    bail!(
+                        "detached local-dump job for schema {schema} failed (exit {code}): {}",
+                        truncate(log.trim(), 800)
+                    );
+                }
+                Ok(JobState::Succeeded) => {
+                    probe_failures = 0;
+                    claimed_done.get_or_insert_with(Instant::now);
+                }
+                Ok(JobState::Running) => probe_failures = 0,
+                Err(e) => {
+                    probe_failures += 1;
+                    warn!(
+                        "schema {schema}: local-dump probe {probe_failures}/\
+                         {ARCHIVE_MAX_PROBE_FAILURES} failed (the dump itself is \
+                         unaffected): {e:#}"
+                    );
+                    if probe_failures >= ARCHIVE_MAX_PROBE_FAILURES {
+                        probes_muted = true;
+                    }
+                }
+            }
+        }
+        // The guest claims success but our server never saw a complete upload
+        // land — same trust posture as the S3 path: unconfirmed means failed.
+        if let Some(at) = claimed_done
+            && at.elapsed() >= ARCHIVE_CONFIRM_GRACE
+        {
+            bail!(
+                "local-dump job for schema {schema} reported success but the dump \
+                 server never received a complete upload — refusing to freeze"
+            );
+        }
+        if Instant::now() >= deadline {
+            bail!("local dump of schema {schema} did not complete within {ARCHIVE_DEADLINE:?}");
+        }
+    }
+}
+
+/// Restore `schema` from the local dump server (frozen tier). The preflight is
+/// a direct file check — stronger than the S3 HEAD — then the same detached
+/// guest job as the S3 restore, against a tokened local URL.
+pub async fn restore_from_local(
+    cfg: &Config,
+    sandbox: &Sandbox,
+    schema: &str,
+    srv: &crate::dumpsrv::DumpServer,
+    port: u16,
+) -> Result<()> {
+    let path = srv.dump_path(schema);
+    match crate::dumpsrv::dump_size(&path) {
+        None => bail!(
+            "schema {schema} is marked frozen but its local dump {} does not exist — \
+             nothing to restore (was PG_VM_POOL_DUMP_DIR changed or the file removed?)",
+            path.display()
+        ),
+        Some(n) if n < MIN_ARCHIVE_BYTES => bail!(
+            "schema {schema}: local dump {} is only {n} bytes — produced by a failed \
+             dump; it holds no data and cannot be restored",
+            path.display()
+        ),
+        Some(_) => {}
+    }
+    let db = shell_squote(schema);
+    let user = shell_squote(&cfg.pg_user);
+    let token = srv.issue(schema, crate::dumpsrv::Mode::Get)?;
+    let url = format!("http://$GW:{port}/d/{token}");
+    let body = format!(
+        "{}{}",
+        gw_prelude(RESTORE_JOB.done),
+        restore_job_body(&user, &db, "", &url)
+    );
+    RESTORE_JOB.launch(cfg, sandbox, &body, RESTORE_PATH).await?;
+    await_detached_job(cfg, sandbox, schema, RESTORE_JOB).await
 }
 
 /// What the guest says about a detached job.
@@ -1248,6 +1413,7 @@ async fn resolve_sandbox(
     name: &str,
     keepalive: bool,
     known_id: Option<&str>,
+    spares: Option<(&crate::spares::SparePool, &std::collections::HashSet<String>)>,
 ) -> Result<Sandbox> {
     // 1. Reattach to the VM we last used for this schema, by id.
     if let Some(id) = known_id {
@@ -1271,8 +1437,26 @@ async fn resolve_sandbox(
         }
     }
 
-    // 3. Genuinely new schema: create it.
+    // 3. Genuinely new VM needed. Claim a warm spare if one is available —
+    //    already booted with initdb done, so the whole create+boot+init cost
+    //    is skipped. It keeps its spare name; the registry's id mapping (put
+    //    on successful bring-up) is what binds it to the schema.
+    if let Some((pool, bound)) = spares
+        && let Some(sb) = pool.take(bound).await
+    {
+        info!("claiming warm spare {} for {name}", sb.sandbox_id());
+        return Ok(sb);
+    }
+
+    // 4. No spare: create from scratch.
     create_vm(cfg, name, keepalive).await
+}
+
+/// Create one warm-spare VM (see `spares`): identical to a schema VM — same
+/// image, size class, thin data disk, TTL 0 — just parked with an empty
+/// cluster until claimed.
+pub(crate) async fn create_spare(cfg: &Config, name: &str) -> Result<Sandbox> {
+    create_vm(cfg, name, false).await
 }
 
 /// Connect to an existing sandbox by id and force it to a running, ready state.
