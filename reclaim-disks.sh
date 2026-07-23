@@ -64,6 +64,20 @@ human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}B"; }
 # Actual on-disk bytes (allocated blocks), not the sparse apparent size.
 allocated() { du -B1 "$1" 2>/dev/null | cut -f1; }
 
+# Flags may also be passed as arguments after RUN_DIR (equivalent to the env
+# vars). This exists for `sudo -n` callers behind a pinned sudoers entry —
+# sudoers can pin an exact argument list, while env assignments are silently
+# refused without a SETENV tag (a trap that has produced "did nothing" runs).
+[ $# -gt 0 ] && shift
+for arg in "$@"; do
+    case "$arg" in
+        --shrink) SHRINK=1 ;;
+        --prune-swap) PRUNE_SWAP=1 ;;
+        --dry-run) DRY_RUN=1 ;;
+        *) die "unknown argument: $arg (expected --shrink, --prune-swap, --dry-run)" ;;
+    esac
+done
+
 if [ "$(id -u)" != 0 ]; then
     # A dry run only reads, so allow it — but warn: without root the /proc scan
     # can't see other users' open files, so the in-use check may under-report.
@@ -253,7 +267,10 @@ trim_one() {
     return 0
 }
 
-echo "reclaim-disks: ${#disks[@]} disk(s) under $RUN_DIR${DRY_RUN:+ (dry-run=$DRY_RUN)}"
+# Announce the active flags: env vars silently stripped by sudo's env_reset
+# (`SHRINK=1 sudo …` instead of `sudo SHRINK=1 …`) have twice produced runs
+# that "did nothing" — make a flagless run visible in the first line.
+echo "reclaim-disks: ${#disks[@]} disk(s) under $RUN_DIR (dry-run=$DRY_RUN shrink=$SHRINK prune-swap=$PRUNE_SWAP)"
 snapshot_open_files
 for disk in "${disks[@]}"; do
     trim_one "$disk"

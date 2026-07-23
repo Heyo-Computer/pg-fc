@@ -1298,14 +1298,19 @@ async fn power_cycle(
     // forward open across the reboot.
     drop(pool);
     drop(tunnel);
-    sandbox
-        .stop()
-        .await
-        .with_context(|| format!("stopping {name} for power-cycle"))?;
-    sandbox
-        .start()
-        .await
-        .with_context(|| format!("restarting {name} after power-cycle"))?;
+    // The stop→start gap makes the disk look reclaimable; hold the boot permit
+    // across both so a reclaim pass can't start working on it in between.
+    {
+        let _permit = crate::reclaim::boot_permit().await;
+        sandbox
+            .stop()
+            .await
+            .with_context(|| format!("stopping {name} for power-cycle"))?;
+        sandbox
+            .start()
+            .await
+            .with_context(|| format!("restarting {name} after power-cycle"))?;
+    }
     sandbox
         .wait_for_ready(cfg.ready_timeout)
         .await
@@ -1473,7 +1478,15 @@ async fn bring_up_existing(cfg: &Config, name: &str, id: &str) -> Result<Option<
     let sb = Sandbox::connect(id.to_string(), local_opts())
         .with_context(|| format!("connecting to VM {name} by id {id}"))?;
     info!("bringing up existing VM {name} ({id})");
-    match sb.start().await {
+    // A stopped VM's disk may be mid-fsck/shrink under a reclaim pass; booting
+    // over that destroys the filesystem. Hold the permit only across start():
+    // once the VM process has the disk open, the next pass's in-use scan
+    // protects it.
+    let started = {
+        let _permit = crate::reclaim::boot_permit().await;
+        sb.start().await
+    };
+    match started {
         Ok(()) => {}
         Err(HeyoError::NotFound(_)) => return Ok(None),
         Err(e) => return Err(anyhow::Error::new(e).context(format!("starting VM {name}"))),

@@ -341,13 +341,21 @@ invokes the script through a `NOPASSWD` sudoers entry:
 
 ```
 # /etc/sudoers.d/pg-vm-pool-reclaim  (chmod 0440; adjust user + paths)
-pooler ALL=(root) NOPASSWD: /opt/pg-vm-pool/reclaim-disks.sh /workbooks/heyvm/run
+pooler ALL=(root) NOPASSWD: /opt/pg-vm-pool/reclaim-disks.sh /workbooks/heyvm/run --shrink --prune-swap
 ```
 
 ```
-PG_VM_POOL_RECLAIM_CMD="sudo -n /opt/pg-vm-pool/reclaim-disks.sh /workbooks/heyvm/run"
+PG_VM_POOL_RECLAIM_CMD="sudo -n /opt/pg-vm-pool/reclaim-disks.sh /workbooks/heyvm/run --shrink --prune-swap"
 PG_VM_POOL_RECLAIM_INTERVAL_SECS=3600
 ```
+
+The flags exist as *arguments* (equivalent to the `SHRINK=1`/`PRUNE_SWAP=1` env
+vars) because a pinned sudoers entry can match an exact argument list, while
+env assignments are silently refused by `sudo -n` without a `SETENV` tag.
+Including them in the periodic command is self-limiting: an already-thin
+filesystem skips the shrink and a right-sized swapfile costs only its own
+recreation on the next boot, so in steady state the pass degenerates to a plain
+trim — but every legacy VM gets fully converted at its first idle stop.
 
 Pin the script at a root-owned path (`chown root:root`, `chmod 0755`) so the
 sudoers entry can't be repointed by editing a user-writable file, and pass the

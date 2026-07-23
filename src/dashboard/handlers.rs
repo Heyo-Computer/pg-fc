@@ -208,9 +208,17 @@ async fn run_lifecycle(id: &str, act: Lifecycle) -> anyhow::Result<()> {
     let sb = Sandbox::connect(id.to_string(), vm::local_opts()).context("connecting to VM")?;
     let fut = async move {
         match act {
-            Lifecycle::Start => sb.start().await,
+            // Start/reboot open a stopped disk — mutually exclusive with
+            // reclaim passes (see reclaim::boot_permit).
+            Lifecycle::Start => {
+                let _permit = crate::reclaim::boot_permit().await;
+                sb.start().await
+            }
             Lifecycle::Stop => sb.stop().await,
-            Lifecycle::Reboot => sb.restart().await,
+            Lifecycle::Reboot => {
+                let _permit = crate::reclaim::boot_permit().await;
+                sb.restart().await
+            }
         }
     };
     tokio::time::timeout(ACTION_TIMEOUT, fut)

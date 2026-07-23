@@ -19,17 +19,24 @@
 //! PG_VM_POOL_RECLAIM_CMD="sudo -n /opt/pg-vm-pool/reclaim-disks.sh /workbooks/heyvm/run"
 //! ```
 //!
-//! Safety lives in the script, not here: it skips any disk a running VM holds
-//! open (device:inode match against every open fd on the host), so triggering
-//! it at any moment is safe. Runs are single-flighted so the periodic timer, the
+//! Safety is layered. The script skips any disk a running VM holds open
+//! (device:inode match against every open fd on the host) — but it takes that
+//! snapshot *once, at pass start*, so a VM booted mid-pass is invisible to it
+//! and its filesystem could be fscked/shrunk underneath the running guest,
+//! which destroys it. All VM boots go through this process, so the pooler
+//! closes that window itself: [`boot_permit`] is the read side of a gate whose
+//! write side is held for the full duration of every reclaim run. Boots wait
+//! for an in-flight pass (seconds in steady state) instead of corrupting a
+//! disk. Runs are additionally single-flighted so the periodic timer, the
 //! post-reap trigger, and the dashboard button can't stack overlapping sweeps.
 
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use tokio::sync::{RwLock, RwLockReadGuard};
 use tracing::{debug, error, info, warn};
 
 /// Hard bound on one reclaim run. A run fscks + mounts + trims every stopped
@@ -48,6 +55,27 @@ pub const POST_STOP_RECLAIM_DELAY: Duration = Duration::from_secs(30);
 /// pooler finish coming up and restore any warm VMs, short enough that frequent
 /// redeploys can't starve reclamation (see `registry::supervise`).
 pub const RECLAIM_FIRST_DELAY: Duration = Duration::from_secs(300);
+
+/// Boot↔reclaim mutual exclusion. Readers are VM boots (start of a stopped VM,
+/// power-cycle, dashboard start/reboot); the writer is a reclaim run, held for
+/// the run's whole duration. Rationale: the script's in-use scan is a snapshot
+/// taken at pass start, so only keeping boots and passes disjoint in time makes
+/// "stopped disk" a stable fact for the length of a pass. Freshly *created*
+/// disks don't need the permit — they didn't exist when the pass enumerated.
+///
+/// tokio's RwLock is fair: a waiting pass blocks later boots until it finishes,
+/// so boots can stall for up to one pass duration (~seconds in steady state,
+/// minutes only during a first full-fleet conversion) — never longer, since
+/// new readers can't starve the writer either.
+static BOOT_GATE: RwLock<()> = RwLock::const_new(());
+
+/// Take the boot side of the gate: resolves immediately unless a reclaim pass
+/// is running, in which case it waits for the pass to finish. Hold the guard
+/// across the daemon call that (re)opens a stopped VM's disk — once the VM
+/// process holds the disk open, the next pass's in-use scan protects it.
+pub async fn boot_permit() -> RwLockReadGuard<'static, ()> {
+    BOOT_GATE.read().await
+}
 
 /// Runs the configured reclaim command, at most one instance at a time.
 pub struct Reclaimer {
@@ -74,6 +102,16 @@ impl Reclaimer {
             return 0;
         }
         let _guard = RunningGuard(&self.running);
+
+        // Exclusive with VM boots for the whole run — see BOOT_GATE.
+        let waited = Instant::now();
+        let _exclusive = BOOT_GATE.write().await;
+        if waited.elapsed() > Duration::from_secs(1) {
+            info!(
+                "disk reclaim: waited {:?} for in-flight VM boots",
+                waited.elapsed()
+            );
+        }
 
         debug!("disk reclaim: running `{}`", self.cmd);
         let mut command = tokio::process::Command::new("sh");
@@ -111,6 +149,11 @@ impl Reclaimer {
             .rev()
             .find(|l| !l.trim().is_empty() && !l.starts_with("----"))
             .unwrap_or("(no output)");
+        // Per-disk FAIL lines name the disks whose fsck failed — without this
+        // the summary's "N failed" count is unactionable.
+        for line in stdout.lines().filter(|l| l.starts_with("FAIL")) {
+            warn!("disk reclaim: {line}");
+        }
         if output.status.success() {
             info!("disk reclaim: {summary}");
             if !stderr.trim().is_empty() {
@@ -215,6 +258,27 @@ mod tests {
         let r = Arc::new(Reclaimer::new("true".to_string()));
         r.running.store(true, Ordering::SeqCst);
         assert!(r.spawn_now().is_err());
+    }
+
+    #[tokio::test]
+    async fn boots_wait_for_a_running_reclaim_pass() {
+        let r = Arc::new(Reclaimer::new("sleep 0.5".to_string()));
+        let run = tokio::spawn({
+            let r = r.clone();
+            async move { r.run_once().await }
+        });
+        // Let the run acquire the write side of the gate.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let waited = Instant::now();
+        let _permit = boot_permit().await;
+        // The permit must not have resolved while the pass was still running.
+        // (One-sided: other tests share the global gate and can only add time.)
+        assert!(
+            waited.elapsed() >= Duration::from_millis(200),
+            "boot permit resolved after {:?} — during the reclaim pass",
+            waited.elapsed()
+        );
+        run.await.unwrap();
     }
 
     #[test]
