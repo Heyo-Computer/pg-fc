@@ -248,14 +248,19 @@ filesystem size and are recomputed + reloaded on each growth step.
 
 Eviction reclaims the whole disk once a schema is *long* idle; `reclaim-disks.sh`
 reclaims the **slack** from disks whose VMs are merely stopped, without deleting
-anything. It offline-`fstrim`s every `data.ext4` whose VM is not currently
-running (loop-attach → journal-recover → `fstrim` → detach), and skips any disk a
-live Firecracker still has open (mounting that would corrupt it):
+anything. For every `data.ext4` whose VM is not currently running it recovers
+the journal (`e2fsck -fp`) and then punches all free blocks and unused
+inode-table blocks straight out of the backing file (`e2fsck -fp -E discard` —
+file-level hole punch, no loop device or mount, which keeps working on hosts
+where loop-device discard doesn't). Disks a live Firecracker still has open are
+skipped (writing to those would corrupt them), and skips name the holding
+process. `PRUNE_SWAP=1` additionally deletes each stopped VM's swapfile (dead
+weight — swap never survives a boot, and init.sh recreates it right-sized):
 
 ```
 sudo DRY_RUN=1 ./reclaim-disks.sh ~/.heyo/run   # list candidates, change nothing
 sudo ./reclaim-disks.sh ~/.heyo/run             # actually reclaim
-sudo SHRINK=1 ./reclaim-disks.sh ~/.heyo/run    # also shrink filesystems (below)
+sudo SHRINK=1 PRUNE_SWAP=1 ./reclaim-disks.sh ~/.heyo/run   # maximum reclaim (below)
 ```
 
 **`SHRINK=1` — retro-fit thin provisioning onto legacy disks.** Disks formatted

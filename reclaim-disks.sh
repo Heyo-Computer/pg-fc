@@ -10,15 +10,19 @@
 # full provisioned size and never shrinks, even though the live database is tiny
 # (we've seen 1.1 GB of data pinning 51 GB on disk).
 #
-# This offline-trims every data disk whose VM is NOT currently running: attach a
-# loop device (which translates discard into a hole-punch on the backing file),
-# recover the journal left dirty by an unclean VM kill, `fstrim`, detach.
+# This offline-reclaims every data disk whose VM is NOT currently running:
+# recover the journal left dirty by an unclean VM kill (`e2fsck -fp`), then
+# punch every free block and unused inode-table block out of the backing file
+# with `e2fsck -fp -E discard`. Both operate on the image file directly — no
+# loop device, no mount, no fstrim. (An earlier version went
+# loop-mount+fstrim; that path silently stopped punching holes on at least one
+# production host — fstrim errors were swallowed and runs "reclaimed" ~0B from
+# hundreds of GB of slack — while file-level discard keeps working, since it's
+# a plain fallocate(PUNCH_HOLE) on the file.)
 #
-# SAFETY: a disk a live Firecracker still has open is skipped — read/write
-# mounting a running guest's filesystem from the host would corrupt it. The
-# check is `fuser` on the backing file, so it holds regardless of how the VM was
-# started. Everything else is best-effort per disk: one failure never aborts the
-# run and never leaves a loop device or mount behind.
+# SAFETY: a disk a live Firecracker still has open is skipped — writing to a
+# filesystem a running guest has mounted would corrupt it. Everything else is
+# best-effort per disk: one failure never aborts the run.
 #
 # SHRINK=1 additionally *shrinks the filesystem* toward its used size before
 # trimming. Legacy disks were formatted across the whole device, so even after
@@ -38,12 +42,14 @@
 #   sudo SHRINK=1 ./reclaim-disks.sh [DIR]   # also shrink filesystems (slower)
 #   sudo PRUNE_SWAP=1 ./reclaim-disks.sh [DIR]  # also delete guest swapfiles
 #
-# PRUNE_SWAP=1 deletes each stopped VM's /swapfile while its fs is mounted.
-# Swap contents are dead the moment a VM stops (swap never survives a boot),
-# and init.sh recreates the file — sized to the filesystem — on the next boot,
-# so this is pure reclaim: the swapfile is fully allocated (fallocate/dd, not
-# sparse), up to 2GB per VM on large-RAM fleets, and fstrim alone can never
-# touch it because it's a live file.
+# PRUNE_SWAP=1 deletes each stopped VM's /swapfile (via debugfs, no mount;
+# the journal-recovery fsck that follows frees the unlinked blocks and the
+# discard pass punches them). Swap contents are dead the moment a VM stops
+# (swap never survives a boot), and init.sh recreates the file — sized to the
+# filesystem — on the next boot, so this is pure reclaim: the swapfile is
+# fully allocated (fallocate/dd, not sparse), up to 2GB per VM on large-RAM
+# fleets, and a plain free-block discard can never touch it because it's a
+# live file.
 #
 set -uo pipefail
 
@@ -61,17 +67,20 @@ allocated() { du -B1 "$1" 2>/dev/null | cut -f1; }
 if [ "$(id -u)" != 0 ]; then
     # A dry run only reads, so allow it — but warn: without root the /proc scan
     # can't see other users' open files, so the in-use check may under-report.
-    [ "$DRY_RUN" = 1 ] || die "must run as root (needs loop-setup, mount, fstrim)"
+    [ "$DRY_RUN" = 1 ] || die "must run as root (needs the full /proc scan + write access to the disks)"
     echo "warning: not root — dry-run in-use detection may be incomplete" >&2
 fi
 [ -d "$RUN_DIR" ] || die "run dir not found: $RUN_DIR"
-for tool in losetup mount umount fstrim e2fsck find stat du numfmt; do
+for tool in e2fsck dumpe2fs find stat du numfmt; do
     command -v "$tool" >/dev/null || die "missing required tool: $tool"
 done
 if [ "$SHRINK" = 1 ]; then
-    for tool in dumpe2fs resize2fs fallocate; do
+    for tool in resize2fs fallocate; do
         command -v "$tool" >/dev/null || die "missing required tool for SHRINK=1: $tool"
     done
+fi
+if [ "$PRUNE_SWAP" = 1 ]; then
+    command -v debugfs >/dev/null || die "missing required tool for PRUNE_SWAP=1: debugfs"
 fi
 
 # Point-in-time set of every file held open by any process, keyed by
@@ -118,18 +127,16 @@ disks=("$RUN_DIR"/sb-*/data.ext4)
 
 reclaimed=0 trimmed=0 skipped=0 failed=0 shrunk=0 dry_reclaimable=0
 
-# SHRINK=1: shrink the (unmounted, freshly fsck'd) filesystem on $1 toward its
-# used size. On success sets SHRINK_PUNCH_OFFSET to the new filesystem's end in
-# bytes — the caller hole-punches the backing file past that point *after*
-# detaching the loop device (never while attached, so no page-cache aliasing on
-# the punched range). Returns: 0 = shrunk or nothing to do, 1 = shrink failed
-# (fs untouched or restored — trimming may proceed), 2 = post-shrink fsck
-# failed (do NOT mount).
-SHRINK_PUNCH_OFFSET=""
+# SHRINK=1: shrink the (freshly fsck'd) filesystem inside image file $1 toward
+# its used size, then hole-punch the backing file past the new fs end (blocks
+# there are dead — old metadata/data from the full-size format that a
+# free-block discard can't reach, since they're outside the fs). Everything
+# operates on the file directly. Returns: 0 = shrunk (counted) or nothing to
+# do, 1 = shrink failed (fs untouched — reclaim may proceed), 2 = post-shrink
+# fsck failed (leave the disk alone and report).
 shrink_fs() {
-    local loop="$1" geom bs blocks free used target floor_blk
-    SHRINK_PUNCH_OFFSET=""
-    geom=$(dumpe2fs -h "$loop" 2>/dev/null) || return 1
+    local disk="$1" geom bs blocks free used target floor_blk
+    geom=$(dumpe2fs -h "$disk" 2>/dev/null) || return 1
     bs=$(awk -F: '/^Block size:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
     blocks=$(awk -F: '/^Block count:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
     free=$(awk -F: '/^Free blocks:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
@@ -141,18 +148,23 @@ shrink_fs() {
     # Not worth a slow, block-moving resize unless it retires at least 256MB
     # of future ratchet room.
     [ "$blocks" -le $((target + 268435456 / bs)) ] && return 0
-    resize2fs "$loop" "$target" >/dev/null 2>&1 || return 1
-    # A shrink relocates data; verify the result before anything mounts it.
-    e2fsck -fp "$loop" >/dev/null 2>&1
+    resize2fs "$disk" "$target" >/dev/null 2>&1 || return 1
+    # A shrink relocates data; verify the result before going further.
+    e2fsck -fp "$disk" >/dev/null 2>&1
     [ $? -ge 4 ] && return 2
-    SHRINK_PUNCH_OFFSET=$((target * bs))
+    local fs_bytes=$((target * bs)) file_bytes
+    file_bytes=$(stat -c %s "$disk" 2>/dev/null || echo 0)
+    if [ "$file_bytes" -gt "$fs_bytes" ]; then
+        fallocate -p -o "$fs_bytes" -l $((file_bytes - fs_bytes)) "$disk" 2>/dev/null
+    fi
+    shrunk=$((shrunk + 1))
     return 0
 }
 
 # Trim one disk with fully local cleanup. Returns non-zero on any failure but the
 # caller keeps going — a single bad disk must not stop the sweep.
 trim_one() {
-    local disk="$1" loop="" mnt="" rc=0
+    local disk="$1"
     # Guard: never touch a disk a running VM has open. Name the holder — an
     # expected skip is a firecracker/jailer PID; anything else (or *every*
     # disk skipped) points at a process unexpectedly pinning the fleet.
@@ -191,69 +203,45 @@ trim_one() {
         return 0
     fi
 
-    loop=$(losetup --find --show "$disk" 2>/dev/null) || {
-        echo "FAIL  (losetup)    $disk"
-        failed=$((failed + 1))
-        return 1
-    }
+    # Drop the dead swapfile first: debugfs unlinks it without a mount, the
+    # journal-recovery fsck below frees the now-orphaned blocks, and the
+    # discard pass punches them out of the backing file.
+    if [ "$PRUNE_SWAP" = 1 ]; then
+        debugfs -w -R "rm /swapfile" "$disk" >/dev/null 2>&1
+    fi
 
     # Recover the journal (VMs are killed uncleanly, so it's usually dirty).
     # -p auto-fixes and exits 1 when it did — expected, not a failure. Only a
-    # code >= 4 means the filesystem is still bad; then we don't mount it.
-    e2fsck -fp "$loop" >/dev/null 2>&1
+    # code >= 4 means the filesystem is still bad; then leave it alone.
+    e2fsck -fp "$disk" >/dev/null 2>&1
     local fsck_rc=$?
     if [ "$fsck_rc" -ge 4 ]; then
         echo "FAIL  (fsck=$fsck_rc)     $disk"
-        losetup -d "$loop"
         failed=$((failed + 1))
         return 1
     fi
 
-    # Optional filesystem shrink (see header). Runs on the clean, unmounted fs;
-    # the hole-punch past the new fs end happens after loop detach, below.
-    local punch_off=""
+    # Optional filesystem shrink (see shrink_fs).
     if [ "$SHRINK" = 1 ]; then
-        shrink_fs "$loop"
+        shrink_fs "$disk"
         case $? in
-            0) punch_off="$SHRINK_PUNCH_OFFSET" ;;
-            1) echo "note  (shrink failed, trim only)  $disk" ;;
+            1) echo "note  (shrink failed, reclaim only)  $disk" ;;
             2)
                 echo "FAIL  (fsck after shrink)  $disk"
-                losetup -d "$loop"
                 failed=$((failed + 1))
                 return 1
                 ;;
         esac
     fi
 
-    mnt=$(mktemp -d)
-    if ! mount "$loop" "$mnt" 2>/dev/null; then
-        echo "FAIL  (mount)      $disk"
-        rmdir "$mnt"
-        losetup -d "$loop"
+    # The reclaim itself: punch every free block and unused inode-table block
+    # out of the backing file. File-level fallocate(PUNCH_HOLE) — works even
+    # where loop-device discard doesn't.
+    e2fsck -fp -E discard "$disk" >/dev/null 2>&1
+    if [ $? -ge 4 ]; then
+        echo "FAIL  (discard fsck)  $disk"
         failed=$((failed + 1))
         return 1
-    fi
-
-    # Drop the dead swapfile before trimming so its blocks get punched too.
-    if [ "$PRUNE_SWAP" = 1 ]; then
-        rm -f "$mnt/swapfile"
-    fi
-    fstrim "$mnt" 2>/dev/null || rc=1
-    umount "$mnt"
-    rmdir "$mnt"
-    losetup -d "$loop"
-
-    # With the fs shrunk, everything in the backing file past its end is dead —
-    # old metadata/data from the full-size format that fstrim (fs-scoped) can't
-    # reach. Punch it out now that the loop device (and its page cache) is gone.
-    if [ -n "$punch_off" ]; then
-        local file_bytes
-        file_bytes=$(stat -c %s "$disk" 2>/dev/null || echo 0)
-        if [ "$file_bytes" -gt "$punch_off" ]; then
-            fallocate -p -o "$punch_off" -l $((file_bytes - punch_off)) "$disk" 2>/dev/null
-        fi
-        shrunk=$((shrunk + 1))
     fi
 
     after=$(allocated "$disk")
@@ -262,7 +250,7 @@ trim_one() {
     reclaimed=$((reclaimed + freed))
     trimmed=$((trimmed + 1))
     printf 'trim  %-12s %s\n' "-$(human "$freed")" "$disk"
-    return "$rc"
+    return 0
 }
 
 echo "reclaim-disks: ${#disks[@]} disk(s) under $RUN_DIR${DRY_RUN:+ (dry-run=$DRY_RUN)}"
