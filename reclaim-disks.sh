@@ -36,6 +36,14 @@
 #   sudo ./reclaim-disks.sh [RUN_DIR]        # default RUN_DIR: ~/.heyo/run
 #   sudo DRY_RUN=1 ./reclaim-disks.sh [DIR]  # report candidates, change nothing
 #   sudo SHRINK=1 ./reclaim-disks.sh [DIR]   # also shrink filesystems (slower)
+#   sudo PRUNE_SWAP=1 ./reclaim-disks.sh [DIR]  # also delete guest swapfiles
+#
+# PRUNE_SWAP=1 deletes each stopped VM's /swapfile while its fs is mounted.
+# Swap contents are dead the moment a VM stops (swap never survives a boot),
+# and init.sh recreates the file — sized to the filesystem — on the next boot,
+# so this is pure reclaim: the swapfile is fully allocated (fallocate/dd, not
+# sparse), up to 2GB per VM on large-RAM fleets, and fstrim alone can never
+# touch it because it's a live file.
 #
 set -uo pipefail
 
@@ -43,6 +51,7 @@ RUN_DIR="${1:-${HOME}/.heyo/run}"
 DRY_RUN="${DRY_RUN:-0}"
 SHRINK="${SHRINK:-0}"
 MIN_FS_MB="${MIN_FS_MB:-4096}"
+PRUNE_SWAP="${PRUNE_SWAP:-0}"
 
 die() { echo "error: $*" >&2; exit 1; }
 human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}B"; }
@@ -83,10 +92,16 @@ fi
 # traffic. The blast radius of a miss is one disk.
 declare -A OPEN_INODES=()
 snapshot_open_files() {
-    local key
-    while IFS= read -r key; do
-        [ -n "$key" ] && OPEN_INODES["$key"]=1
-    done < <(find /proc/[0-9]*/fd -maxdepth 1 -type l -exec stat -L -c '%d:%i' {} + 2>/dev/null)
+    local key path pid
+    while read -r key path; do
+        [ -n "$key" ] || continue
+        # Remember (one of) the holding PIDs so a skip can say *who* — the
+        # difference between "that VM is running" and "something unexpected
+        # holds every disk" is the whole diagnosis.
+        pid="${path#/proc/}"
+        pid="${pid%%/*}"
+        OPEN_INODES["$key"]="${OPEN_INODES[$key]:-$pid}"
+    done < <(find /proc/[0-9]*/fd -maxdepth 1 -type l -exec stat -L -c '%d:%i %n' {} + 2>/dev/null)
 }
 
 # In use if some process holds this exact file (device:inode) open. Fails closed:
@@ -101,7 +116,7 @@ shopt -s nullglob
 disks=("$RUN_DIR"/sb-*/data.ext4)
 [ "${#disks[@]}" -gt 0 ] || die "no sb-*/data.ext4 disks under $RUN_DIR"
 
-reclaimed=0 trimmed=0 skipped=0 failed=0 shrunk=0
+reclaimed=0 trimmed=0 skipped=0 failed=0 shrunk=0 dry_reclaimable=0
 
 # SHRINK=1: shrink the (unmounted, freshly fsck'd) filesystem on $1 toward its
 # used size. On success sets SHRINK_PUNCH_OFFSET to the new filesystem's end in
@@ -138,9 +153,15 @@ shrink_fs() {
 # caller keeps going — a single bad disk must not stop the sweep.
 trim_one() {
     local disk="$1" loop="" mnt="" rc=0
-    # Guard: never touch a disk a running VM has open.
+    # Guard: never touch a disk a running VM has open. Name the holder — an
+    # expected skip is a firecracker/jailer PID; anything else (or *every*
+    # disk skipped) points at a process unexpectedly pinning the fleet.
     if disk_in_use "$disk"; then
-        echo "skip  (in use)      $disk"
+        local key pid comm="?"
+        key=$(stat -c '%d:%i' "$disk" 2>/dev/null)
+        pid="${OPEN_INODES[${key:-none}]:-?}"
+        [ -r "/proc/$pid/comm" ] && comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+        echo "skip  (in use by pid $pid/$comm)  $disk"
         skipped=$((skipped + 1))
         return 0
     fi
@@ -149,7 +170,24 @@ trim_one() {
     before=$(allocated "$disk")
 
     if [ "$DRY_RUN" = 1 ]; then
-        echo "would-trim$([ "$SHRINK" = 1 ] && echo ' (+shrink)')  $disk  ($(human "$before"))"
+        # Estimate what a trim would actually free: allocated bytes minus the
+        # filesystem's used bytes. Without this, "would-trim" reads as savings
+        # when it's only candidacy — an already-lean disk would-trims ~0B.
+        local est=""
+        if command -v dumpe2fs >/dev/null; then
+            local geom bs total_b free_b
+            geom=$(dumpe2fs -h "$disk" 2>/dev/null)
+            bs=$(awk -F: '/^Block size:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+            total_b=$(awk -F: '/^Block count:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+            free_b=$(awk -F: '/^Free blocks:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+            if [ -n "$bs" ] && [ -n "$total_b" ] && [ -n "$free_b" ]; then
+                local gain=$((before - (total_b - free_b) * bs))
+                [ "$gain" -lt 0 ] && gain=0
+                est="  ~$(human "$gain") reclaimable"
+                dry_reclaimable=$((dry_reclaimable + gain))
+            fi
+        fi
+        echo "would-trim$([ "$SHRINK" = 1 ] && echo ' (+shrink)')  $disk  ($(human "$before") allocated$est)"
         return 0
     fi
 
@@ -197,6 +235,10 @@ trim_one() {
         return 1
     fi
 
+    # Drop the dead swapfile before trimming so its blocks get punched too.
+    if [ "$PRUNE_SWAP" = 1 ]; then
+        rm -f "$mnt/swapfile"
+    fi
     fstrim "$mnt" 2>/dev/null || rc=1
     umount "$mnt"
     rmdir "$mnt"
@@ -231,7 +273,7 @@ done
 
 echo "----"
 if [ "$DRY_RUN" = 1 ]; then
-    echo "dry-run: $((${#disks[@]} - skipped)) candidate(s), $skipped in use (skipped)"
+    echo "dry-run: $((${#disks[@]} - skipped)) candidate(s), ~$(human "$dry_reclaimable") reclaimable by trim, $skipped in use (skipped)"
 else
     shrink_note=""
     [ "$SHRINK" = 1 ] && shrink_note=" ($shrunk filesystem(s) shrunk)"
